@@ -109,31 +109,41 @@ bool parse_header(const uint8_t* data, std::size_t data_size,
                 if (*p == ']') ++p;
             } else if (key == "data_offsets") {
                 // Parse [start_offset, end_offset]
+                // Note: offsets are relative to the start of the data section (after header + 8 bytes)
                 if (*p != '[') break;
                 ++p;
                 
+                // Skip whitespace
+                while (*p && (*p == ' ' || *p == '\n')) ++p;
+                
                 // Read start offset
-                while (*p && *p != ',') ++p;
-                if (*p == ',') ++p;
+                long long start_offset = 0;
+                {
+                    const char* num_start = p;
+                    while (*p >= '0' && *p <= '9') ++p;
+                    if (num_start != p) {
+                        start_offset = std::stoll(std::string(num_start, p));
+                    }
+                }
+                
+                // Skip comma and whitespace
+                while (*p && (*p == ' ' || *p == ',' || *p == '\n')) ++p;
                 
                 // Read end offset
-                while (*p && *p != ',') ++p;
                 long long end_offset = 0;
-                const char* num_start = p;
-                while (*p >= '0' && *p <= '9') ++p;
-                end_offset = std::stoll(std::string(num_start, p));
-                
-                // Calculate start offset from end_offset of previous tensor
-                std::size_t start_offset = 0;
-                if (!tensors.empty()) {
-                    auto last_it = std::prev(tensors.end());
-                    start_offset = last_it->second.data_offset + 
-                                   last_it->second.data_nbytes;
+                {
+                    const char* num_start = p;
+                    while (*p >= '0' && *p <= '9') ++p;
+                    if (num_start != p) {
+                        end_offset = std::stoll(std::string(num_start, p));
+                    }
                 }
-                start_offset += header_length + 8; // Add header size
                 
-                t.data_offset = start_offset;
-                t.data_nbytes = static_cast<std::size_t>(end_offset) - start_offset;
+                // Data section starts after header (8 bytes length + header_length bytes JSON)
+                std::size_t data_section_start = header_length + 8;
+                
+                t.data_offset = data_section_start + static_cast<std::size_t>(start_offset);
+                t.data_nbytes = static_cast<std::size_t>(end_offset - start_offset);
                 
                 // Calculate strides (row-major, float32)
                 if (!t.shape.empty()) {

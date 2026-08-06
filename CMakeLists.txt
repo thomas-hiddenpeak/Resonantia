@@ -104,6 +104,15 @@ set_target_properties(vc_probe PROPERTIES
     LINK_FLAGS "-Wl,--disable-new-dtags"
 )
 
+    add_executable(test_model_load tools/test_model_load.cpp)
+    target_include_directories(test_model_load PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test_model_load PRIVATE voxmutatio CUDA::cudart)
+    set_target_properties(test_model_load PROPERTIES
+        BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+        INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+        LINK_FLAGS "-Wl,--disable-new-dtags"
+    )
+
 # ============================================================================
 # 测试
 # ============================================================================

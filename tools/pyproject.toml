@@ -8,6 +8,8 @@ dependencies = [
     "safetensors>=0.4",
     "numpy>=1.24",
     "huggingface-hub>=0.20",
+    "scipy>=1.10",
+    "soundfile>=0.12",
 ]
 
 [dependency-groups]
