@@ -68,12 +68,47 @@
 
 ## Governance
 
+### Spec Creation Rules (NON-NEGOTIABLE)
+
+**Specs 是项目的核心契约，不得随意创建。**
+
+1. **Sequential Completion**: 已创建的 Spec 必须标记为完成后，才能创建下一个 Spec。
+   - `specs/###-feature-name/spec.md` 的 Status 必须从 `Draft` → `Complete`
+   - 每个 FR (Functional Requirement) 必须有对应的实现和测试
+
+2. **Necessity Audit**: 计划创建新 Spec 前，必须审计：
+   - [ ] 当前 Spec 是否已完成？
+   - [ ] 计划工作是否已被现有 Spec 覆盖？
+   - [ ] 是否属于升级/改善（而非新增功能）？
+
+3. **No Spec for Refactoring/Performance**: 在不改变核心意图的情况下，
+   **不得**因为以下原因新增 Spec：
+   - ❌ 性能提升（kernel optimization → commit message 说明即可）
+   - ❌ 代码重构（refactor → commit message 说明即可）
+   - ❌ Bug 修复（fix → commit message 说明即可）
+   - ❌ 测试覆盖改进（test → commit message 说明即可）
+
+4. **Valid Reasons for New Spec**:
+   - ✅ 新增用户可见功能（如：新增 WebUI）
+   - ✅ 新增模块（如：新增 WavLM 编码器）
+   - ✅ 改变核心架构（如：从 FP32 迁移到 FP16-only）
+
+5. **Spec Upgrade vs. New Spec**:
+   - 改善/扩展现有 Spec 的功能 → 更新现有 `spec.md`，version +1
+   - 完全独立的新功能 → 创建新 Spec `specs/###-new-feature/`
+
+### Authority
+
 - **Authority**: Principles I-VI 和 X 是强制门控。违反原则的代码不得合并。
-- **Amendments**: 修改需要 PR + 理由 + 维护者审批 + 版本升级
-- **Versioning policy (SemVer for governance)**:
+- **Spec Violation**: 未经审计创建 Spec 视为 CRITICAL 违规。
+
+### Amendments
+
+- 修改需要 PR + 理由 + 维护者审批 + 版本升级
+- Versioning policy (SemVer for governance):
   - MAJOR = 不兼容的治理变更
   - MINOR = 新原则/章节
   - PATCH = 澄清和非语义修改
-- **Compliance review**: 每个 PR 必须验证合规性
+- Compliance review: 每个 PR 必须验证合规性
 
-**Version**: 1.1.0 | **Ratified**: 2026-08-07 | **Last Amended**: 2026-08-07
+**Version**: 1.2.0 | **Ratified**: 2026-08-07 | **Last Amended**: 2026-08-07

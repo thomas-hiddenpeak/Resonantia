@@ -79,6 +79,18 @@ Does the change violate any Constitution principles?
 | VII. Simplicity | YAGNI — no over-engineering? |
 | VIII. Anti-Abstraction | Direct CUDA/cuBLAS usage? |
 | IX. Integration-First | `test_pipeline.cpp` passes? |
+| X. Python Isolation | Python only in `tools/` with uv? |
+
+### 7. Spec Governance (CRITICAL)
+
+Does the change comply with Spec Creation Rules?
+
+- [ ] If new `specs/###-feature/` created: was necessity audit performed?
+- [ ] If new `specs/###-feature/` created: is previous Spec marked `Complete`?
+- [ ] If performance/refactor/fix: is there a new Spec? (should be **NO**)
+- [ ] If feature improvement: is existing `spec.md` updated instead of new Spec?
+
+**Red Flag**: New Spec created for performance optimization, refactoring, or bug fix.
 
 ## Review Process
 
