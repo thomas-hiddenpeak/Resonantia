@@ -29,6 +29,10 @@ set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
+# Find cuFFT and cuSOLVER
+find_library(CUFFT_LIBRARY cufft PATHS ${CUDAToolkit_LIBRARY_DIR})
+find_library(CUSOLVER_LIBRARY cusolver PATHS ${CUDAToolkit_LIBRARY_DIR})
+
 # ============================================================================
 # 包含目录
 # ============================================================================
@@ -63,6 +67,7 @@ add_library(voxmutatio STATIC ${VOXMUTATIO_SOURCES})
 target_link_libraries(voxmutatio PRIVATE
     CUDA::cudart
     CUDA::cublas
+    CUDA::cufft
     Threads::Threads
 )
 target_include_directories(voxmutatio PUBLIC
