@@ -10,21 +10,23 @@
 - ✅ Code compiles (CMake build succeeds)
 - ✅ Unit tests pass (5/5 - core, io, f0, index, pipeline config)
 - ✅ CUDA kernels compile (cuBLAS, cuFFT linked)
+- ✅ Model weights downloaded and converted to safetensors:
+  - HuBERT Base: 361 MB (213 tensors)
+  - RMVPE: 346 MB (741 tensors)
+  - VITS f0G40k (v2): 140 MB (560 tensors)
+  - VITS f0D40k (v2): 273 MB (165 tensors)
 
 ### What Does NOT Work
-- ❌ No model weights available (safetensors)
 - ❌ No actual voice conversion ever executed
 - ❌ No numerical alignment verified (L2, F0, SRCC)
 - ❌ No end-to-end integration test with real audio
-- ❌ Pipeline init fails without model files
+- ❌ Pipeline init may fail (need to verify model loading works)
 
 ### Blockers
 | Blocker | Required For |
 |---------|-------------|
-| HuBERT safetensors weights | Feature extraction |
-| VITS safetensors weights | Audio synthesis |
-| RMVPE safetensors weights | F0 extraction |
 | Python reference outputs (.npz) | Numerical alignment tests |
+| Test audio files | End-to-end integration tests |
 
 ## Completion Checklist
 
