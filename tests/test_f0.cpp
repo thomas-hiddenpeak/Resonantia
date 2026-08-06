@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
+#include <catch2/catch_approx.hpp>
 
 #include "voxmutatio/f0/rmvpe.h"
 #include "voxmutatio/f0/fcpe.h"

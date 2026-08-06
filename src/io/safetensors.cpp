@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -125,8 +126,7 @@ bool parse_header(const uint8_t* data, std::size_t data_size,
                 // Calculate start offset from end_offset of previous tensor
                 std::size_t start_offset = 0;
                 if (!tensors.empty()) {
-                    auto last_it = tensors.end();
-                    --last_it;
+                    auto last_it = std::prev(tensors.end());
                     start_offset = last_it->second.data_offset + 
                                    last_it->second.data_nbytes;
                 }

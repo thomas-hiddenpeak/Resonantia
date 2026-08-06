@@ -5,7 +5,7 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include < cufft.h>
+#include <cufft.h>
 
 #include <cmath>
 #include <stdexcept>
@@ -84,23 +84,23 @@ __global__ void layer_norm_kernel(const float* input, float* output,
     }
 }
 
-// Hann window function
-__device__ float hann_window(int i, int size) {
-    return 0.5f * (1.0f - cosf(2.0f * M_PI * i / (size - 1)));
+// Hann window function (host version)
+static float hann_window_host(int i, int size) {
+    return 0.5f * (1.0f - std::cos(2.0f * M_PI * i / (size - 1)));
 }
 
-// STFT kernel using cuFFT
+// STFT computation with cuFFT
 std::vector<float> compute_stft(const float* audio, int num_samples,
                                  int frame_size, int hop_length) {
     int num_frames = (num_samples - frame_size) / hop_length + 1;
     int fft_size = frame_size;
     
-    // Apply Hann window and extract frames
+    // Apply Hann window and extract frames (host side)
     std::vector<float> windowed(num_frames * fft_size);
     for (int f = 0; f < num_frames; ++f) {
         for (int i = 0; i < frame_size; ++i) {
             windowed[f * fft_size + i] = 
-                audio[f * hop_length + i] * hann_window(i, frame_size);
+                audio[f * hop_length + i] * hann_window_host(i, frame_size);
         }
     }
     

@@ -14,75 +14,25 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <numeric>
 #include <stdexcept>
 
 namespace voxmutatio::index {
 
 namespace {
 
-// CUDA kernel for L2 distance computation
-__global__ void l2_distance_kernel(const float* queries, const float* database,
-                                   float* distances, int n_queries,
-                                   int n_database, int dim) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = n_queries * n_database;
-    
-    if (idx < total) {
-        int q_idx = idx / n_database;
-        int d_idx = idx % n_database;
-        
-        float dist = 0.0f;
-        for (int i = 0; i < dim; ++i) {
-            float diff = queries[q_idx * dim + i] - 
-                        database[d_idx * dim + i];
-            dist += diff * diff;
-        }
-        distances[idx] = dist;
-    }
-}
-
-// CUDA kernel for finding top-K nearest neighbors
-__global__ void topk_kernel(const float* distances, const int64_t* indices,
-                            int n_queries, int k, int n_database) {
-    int q_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (q_idx < n_queries) {
-        // Simple selection sort for top-K
-        std::vector<float> dists(k);
-        std::vector<int64_t> idxs(k);
-        
-        const float* q_dists = distances + q_idx * n_database;
-        
-        // Initialize with first k distances
-        for (int j = 0; j < k; ++j) {
-            dists[j] = q_dists[j];
-            idxs[j] = j;
-        }
-        
-        // Find top-K
-        for (int j = k; j < n_database; ++j) {
-            // Find max in current top-K
-            int max_idx = 0;
-            for (int m = 1; m < k; ++m) {
-                if (dists[m] > dists[max_idx]) {
-                    max_idx = m;
-                }
+// Host-side L2 distance computation (GPU version in .cu file)
+void compute_l2_distances_host(const float* queries, const float* database,
+                                float* distances, int n_queries,
+                                int n_database, int dim) {
+    for (int i = 0; i < n_queries; ++i) {
+        for (int j = 0; j < n_database; ++j) {
+            float dist = 0.0f;
+            for (int d = 0; d < dim; ++d) {
+                float diff = queries[i * dim + d] - database[j * dim + d];
+                dist += diff * diff;
             }
-            
-            // Replace if current distance is smaller
-            if (q_dists[j] < dists[max_idx]) {
-                dists[max_idx] = q_dists[j];
-                idxs[max_idx] = j;
-            }
-        }
-        
-        // Write results
-        float* out_dists = const_cast<float*>(distances) + q_idx * k;
-        int64_t* out_idxs = const_cast<int64_t*>(indices) + q_idx * k;
-        
-        for (int j = 0; j < k; ++j) {
-            out_dists[j] = dists[j];
-            out_idxs[j] = idxs[j];
+            distances[i * n_database + j] = dist;
         }
     }
 }
@@ -179,26 +129,10 @@ CudaFlatIndex::search(const float* queries, int n_queries, int k, int dim) {
         return {{}, {}};
     }
     
-    // Allocate GPU memory for queries
-    float* d_queries = nullptr;
-    cudaMalloc(&d_queries, n_queries * dim * sizeof(float));
-    cudaMemcpy(d_queries, queries, n_queries * dim * sizeof(float),
-               cudaMemcpyHostToDevice);
-    
-    // Compute L2 distances
+    // Compute L2 distances on host (GPU version uses device_data_)
     std::vector<float> distances(n_queries * ntotal_);
-    float* d_distances = nullptr;
-    cudaMalloc(&d_distances, n_queries * ntotal_ * sizeof(float));
-    
-    int block_size = 256;
-    int grid_size = (n_queries * ntotal_ + block_size - 1) / block_size;
-    
-    l2_distance_kernel<<<grid_size, block_size>>>(
-        d_queries, device_data_, d_distances, n_queries, ntotal_, dim);
-    
-    // Copy distances back to host
-    cudaMemcpy(distances.data(), d_distances, 
-               n_queries * ntotal_ * sizeof(float), cudaMemcpyDeviceToHost);
+    compute_l2_distances_host(queries, data_, distances.data(),
+                              n_queries, ntotal_, dim);
     
     // Find top-K on host (for now)
     std::vector<float> result_dists(n_queries * k);
@@ -222,10 +156,6 @@ CudaFlatIndex::search(const float* queries, int n_queries, int k, int dim) {
             result_idxs[i * k + j] = idxs[j];
         }
     }
-    
-    // Cleanup
-    cudaFree(d_queries);
-    cudaFree(d_distances);
     
     return {result_dists, result_idxs};
 }

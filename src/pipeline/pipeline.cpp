@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "voxmutatio/pipeline/pipeline.h"
+#include "voxmutatio/io/audio_io.h"
 
 #include <chrono>
 #include <cmath>
