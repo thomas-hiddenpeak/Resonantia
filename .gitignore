@@ -1,0 +1,67 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.lib
+*.dll
+*.exe
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-*
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# CUDA
+*.cuo
+*.cubin
+*.ptx
+
+# Python (conversion tool only)
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.whl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models and weights (large files)
+models/
+*.safetensors
+*.pth
+*.pt
+*.bin
+*.ckpt
+*.index
+
+# Audio test fixtures
+test_audio/
+*.wav
+*.flac
+*.mp3
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/

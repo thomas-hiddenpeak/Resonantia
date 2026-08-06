@@ -1,0 +1,59 @@
+# Resonantia C++ Style Guide (Google C++ Style + Project Extensions)
+
+## Language
+- **C++20** standard
+- **CUDA 20** standard for `.cu` files
+
+## Naming Conventions
+
+| Element | Convention | Example |
+|---------|-----------|---------|
+| Files | `snake_case` | `hubert_encoder.h`, `cuda_flat_index.cu` |
+| Namespaces | `snake_case` | `voxmutatio::content` |
+| Types/Classes | `PascalCase` | `HubertEncoder`, `AudioBuffer` |
+| Functions | `snake_case` | `extract_features()`, `init()` |
+| Variables | `snake_case` | `num_samples`, `sample_rate` |
+| Members | `snake_case_` (trailing underscore) | `output_dim_`, `half_precision_` |
+| Constants | `kPascalCase` | `kHubertHiddenDim`, `kVitsSegmentSize` |
+| Enums | `enum class` with `kPascalCase` values | `ModelVersion::kV1` |
+| Macros | `K_SNAKE_CASE` (avoid when possible) | - |
+
+## Header Guards
+- Use `#pragma once` for all headers
+
+## Namespace Style
+- Use single-line nested syntax (C++17):
+  ```cpp
+  namespace voxmutatio::content {
+  // ...
+  }  // namespace voxmutatio::content
+  ```
+
+## Constexpr & Static Assert (宪法治理)
+- Use `static_assert` for compile-time validation:
+  ```cpp
+  static_assert(kHubertHiddenDim == 768U);
+  static_assert(sizeof(AudioBuffer) == expected_size);
+  ```
+- Use `constexpr` for compile-time computation
+- Use `[[nodiscard]]` on all value-returning functions
+- Use `noexcept` on non-throwing functions
+
+## Number Literals
+- Use C++14 digit separators: `16'000`, `40'000`, `3200U`
+- Use `U` suffix for unsigned: `256U`, `768U`
+
+## Includes
+- Order: system headers → third-party → project headers
+- Use quotes for project headers: `#include "voxmutatio/core/types.h"`
+
+## Formatting
+- See `.clang-format` for automatic formatting rules
+- 4 spaces for indentation (no tabs)
+- 100 character line limit
+
+## CUDA Specific
+- `.cu` files for device code
+- `.cuh` files for device headers (internal use)
+- Use `__device__`, `__host__ __device__` qualifiers appropriately
+- Use `cudaMalloc`/`cudaFree` or custom allocator from `core/allocator.h`

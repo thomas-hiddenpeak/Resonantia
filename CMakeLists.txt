@@ -1,0 +1,125 @@
+cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
+
+project(Resonantia VERSION 0.1.0 LANGUAGES CXX CUDA)
+
+# ============================================================================
+# 编译标准: C++20 + CUDA20
+# ============================================================================
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# ============================================================================
+# CUDA 架构: SM87 (Jetson AGX Orin)
+# ============================================================================
+set(VOXMUTATIO_CUDA_ARCHITECTURES "87" CACHE STRING
+    "CUDA architectures for Resonantia (87 is Jetson AGX Orin)")
+set(CMAKE_CUDA_ARCHITECTURES "${VOXMUTATIO_CUDA_ARCHITECTURES}")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_87,code=sm_87 --expt-relaxed-constexpr -O3 --use_fast_math -Xptxas -O3")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
+
+# ============================================================================
+# 依赖
+# ============================================================================
+find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
+
+# ============================================================================
+# 包含目录
+# ============================================================================
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+# ============================================================================
+# 核心静态库 (voxmutatio — voice conversion engine)
+# ============================================================================
+file(GLOB_RECURSE VOXMUTATIO_SOURCES
+    "src/core/*.cpp"
+    "src/separation/*.cpp"
+    "src/separation/*.cu"
+    "src/content/*.cpp"
+    "src/content/*.cu"
+    "src/f0/*.cpp"
+    "src/f0/*.cu"
+    "src/index/*.cpp"
+    "src/index/*.cu"
+    "src/synthesizer/*.cpp"
+    "src/synthesizer/*.cu"
+    "src/training/*.cpp"
+    "src/training/*.cu"
+    "src/pipeline/*.cpp"
+    "src/io/*.cpp"
+    "src/webui/*.cpp"
+)
+
+add_library(voxmutatio STATIC ${VOXMUTATIO_SOURCES})
+target_link_libraries(voxmutatio PRIVATE
+    CUDA::cudart
+    CUDA::cublas
+    Threads::Threads
+)
+target_include_directories(voxmutatio PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# ============================================================================
+# 工具
+# ============================================================================
+add_executable(vc_convert tools/vc_convert.cpp)
+target_include_directories(vc_convert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(vc_convert PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
+set_target_properties(vc_convert PROPERTIES
+    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+    LINK_FLAGS "-Wl,--disable-new-dtags"
+)
+
+add_executable(vc_batch tools/vc_batch.cpp)
+target_include_directories(vc_batch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(vc_batch PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
+set_target_properties(vc_batch PROPERTIES
+    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+    LINK_FLAGS "-Wl,--disable-new-dtags"
+)
+
+add_executable(vc_probe tools/vc_probe.cpp)
+target_include_directories(vc_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(vc_probe PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
+set_target_properties(vc_probe PROPERTIES
+    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+    LINK_FLAGS "-Wl,--disable-new-dtags"
+)
+
+# ============================================================================
+# 测试
+# ============================================================================
+option(VOXMUTATIO_BUILD_TESTS "Build test executables" ON)
+
+if(VOXMUTATIO_BUILD_TESTS)
+    enable_testing()
+
+    add_executable(test_hubert tests/test_hubert.cpp)
+    target_link_libraries(test_hubert PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
+    add_test(NAME test_hubert COMMAND test_hubert)
+
+    add_executable(test_f0 tests/test_f0.cpp)
+    target_link_libraries(test_f0 PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
+    add_test(NAME test_f0 COMMAND test_f0)
+
+    add_executable(test_synthesizer tests/test_synthesizer.cpp)
+    target_link_libraries(test_synthesizer PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
+    add_test(NAME test_synthesizer COMMAND test_synthesizer)
+
+    add_executable(test_pipeline tests/test_pipeline.cpp)
+    target_link_libraries(test_pipeline PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
+    add_test(NAME test_pipeline COMMAND test_pipeline)
+endif()
