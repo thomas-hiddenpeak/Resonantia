@@ -80,4 +80,57 @@ std::vector<float> conv1d(const float* input, int seq_len, int channels,
                           const float* weight, int out_channels,
                           int kernel_size);
 
+// ============================================================================
+// HuBERT-specific operations (numerically aligned with transformers)
+// ============================================================================
+
+/// Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
+void gelu_exact(const float* input, float* output, int size);
+
+/// 1D convolution, strided, no padding (channels-first layout)
+/// input: [in_channels, in_len]
+/// weight: [out_channels, in_channels, kernel]
+/// bias: [out_channels] or nullptr
+/// Returns: [out_channels, out_len], out_len = (in_len - kernel) / stride + 1
+std::vector<float> conv1d_strided(const float* input, int in_channels, int in_len,
+                                   const float* weight, const float* bias,
+                                   int out_channels, int kernel, int stride);
+
+/// Grouped 1D convolution with padding (channels-first layout)
+/// input: [in_channels, in_len]
+/// weight: [out_channels, in_channels/groups, kernel]
+/// bias: [out_channels] or nullptr
+/// Returns: [out_channels, out_len]
+std::vector<float> conv1d_grouped(const float* input, int in_channels, int in_len,
+                                   const float* weight, const float* bias,
+                                   int out_channels, int kernel, int stride,
+                                   int padding, int groups);
+
+/// Group normalization (channels-first: [channels, length])
+/// Normalizes over (channels/num_groups, length) per group.
+/// weight, bias: [channels]
+void group_norm(const float* input, float* output, int channels, int length,
+                int num_groups, const float* weight, const float* bias,
+                float eps = 1e-5f);
+
+/// Layer normalization with affine transform (row-major [seq_len, dim])
+/// Normalizes over last dim. weight, bias: [dim]
+std::vector<float> layer_norm_affine(const float* input, int seq_len, int dim,
+                                      const float* weight, const float* bias,
+                                      float eps = 1e-5f);
+
+/// Multi-head attention with proper head splitting.
+/// q, k, v: [seq_len, dim] where dim = num_heads * head_dim
+/// Applies scaling 1/sqrt(head_dim). Returns [seq_len, dim].
+std::vector<float> multihead_attention_split(const float* q, const float* k,
+                                              const float* v,
+                                              int seq_len, int dim,
+                                              int num_heads);
+
+/// Linear layer: output = input @ weight^T + bias
+/// input: [M, K], weight: [N, K] (PyTorch layout), bias: [N] or nullptr
+/// Returns: [M, N]
+std::vector<float> linear(const float* input, int M, int K,
+                          const float* weight, const float* bias, int N);
+
 }  // namespace voxmutatio::content::cuda

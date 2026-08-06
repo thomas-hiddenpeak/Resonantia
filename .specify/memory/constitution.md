@@ -34,7 +34,17 @@
 ### IX. Integration-First Testing
 优先端到端集成测试（完整 Pipeline），而非孤立的单元测试。`test_pipeline.cpp` 是最高优先级的测试。
 
-### X. Python Isolation (NON-NEGOTIABLE)
+### X. Real Audio Only (NON-NEGOTIABLE)
+**所有测试必须使用真实音频数据，禁止使用合成数据（正弦波、白噪声等）进行功能验证。**
+- ✅ 必须使用真实人声录音进行测试
+- ❌ 禁止使用正弦波、多音信号、白噪声等合成音频替代真实人声
+- ❌ 合成数据仅可用于底层工具函数的 smoke test（如 resample 尺寸检查）
+- 原因：语音转换的特征分布（HuBERT 特征、F0 轮廓、能量包络）与合成信号完全不同
+  - 正弦波的 HuBERT 特征无意义
+  - 合成信号无法测试 F0 提取器的真实表现
+  - 无法验证 index search 在真实特征空间中的效果
+
+### XI. Python Isolation (NON-NEGOTIABLE)
 **`tools/` 是唯一允许使用 Python 的目录**。所有 Python 脚本必须通过 `uv` 管理虚拟环境，确保系统环境干净：
 - 权重转换工具 (`tools/convert_to_safetensors.py`) — 一次性使用
 - 数据预处理工具 — 训练前准备

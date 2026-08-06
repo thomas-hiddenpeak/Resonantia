@@ -64,7 +64,18 @@ bool read_wav(const std::string& path, std::vector<float>& samples,
         file.read(reinterpret_cast<char*>(&chunk_size), 4);
         
         if (std::memcmp(chunk_id, "fmt ", 4) == 0) {
-            file.read(reinterpret_cast<char*>(&fmt_chunk), sizeof(fmt_chunk));
+            // Read the fmt body (chunk_id + chunk_size already consumed).
+            // Standard PCM fmt body is 16 bytes.
+            file.read(reinterpret_cast<char*>(&fmt_chunk.audio_format), 2);
+            file.read(reinterpret_cast<char*>(&fmt_chunk.num_channels), 2);
+            file.read(reinterpret_cast<char*>(&fmt_chunk.sample_rate), 4);
+            file.read(reinterpret_cast<char*>(&fmt_chunk.byte_rate), 4);
+            file.read(reinterpret_cast<char*>(&fmt_chunk.block_align), 2);
+            file.read(reinterpret_cast<char*>(&fmt_chunk.bits_per_sample), 2);
+            // Skip any extra fmt bytes (e.g. WAVE_FORMAT_EXTENSIBLE)
+            if (chunk_size > 16) {
+                file.seekg(chunk_size - 16, std::ios::cur);
+            }
             has_fmt = true;
         } else if (std::memcmp(chunk_id, "data", 4) == 0) {
             data_chunk.chunk_size = chunk_size;

@@ -17,6 +17,65 @@ namespace voxmutatio::io {
 
 namespace {
 
+// Skip whitespace
+inline void skip_ws(const char*& p, const char* end) {
+    while (p < end && (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r')) ++p;
+}
+
+// Parse a JSON string (assumes *p == '"'). Returns content, advances past closing quote.
+std::string parse_string(const char*& p, const char* end) {
+    std::string out;
+    if (p >= end || *p != '"') return out;
+    ++p;  // opening quote
+    while (p < end && *p != '"') {
+        if (*p == '\\' && p + 1 < end) ++p;  // skip escape
+        out.push_back(*p);
+        ++p;
+    }
+    if (p < end && *p == '"') ++p;  // closing quote
+    return out;
+}
+
+// Parse a JSON integer, advancing p.
+long long parse_int(const char*& p, const char* end) {
+    skip_ws(p, end);
+    bool neg = false;
+    if (p < end && *p == '-') { neg = true; ++p; }
+    long long v = 0;
+    while (p < end && *p >= '0' && *p <= '9') {
+        v = v * 10 + (*p - '0');
+        ++p;
+    }
+    return neg ? -v : v;
+}
+
+// Skip a JSON value (object, array, string, or number) at *p.
+void skip_value(const char*& p, const char* end) {
+    skip_ws(p, end);
+    if (p >= end) return;
+    if (*p == '{') {
+        int depth = 0;
+        do {
+            if (*p == '{') ++depth;
+            else if (*p == '}') --depth;
+            else if (*p == '"') { parse_string(p, end); continue; }
+            ++p;
+        } while (p < end && depth > 0);
+    } else if (*p == '[') {
+        int depth = 0;
+        do {
+            if (*p == '[') ++depth;
+            else if (*p == ']') --depth;
+            else if (*p == '"') { parse_string(p, end); continue; }
+            ++p;
+        } while (p < end && depth > 0);
+    } else if (*p == '"') {
+        parse_string(p, end);
+    } else {
+        while (p < end && *p != ',' && *p != '}' && *p != ']') ++p;
+    }
+}
+
 // Parse safetensors header (JSON format)
 // Header format: 8-byte little-endian uint64 length + JSON body
 bool parse_header(const uint8_t* data, std::size_t data_size,
@@ -26,139 +85,99 @@ bool parse_header(const uint8_t* data, std::size_t data_size,
         return false;
     }
 
-    // Read header length (little-endian uint64)
     uint64_t header_length = 0;
     std::memcpy(&header_length, data, 8);
-    
+
     if (header_length == 0 || header_length + 8 > data_size) {
         return false;
     }
 
-    // Parse JSON header (simple manual parser for safetensors format)
-    const char* json = reinterpret_cast<const char*>(data + 8);
-    
-    // Skip opening '{'
-    const char* p = json + 1;
-    
-    while (*p && *p != '}') {
-        // Skip whitespace and commas
-        while (*p && (*p == ' ' || *p == ',' || *p == '\n')) ++p;
-        if (*p == '}') break;
+    const char* p = reinterpret_cast<const char*>(data + 8);
+    const char* end = p + header_length;
+    const std::size_t data_section_start = header_length + 8;
 
-        // Parse tensor name (quoted string)
+    skip_ws(p, end);
+    if (p >= end || *p != '{') return false;
+    ++p;  // opening '{'
+
+    while (p < end) {
+        skip_ws(p, end);
+        if (p >= end || *p == '}') break;
+        if (*p == ',') { ++p; continue; }
         if (*p != '"') break;
-        ++p; // skip opening quote
-        
-        const char* name_start = p;
-        while (*p && *p != '"') ++p;
-        std::string name(name_start, p - name_start);
-        ++p; // skip closing quote
 
-        // Skip ': '
-        while (*p && (*p == ' ' || *p == ':')) ++p;
+        std::string name = parse_string(p, end);
+        skip_ws(p, end);
+        if (p < end && *p == ':') ++p;
+        skip_ws(p, end);
 
-        // Parse object {dtype, shape, data_offsets}
-        if (*p != '{') break;
-        ++p; // skip opening '{'
+        // Skip the __metadata__ entry (maps to a string dict, not a tensor)
+        if (name == "__metadata__") {
+            skip_value(p, end);
+            continue;
+        }
+
+        if (p >= end || *p != '{') break;
+        ++p;  // tensor object '{'
 
         Tensor t;
         t.name = name;
-        
-        while (*p && *p != '}') {
-            // Skip whitespace and commas
-            while (*p && (*p == ' ' || *p == ',')) ++p;
-            if (*p == '}') break;
+        long long start_offset = 0, end_offset = 0;
 
-            // Parse key
+        while (p < end) {
+            skip_ws(p, end);
+            if (p >= end || *p == '}') break;
+            if (*p == ',') { ++p; continue; }
             if (*p != '"') break;
-            ++p;
-            const char* key_start = p;
-            while (*p && *p != '"') ++p;
-            std::string key(key_start, p - key_start);
-            ++p; // skip closing quote
 
-            // Skip ': '
-            while (*p && (*p == ' ' || *p == ':')) ++p;
+            std::string key = parse_string(p, end);
+            skip_ws(p, end);
+            if (p < end && *p == ':') ++p;
+            skip_ws(p, end);
 
             if (key == "dtype") {
-                // Skip dtype value (we don't need it for now)
-                if (*p == '"') {
-                    ++p;
-                    while (*p && *p != '"') ++p;
-                    ++p;
-                }
+                parse_string(p, end);
             } else if (key == "shape") {
-                // Parse [dim1, dim2, ...]
-                if (*p != '[') break;
-                ++p;
-                while (*p && *p != ']') {
-                    while (*p && *p != ',') {
-                        if (*p >= '0' && *p <= '9') {
-                            long long val = 0;
-                            while (*p >= '0' && *p <= '9') {
-                                val = val * 10 + (*p - '0');
-                                ++p;
-                            }
-                            t.shape.push_back(static_cast<int64_t>(val));
-                            continue;
-                        }
-                        ++p;
+                if (p < end && *p == '[') {
+                    ++p;
+                    while (p < end && *p != ']') {
+                        skip_ws(p, end);
+                        if (*p == ']') break;
+                        long long dim = parse_int(p, end);
+                        t.shape.push_back(static_cast<int64_t>(dim));
+                        skip_ws(p, end);
+                        if (p < end && *p == ',') ++p;
                     }
-                    if (*p == ',') ++p;
+                    if (p < end && *p == ']') ++p;
                 }
-                if (*p == ']') ++p;
             } else if (key == "data_offsets") {
-                // Parse [start_offset, end_offset]
-                // Note: offsets are relative to the start of the data section (after header + 8 bytes)
-                if (*p != '[') break;
-                ++p;
-                
-                // Skip whitespace
-                while (*p && (*p == ' ' || *p == '\n')) ++p;
-                
-                // Read start offset
-                long long start_offset = 0;
-                {
-                    const char* num_start = p;
-                    while (*p >= '0' && *p <= '9') ++p;
-                    if (num_start != p) {
-                        start_offset = std::stoll(std::string(num_start, p));
-                    }
+                if (p < end && *p == '[') {
+                    ++p;
+                    start_offset = parse_int(p, end);
+                    skip_ws(p, end);
+                    if (p < end && *p == ',') ++p;
+                    end_offset = parse_int(p, end);
+                    skip_ws(p, end);
+                    if (p < end && *p == ']') ++p;
                 }
-                
-                // Skip comma and whitespace
-                while (*p && (*p == ' ' || *p == ',' || *p == '\n')) ++p;
-                
-                // Read end offset
-                long long end_offset = 0;
-                {
-                    const char* num_start = p;
-                    while (*p >= '0' && *p <= '9') ++p;
-                    if (num_start != p) {
-                        end_offset = std::stoll(std::string(num_start, p));
-                    }
-                }
-                
-                // Data section starts after header (8 bytes length + header_length bytes JSON)
-                std::size_t data_section_start = header_length + 8;
-                
-                t.data_offset = data_section_start + static_cast<std::size_t>(start_offset);
-                t.data_nbytes = static_cast<std::size_t>(end_offset - start_offset);
-                
-                // Calculate strides (row-major, float32)
-                if (!t.shape.empty()) {
-                    int64_t stride = 4; // float32 = 4 bytes
-                    for (int64_t i = t.shape.size() - 1; i >= 0; --i) {
-                        t.strides.push_back(stride);
-                        stride *= t.shape[i];
-                    }
-                    std::reverse(t.strides.begin(), t.strides.end());
-                }
-                
-                if (*p == ',') ++p;
+            } else {
+                skip_value(p, end);
             }
         }
-        if (*p == '}') ++p;
+        if (p < end && *p == '}') ++p;  // close tensor object
+
+        t.data_offset = data_section_start + static_cast<std::size_t>(start_offset);
+        t.data_nbytes = static_cast<std::size_t>(end_offset - start_offset);
+
+        // Row-major strides (float32)
+        if (!t.shape.empty()) {
+            int64_t stride = 4;
+            for (int64_t i = static_cast<int64_t>(t.shape.size()) - 1; i >= 0; --i) {
+                t.strides.push_back(stride);
+                stride *= t.shape[i];
+            }
+            std::reverse(t.strides.begin(), t.strides.end());
+        }
 
         tensors[name] = t;
     }
