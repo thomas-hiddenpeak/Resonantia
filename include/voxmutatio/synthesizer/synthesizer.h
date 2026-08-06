@@ -82,12 +82,30 @@ public:
     /// Check if model uses F0 conditioning
     [[nodiscard]] bool has_f0() const noexcept { return has_f0_; }
 
+    /// Test hook: run TextEncoder only, return m_p [inter_channels, T].
+    std::vector<float> debug_text_encoder(const float* features, int frames,
+                                          const int* pitch_coarse);
+
+    /// Test hook: run TextEncoder + Flow, return z [inter_channels, T].
+    std::vector<float> debug_flow(const float* features, int frames,
+                                  const int* pitch_coarse, int speaker_id);
+
+    /// Test hook: sine source har [T*upp].
+    std::vector<float> debug_har(const float* f0, int frames);
+
+    /// Test hook: conv_pre + cond output [512, T].
+    std::vector<float> debug_convpre(const float* z, int frames, int speaker_id);
+
+    /// Test hook: generator intermediates. which: 0=ups0, 1=noiseconv0, 2=stage0.
+    std::vector<float> debug_gen_stage0(const float* z, const float* f0,
+                                        int frames, int speaker_id, int which);
+
 private:
+    SynthesizerConfig config_;
     int sample_rate_ = 40'000;
     ModelVersion version_ = ModelVersion::kV1;
     bool has_f0_ = true;
     int num_speakers_ = 1;
-    // Model weights and GPU buffers (implementation details in .cu)
 };
 
 }  // namespace voxmutatio::synthesizer

@@ -81,6 +81,13 @@ if __name__ == "__main__":
 
     torch.manual_seed(0)
 
+    # Make inference fully deterministic: disable all Gaussian noise
+    # (flow noise_scale=0 handled manually; SineGen additive noise -> 0).
+    _orig_randn_like = torch.randn_like
+    torch.randn_like = lambda x, *a, **k: torch.zeros_like(x)
+    _orig_randn = torch.randn
+    torch.randn = lambda *a, **k: torch.zeros(*a, **k)
+
     print("Building SynthesizerTrnMs768NSFsid (40k v2)...")
     net_g = SynthesizerTrnMs768NSFsid(**CONFIG)
     state = load_file(os.path.join(MODELS_DIR, "pretrained_v2",
@@ -141,6 +148,31 @@ if __name__ == "__main__":
         print(f"  Output audio: {audio.shape} ({len(audio)/40000:.2f}s @ 40kHz)")
         save_bin(os.path.join(FIXTURES_DIR, "vits_ref_audio.bin"), audio.reshape(-1, 1))
         sf.write(os.path.join(FIXTURES_DIR, "vits_ref_output.wav"), audio, 40000)
+
+        # --- Generator intermediates for debugging ---
+        dec = net_g.dec
+        har, _, _ = dec.m_source(nsff0, dec.upp)  # [1, T*upp, 1]
+        har_t = har.transpose(1, 2)  # [1, 1, T*upp]
+        save_bin(os.path.join(FIXTURES_DIR, "vits_ref_har.bin"),
+                 har_t[0, 0].numpy().reshape(-1, 1))
+        xg = dec.conv_pre(z * x_mask)
+        xg = xg + dec.cond(g)
+        save_bin(os.path.join(FIXTURES_DIR, "vits_ref_convpre.bin"), xg[0].numpy())
+
+        # Manual first upsample stage
+        import torch.nn.functional as _F
+        x1 = _F.leaky_relu(xg, dec.lrelu_slope)
+        x1 = dec.ups[0](x1)
+        save_bin(os.path.join(FIXTURES_DIR, "vits_ref_ups0.bin"), x1[0].detach().numpy())
+        x1s = dec.noise_convs[0](har_t)
+        save_bin(os.path.join(FIXTURES_DIR, "vits_ref_noiseconv0.bin"), x1s[0].detach().numpy())
+        x1 = x1 + x1s
+        xs = None
+        for j in range(3):
+            rb = dec.resblocks[j](x1)
+            xs = rb if xs is None else xs + rb
+        x1 = xs / 3
+        save_bin(os.path.join(FIXTURES_DIR, "vits_ref_stage0.bin"), x1[0].detach().numpy())
 
     print("\nDone! VITS reference files:")
     for f in sorted(os.listdir(FIXTURES_DIR)):
