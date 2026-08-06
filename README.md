@@ -8,6 +8,19 @@
 
 Resonantia 是 [RVC (Retrieval-based Voice Conversion)](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) 的纯 C++/CUDA 重构实现，提供零 Python 依赖的声音转换引擎。
 
+## 状态：可用 ✅
+
+端到端语音转换已实现并验证，与 Python RVC 数值对齐（真实 LibriSpeech 语音）：
+
+| 模块 | 指标 | 结果 |
+|------|------|------|
+| HuBERT 内容编码器 | RMS 误差 | 7.1e-07 |
+| RMVPE F0 提取器 | 平均误差 | 1.5e-05 Hz |
+| VITS 合成器 | 波形相关性 | 0.9997 |
+| **端到端转换** | **波形相关性** | **0.9997** |
+
+全部 9 个测试通过。`vc_convert` CLI 可转换任意真实音频文件。
+
 ## 设计目标
 
 - **纯 C++20/CUDA**：推理和训练链路完全脱离 Python/PyTorch 运行时

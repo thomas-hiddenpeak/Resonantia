@@ -77,6 +77,13 @@ int main(int argc, char** argv) {
         else if (arg == "--protect" && i + 1 < argc) config.protect = std::atof(argv[++i]);
         else if (arg == "--half") config.use_half_precision = true;
         else if (arg == "--device" && i + 1 < argc) config.device = argv[++i];
+        else if (arg == "--version" && i + 1 < argc) {
+            std::string v = argv[++i];
+            config.version = (v == "v2") ? voxmutatio::ModelVersion::kV2
+                                         : voxmutatio::ModelVersion::kV1;
+        }
+        else if (arg == "--speakers" && i + 1 < argc) config.num_speakers = std::atoi(argv[++i]);
+        else if (arg == "--sr" && i + 1 < argc) config.model_sample_rate = std::atoi(argv[++i]);
         else {
             std::cerr << "Unknown argument: " << arg << "\n";
             return 1;
