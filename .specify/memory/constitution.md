@@ -107,12 +107,17 @@
    - [ ] **所有 Success Criteria** 已验证达标（数值对齐/性能指标）
    - [ ] **Edge Cases** 已处理并有测试覆盖
    - [ ] **集成测试通过** (`test_pipeline.cpp` 端到端验证)
+   - [ ] **实际运行验证**: 至少一次完整的端到端推理已成功执行
+   - [ ] **模型权重**: 所有必需的 safetensors 权重已加载并验证
    
    **禁止行为**：
    - ❌ 仅有骨架代码就标记 Complete
    - ❌ 测试未运行就标记 Complete
    - ❌ 测试有失败就标记 Complete
    - ❌ 数值对齐未验证就标记 Complete
+   - ❌ **没有实际运行过推理就标记 Complete**
+   - ❌ **没有加载过真实模型权重就标记 Complete**
+   - ❌ **仅靠单元测试通过就标记 Complete**（必须包含集成测试）
    
    **Completion Checklist 模板**：
    ```
@@ -125,6 +130,7 @@
    - ...
    - [x] Edge cases: all handled
    - [x] Integration test: passed
+   - [x] Actual inference: executed successfully with real models
    ```
 
 ### Authority
