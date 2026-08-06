@@ -97,6 +97,36 @@
    - 改善/扩展现有 Spec 的功能 → 更新现有 `spec.md`，version +1
    - 完全独立的新功能 → 创建新 Spec `specs/###-new-feature/`
 
+6. **Spec Completion Criteria (NON-NEGOTIABLE)**:
+   
+   Spec 标记为 `Complete` 必须满足以下**所有**条件：
+   
+   - [ ] **所有 FR (Functional Requirements)** 已有对应的实现代码
+   - [ ] **所有 Acceptance Scenarios** 已有对应的测试用例
+   - [ ] **所有测试用例均已通过** (`ctest` 或等价工具)
+   - [ ] **所有 Success Criteria** 已验证达标（数值对齐/性能指标）
+   - [ ] **Edge Cases** 已处理并有测试覆盖
+   - [ ] **集成测试通过** (`test_pipeline.cpp` 端到端验证)
+   
+   **禁止行为**：
+   - ❌ 仅有骨架代码就标记 Complete
+   - ❌ 测试未运行就标记 Complete
+   - ❌ 测试有失败就标记 Complete
+   - ❌ 数值对齐未验证就标记 Complete
+   
+   **Completion Checklist 模板**：
+   ```
+   ## Completion Checklist
+   - [x] FR-001: Implementation + test passed
+   - [x] FR-002: Implementation + test passed
+   - ...
+   - [x] SC-001: L2 error < 1e-4 verified
+   - [x] SC-002: F0 error < 0.5 Hz verified
+   - ...
+   - [x] Edge cases: all handled
+   - [x] Integration test: passed
+   ```
+
 ### Authority
 
 - **Authority**: Principles I-VI 和 X 是强制门控。违反原则的代码不得合并。
@@ -111,4 +141,4 @@
   - PATCH = 澄清和非语义修改
 - Compliance review: 每个 PR 必须验证合规性
 
-**Version**: 1.2.0 | **Ratified**: 2026-08-07 | **Last Amended**: 2026-08-07
+**Version**: 1.3.0 | **Ratified**: 2026-08-07 | **Last Amended**: 2026-08-07
