@@ -34,6 +34,14 @@
 ### IX. Integration-First Testing
 优先端到端集成测试（完整 Pipeline），而非孤立的单元测试。`test_pipeline.cpp` 是最高优先级的测试。
 
+### X. Python Isolation (NON-NEGOTIABLE)
+**`tools/` 是唯一允许使用 Python 的目录**。所有 Python 脚本必须通过 `uv` 管理虚拟环境，确保系统环境干净：
+- 权重转换工具 (`tools/convert_to_safetensors.py`) — 一次性使用
+- 数据预处理工具 — 训练前准备
+- **禁止**在 `src/`, `tests/`, `include/`, `CMakeLists.txt` 中引入任何 Python 依赖
+- **禁止**在 CMake 中使用 `find_package(Python)` 或执行 Python 脚本
+- `tools/` 目录下必须包含 `pyproject.toml` 和 `.python-version` 定义 uv 环境
+
 ## Coding Standards
 
 ### Language
@@ -60,7 +68,7 @@
 
 ## Governance
 
-- **Authority**: Principles I-VI 是强制门控。违反原则的代码不得合并。
+- **Authority**: Principles I-VI 和 X 是强制门控。违反原则的代码不得合并。
 - **Amendments**: 修改需要 PR + 理由 + 维护者审批 + 版本升级
 - **Versioning policy (SemVer for governance)**:
   - MAJOR = 不兼容的治理变更
@@ -68,4 +76,4 @@
   - PATCH = 澄清和非语义修改
 - **Compliance review**: 每个 PR 必须验证合规性
 
-**Version**: 1.0.0 | **Ratified**: 2026-08-07 | **Last Amended**: 2026-08-07
+**Version**: 1.1.0 | **Ratified**: 2026-08-07 | **Last Amended**: 2026-08-07

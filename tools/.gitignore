@@ -1,0 +1,10 @@
+# Python virtual environment (managed by uv)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Weight files (large, use Git LFS or download separately)
+*.safetensors
+*.pth
+*.pt
