@@ -2,22 +2,42 @@
 
 **Feature Branch**: `001-voice-conversion-engine`
 **Created**: 2026-08-07
-**Status**: Complete
+**Status**: Draft
+
+## Current Status (Honest Assessment)
+
+### What Works
+- ✅ Code compiles (CMake build succeeds)
+- ✅ Unit tests pass (5/5 - core, io, f0, index, pipeline config)
+- ✅ CUDA kernels compile (cuBLAS, cuFFT linked)
+
+### What Does NOT Work
+- ❌ No model weights available (safetensors)
+- ❌ No actual voice conversion ever executed
+- ❌ No numerical alignment verified (L2, F0, SRCC)
+- ❌ No end-to-end integration test with real audio
+- ❌ Pipeline init fails without model files
+
+### Blockers
+| Blocker | Required For |
+|---------|-------------|
+| HuBERT safetensors weights | Feature extraction |
+| VITS safetensors weights | Audio synthesis |
+| RMVPE safetensors weights | F0 extraction |
+| Python reference outputs (.npz) | Numerical alignment tests |
 
 ## Completion Checklist
 
 Per Constitution v1.3.0 Spec Completion Criteria:
 
-- [x] All FR (Functional Requirements) have implementation code
-- [x] All Acceptance Scenarios have test cases
-- [x] All tests pass (ctest: 5/5 passed)
-- [x] Edge Cases handled (empty, short, long audio, stereo downmix)
-- [x] Integration test passed (test_pipeline.cpp)
-- [ ] SC-001: HuBERT L2 < 1e-4 (pending model weights)
-- [ ] SC-002: F0 error < 0.5 Hz (pending model weights)
-- [ ] SC-003: SRCC > 0.999 (pending model weights)
-
-**Note**: Numerical alignment tests (SC-001/002/003) require safetensors model weights and Python reference outputs. Infrastructure is ready; validation can proceed once weights are available.
+- [ ] All FR have implementation code (skeletons only, not verified)
+- [ ] All Acceptance Scenarios have test cases (not yet)
+- [ ] All tests pass with real data (not yet)
+- [ ] SC-001: HuBERT L2 < 1e-4 (blocked by weights)
+- [ ] SC-002: F0 error < 0.5 Hz (blocked by weights)
+- [ ] SC-003: SRCC > 0.999 (blocked by weights)
+- [ ] Edge Cases handled (unit tests only)
+- [ ] Integration test passed (not yet)
 
 ## User Scenarios & Testing *(mandatory)*
 
