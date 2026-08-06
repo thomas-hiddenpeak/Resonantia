@@ -26,9 +26,13 @@ public:
     [[nodiscard]] static std::vector<float> pitch_shift(
         const std::vector<float>& f0, int semitones);
 
+    /// Extract the raw salience map [T, 360] (for alignment testing).
+    std::vector<float> infer_salience(const float* audio, int num_samples,
+                                      int& out_frames);
+
 private:
     float threshold_ = 0.03f;
-    // Model weights and GPU buffers (implementation details in .cu)
+    RmvpeConfig config_;
 };
 
 }  // namespace voxmutatio::f0
