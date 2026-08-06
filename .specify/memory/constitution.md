@@ -1,0 +1,71 @@
+# Resonantia Constitution
+
+> *Vox mutatur, mens manet.* (声音变化，意识不变。)
+
+## Core Principles
+
+### I. Library-First
+每个功能模块从独立库开始。`src/` 下的每个子目录（`core/`, `content/`, `f0/`, `synthesizer/` 等）都是独立的编译单元，通过清晰的 public header 暴露接口。
+
+### II. CLI Interface
+每个核心功能通过 CLI 工具暴露。`vc_convert`, `vc_batch`, `vc_probe` 等工具是功能的"烟雾测试"入口。
+
+### III. Test-First (NON-NEGOTIABLE)
+每个模块在实现前必须有对应的测试骨架。数值对齐测试（与 Python 原始实现对比）是核心质量门控。
+
+### IV. safetensors-Only
+权重格式锁定 safetensors。零拷贝 mmap 加载，无 pickle 安全风险。PyTorch `.pth` 格式仅通过一次性 Python 转换工具支持。
+
+### V. Zero-Dependency Purity
+推理链路完全脱离 Python/PyTorch 运行时。禁止引入 FAISS、ONNX Runtime 等大型第三方推理库。手写 CUDA Kernel 优先于链接外部库。
+
+### VI. Numerical Alignment
+每个模块的输出必须与 Python 原始实现逐样本对齐：
+- 特征向量: L2 < 1e-4
+- F0 序列: 绝对误差 < 0.5 Hz
+- 合成音频: SRCC > 0.999
+
+### VII. Simplicity
+简单优先，YAGNI (You Ain't Gonna Need It)。不预先实现不确定的功能。WebUI 设计简洁现代，不照搬 RVC-WebUI 的复杂界面。
+
+### VIII. Anti-Abstraction
+直接使用 cuBLAS/CUDA 原语，不包装抽象层。避免"过早抽象"——只有在第三个重复模式出现时才提取公共代码。
+
+### IX. Integration-First Testing
+优先端到端集成测试（完整 Pipeline），而非孤立的单元测试。`test_pipeline.cpp` 是最高优先级的测试。
+
+## Coding Standards
+
+### Language
+- **C++20** / **CUDA 20**
+- **Google C++ Style Guide** 为基础
+- **宪法治理**: `static_assert` / `constexpr` 编译时验证
+
+### Naming
+| Element | Convention | Example |
+|---------|-----------|---------|
+| Files | `snake_case` | `hubert_encoder.h` |
+| Namespaces | `snake_case` 单行嵌套 | `namespace voxmutatio::content {` |
+| Types | `PascalCase` | `HubertEncoder` |
+| Functions | `snake_case` | `extract_features()` |
+| Members | `trailing_` | `output_dim_` |
+| Constants | `kPascalCase` | `kHubertHiddenDim` |
+| Enums | `enum class` + `kPascalCase` | `ModelVersion::kV1` |
+
+### Quality Gates
+- `[[nodiscard]]` on all value-returning functions
+- `noexcept` on non-throwing functions
+- `constexpr` for compile-time computation
+- `static_assert` for invariant validation
+
+## Governance
+
+- **Authority**: Principles I-VI 是强制门控。违反原则的代码不得合并。
+- **Amendments**: 修改需要 PR + 理由 + 维护者审批 + 版本升级
+- **Versioning policy (SemVer for governance)**:
+  - MAJOR = 不兼容的治理变更
+  - MINOR = 新原则/章节
+  - PATCH = 澄清和非语义修改
+- **Compliance review**: 每个 PR 必须验证合规性
+
+**Version**: 1.0.0 | **Ratified**: 2026-08-07 | **Last Amended**: 2026-08-07
