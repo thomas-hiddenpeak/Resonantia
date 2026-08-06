@@ -107,19 +107,36 @@ option(VOXMUTATIO_BUILD_TESTS "Build test executables" ON)
 if(VOXMUTATIO_BUILD_TESTS)
     enable_testing()
 
-    add_executable(test_hubert tests/test_hubert.cpp)
-    target_link_libraries(test_hubert PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
-    add_test(NAME test_hubert COMMAND test_hubert)
+    # Fetch Catch2
+    include(FetchContent)
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG v3.4.0
+    )
+    FetchContent_MakeAvailable(Catch2)
 
+    # Test: Core
+    add_executable(test_core tests/test_core.cpp)
+    target_link_libraries(test_core PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
+    target_include_directories(test_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME test_core COMMAND test_core)
+
+    # Test: Audio I/O
+    add_executable(test_audio_io tests/test_audio_io.cpp)
+    target_link_libraries(test_audio_io PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
+    target_include_directories(test_audio_io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME test_audio_io COMMAND test_audio_io)
+
+    # Test: F0
     add_executable(test_f0 tests/test_f0.cpp)
-    target_link_libraries(test_f0 PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
+    target_link_libraries(test_f0 PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
+    target_include_directories(test_f0 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME test_f0 COMMAND test_f0)
 
-    add_executable(test_synthesizer tests/test_synthesizer.cpp)
-    target_link_libraries(test_synthesizer PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
-    add_test(NAME test_synthesizer COMMAND test_synthesizer)
-
-    add_executable(test_pipeline tests/test_pipeline.cpp)
-    target_link_libraries(test_pipeline PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
-    add_test(NAME test_pipeline COMMAND test_pipeline)
+    # Test: Index
+    add_executable(test_index tests/test_index.cpp)
+    target_link_libraries(test_index PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
+    target_include_directories(test_index PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME test_index COMMAND test_index)
 endif()
