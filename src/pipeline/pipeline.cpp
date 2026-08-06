@@ -1,298 +1,183 @@
 // Copyright 2024 Resonantia Authors.
 // Licensed under the MIT License.
+//
+// End-to-end voice conversion pipeline orchestration.
+// Audio -> HuBERT content -> RMVPE F0 -> VITS synthesis -> Audio.
 
 #include "voxmutatio/pipeline/pipeline.h"
 #include "voxmutatio/io/audio_io.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <fstream>
-#include <numeric>
+#include <vector>
 
 namespace voxmutatio::pipeline {
 
 namespace {
 
-// Compute RMS energy of audio buffer
-float compute_rms(const float* audio, int num_samples) {
-    float sum_sq = 0.0f;
-    for (int i = 0; i < num_samples; ++i) {
-        sum_sq += audio[i] * audio[i];
-    }
-    return std::sqrt(sum_sq / num_samples);
+// Coarse pitch quantization (matches RVC f0_to_coarse), returns 1..255.
+int f0_to_coarse(float f0) {
+    const double f0_mel_min = 1127.0 * std::log(1.0 + 50.0 / 700.0);
+    const double f0_mel_max = 1127.0 * std::log(1.0 + 1100.0 / 700.0);
+    if (f0 <= 0.0f) return 1;
+    double f0_mel = 1127.0 * std::log(1.0 + f0 / 700.0);
+    f0_mel = (f0_mel - f0_mel_min) * 254.0 / (f0_mel_max - f0_mel_min) + 1.0;
+    if (f0_mel <= 1.0) f0_mel = 1.0;
+    if (f0_mel > 255.0) f0_mel = 255.0;
+    int coarse = static_cast<int>(std::lround(f0_mel));
+    return std::clamp(coarse, 1, 255);
 }
 
-// Apply RMS energy blending
-void apply_rms_blend(float* output, const float* source, 
-                     int num_samples, double rms_mix_rate) {
-    if (rms_mix_rate <= 0.0 || rms_mix_rate >= 1.0) {
-        // No blending needed
-        if (rms_mix_rate >= 1.0) {
-            std::memcpy(output, source, num_samples * sizeof(float));
-        }
-        return;
+// Nearest-neighbour 2x interpolation of features [T, D] -> [2T, D].
+std::vector<float> interpolate_2x(const std::vector<float>& feats, int T, int D) {
+    std::vector<float> out(2 * T * D);
+    for (int t = 0; t < T; ++t) {
+        std::memcpy(&out[(2 * t) * D], &feats[t * D], D * sizeof(float));
+        std::memcpy(&out[(2 * t + 1) * D], &feats[t * D], D * sizeof(float));
     }
-    
-    float source_rms = compute_rms(source, num_samples);
-    
-    // Target RMS would be computed from reference audio
-    // For now, we just scale the output
-    for (int i = 0; i < num_samples; ++i) {
-        output[i] = output[i] * rms_mix_rate + source[i] * (1.0 - rms_mix_rate);
-    }
+    return out;
 }
 
-// Apply unvoiced protection
-void apply_uv_protection(std::vector<float>& f0, 
-                         const std::vector<float>& source_f0,
-                         double protect) {
-    if (protect <= 0.0) {
-        return;
-    }
-    
-    for (size_t i = 0; i < f0.size(); ++i) {
-        // If source frame is unvoiced (F0 = 0), protect it
-        if (source_f0[i] == 0.0f && protect > 0.5) {
-            f0[i] = 0.0f;
-        }
-    }
+double compute_rms(const float* x, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; ++i) s += (double)x[i] * x[i];
+    return std::sqrt(s / std::max(1, n));
 }
 
 }  // namespace
 
 bool VoiceConversionPipeline::init(const VCConfig& config) {
     config_ = config;
-    
-    // Initialize content encoder (HuBERT)
-    hubert_cfg_.model_path = config_.hubert_model_path;
-    hubert_cfg_.output_dim = (config_.version == ModelVersion::kV2) ? 768 : 256;
-    hubert_cfg_.half_precision = config_.use_half_precision;
-    
-    if (!hubert_encoder_.init(hubert_cfg_)) {
-        return false;
-    }
-    
-    // Initialize F0 extractor (RMVPE)
-    f0_cfg_.model_path = config_.rmvpe_model_path;
-    
-    if (!f0_extractor_.init(f0_cfg_)) {
-        return false;
-    }
-    
-    // Initialize feature index (optional)
-    if (!config_.index_path.empty()) {
-        if (!feature_index_.load(config_.index_path)) {
-            // Index loading failed, continue without index
-        }
-    }
-    
-    // Initialize synthesizer
-    synth_cfg_.model_path = config_.synthesizer_model_path;
-    synth_cfg_.version = config_.version;
-    synth_cfg_.has_f0 = config_.has_f0;
-    synth_cfg_.half_precision = config_.use_half_precision;
-    
-    if (!synth_.init(synth_cfg_)) {
-        return false;
-    }
-    
-    // Auto-detect model metadata
-    config_.version = synth_.version();
-    config_.has_f0 = synth_.has_f0();
-    config_.num_speakers = synth_.num_speakers();
-    config_.model_sample_rate = synth_.sample_rate();
-    
+
+    hubert_cfg_.model_path = config.hubert_model_path;
+    hubert_cfg_.output_dim = (config.version == ModelVersion::kV2) ? 768 : 768;
+    hubert_cfg_.use_final_proj = (config.version == ModelVersion::kV1);
+    hubert_cfg_.half_precision = config.use_half_precision;
+    hubert_encoder_.init(hubert_cfg_);
+
+    f0_cfg_.model_path = config.rmvpe_model_path;
+    f0_extractor_.init(f0_cfg_);
+
+    synth_cfg_.model_path = config.synthesizer_model_path;
+    synth_cfg_.version = config.version;
+    synth_cfg_.has_f0 = config.has_f0;
+    synth_cfg_.sample_rate = config.model_sample_rate;
+    synth_cfg_.spk_embed_dim = config.num_speakers;
+    synth_.init(synth_cfg_);
+
     initialized_ = true;
     return true;
 }
 
-VCResult VoiceConversionPipeline::convert_file(const std::string& input_path,
-                                                const std::string& output_path,
-                                                int speaker_id) {
-    VCResult result;
-    
-    auto total_start = std::chrono::high_resolution_clock::now();
-    
-    // Load audio
-    auto audio = io::read_audio(input_path, 16000);
-    if (!audio) {
-        result.success = false;
-        result.error_message = "Failed to load audio file: " + input_path;
-        return result;
-    }
-    
-    // Convert buffer
-    VCResult buffer_result = convert_buffer(*audio, speaker_id);
-    
-    if (!buffer_result.success) {
-        return buffer_result;
-    }
-    
-    // Write output
-    if (!io::write_audio(output_path, buffer_result.audio.data.data(),
-                        static_cast<int>(buffer_result.audio.data.size()),
-                        buffer_result.audio.sample_rate,
-                        config_.output_format)) {
-        result.success = false;
-        result.error_message = "Failed to write audio file: " + output_path;
-        return result;
-    }
-    
-    auto total_end = std::chrono::high_resolution_clock::now();
-    buffer_result.total_ms = std::chrono::duration<double, std::milli>(
-        total_end - total_start).count();
-    
-    return buffer_result;
-}
-
 VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
-                                                  int speaker_id) {
+                                                 int speaker_id) {
+    using clock = std::chrono::high_resolution_clock;
     VCResult result;
-    
+    auto t_start = clock::now();
+
     if (!initialized_) {
-        result.success = false;
-        result.error_message = "Pipeline not initialized";
+        result.error_message = "pipeline not initialized";
         return result;
     }
-    
+
+    // 1. Resample input to 16kHz mono for feature extraction
+    std::vector<float> audio16k;
     if (input.sample_rate != 16000) {
-        result.success = false;
-        result.error_message = "Input audio must be 16kHz mono";
+        audio16k = io::resample_linear(input.data.data(),
+                                       static_cast<int>(input.data.size()),
+                                       input.sample_rate, 16000);
+    } else {
+        audio16k = input.data;
+    }
+    int n16k = static_cast<int>(audio16k.size());
+
+    // 2. HuBERT content features [T, 768]
+    auto t0 = clock::now();
+    auto feats = hubert_encoder_.extract(audio16k.data(), n16k);
+    result.hubert_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    if (feats.empty()) {
+        result.error_message = "HuBERT extraction failed";
         return result;
     }
-    
-    auto total_start = std::chrono::high_resolution_clock::now();
-    
-    // Step 1: Extract content features (HuBERT)
-    auto hubert_start = std::chrono::high_resolution_clock::now();
-    
-    std::vector<float> source_features = hubert_encoder_.extract(
-        input.data.data(), static_cast<int>(input.data.size()));
-    
-    auto hubert_end = std::chrono::high_resolution_clock::now();
-    result.hubert_ms = std::chrono::duration<double, std::milli>(
-        hubert_end - hubert_start).count();
-    
-    int frames = static_cast<int>(source_features.size()) / hubert_encoder_.output_dim();
-    
-    // Step 2: Extract F0 (RMVPE)
-    auto f0_start = std::chrono::high_resolution_clock::now();
-    
-    std::vector<float> source_f0;
-    if (config_.has_f0) {
-        source_f0 = f0_extractor_.infer(input.data.data(),
-                                       static_cast<int>(input.data.size()));
-        
-        // Apply pitch shift
-        if (config_.f0_up_key != 0) {
-            source_f0 = f0::RmvpeExtractor::pitch_shift(source_f0, 
-                                                         config_.f0_up_key);
-        }
-        
-        // Apply unvoiced protection
-        apply_uv_protection(source_f0, source_f0, config_.protect);
+    int hop = 320;  // HuBERT hop at 16kHz
+    int T = static_cast<int>(feats.size()) / 768;
+
+    // 3. Interpolate features 2x (50Hz -> 100Hz)
+    auto feats_up = interpolate_2x(feats, T, 768);
+    int Tf = 2 * T;
+
+    // 4. RMVPE F0 [Tr]
+    t0 = clock::now();
+    auto f0 = f0_extractor_.infer(audio16k.data(), n16k);
+    result.f0_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+
+    // 5. Pitch shift
+    if (config_.f0_up_key != 0) {
+        float factor = std::pow(2.0f, config_.f0_up_key / 12.0f);
+        for (auto& v : f0) if (v > 0) v *= factor;
     }
-    
-    auto f0_end = std::chrono::high_resolution_clock::now();
-    result.f0_ms = std::chrono::duration<double, std::milli>(
-        f0_end - f0_start).count();
-    
-    // Step 3: Feature retrieval (optional)
-    auto index_start = std::chrono::high_resolution_clock::now();
-    
-    std::vector<float> target_features = source_features;
-    
-    if (feature_index_.valid() && config_.index_rate > 0.0) {
-        // Search for nearest neighbors
-        auto [distances, indices] = feature_index_.search(
-            source_features.data(), frames, 
-            static_cast<int>(config_.index_rate > 0.0 ? 1 : 0),
-            hubert_encoder_.output_dim());
-        
-        // Reconstruct retrieved features
-        std::vector<float> retrieved(frames * hubert_encoder_.output_dim());
-        for (int i = 0; i < frames; ++i) {
-            auto recon = feature_index_.reconstruct(indices[i], 
-                                                    hubert_encoder_.output_dim());
-            std::memcpy(retrieved.data() + i * hubert_encoder_.output_dim(),
-                       recon.data(), hubert_encoder_.output_dim() * sizeof(float));
-        }
-        
-        // Blend features
-        index::blend_features(target_features.data(), source_features.data(),
-                             retrieved.data(), frames,
-                             hubert_encoder_.output_dim(),
-                             config_.index_rate);
-    }
-    
-    auto index_end = std::chrono::high_resolution_clock::now();
-    result.index_ms = std::chrono::duration<double, std::milli>(
-        index_end - index_start).count();
-    
-    // Step 4: Synthesize audio
-    auto synth_start = std::chrono::high_resolution_clock::now();
-    
-    // Prepare pitch and pitchf arrays
-    std::vector<float> pitch(frames, 0.0f);
-    std::vector<float> pitchf(frames, 0.0f);
-    
-    if (config_.has_f0 && !source_f0.empty()) {
-        // Convert F0 (Hz) to pitch (log scale) and pitchf (linear)
-        for (int i = 0; i < frames && i < static_cast<int>(source_f0.size()); ++i) {
-            if (source_f0[i] > 0.0f) {
-                pitch[i] = std::log2(source_f0[i] / 10.0f);
-                pitchf[i] = source_f0[i];
-            }
+
+    // 6. Align lengths
+    int p_len = std::min(Tf, static_cast<int>(f0.size()));
+    feats_up.resize(p_len * 768);
+    f0.resize(p_len);
+
+    // 7. Coarse pitch
+    std::vector<float> pitch_coarse(p_len);
+    for (int i = 0; i < p_len; ++i)
+        pitch_coarse[i] = static_cast<float>(f0_to_coarse(f0[i]));
+
+    // 8. VITS synthesis
+    t0 = clock::now();
+    auto synth_audio = synth_.infer(feats_up.data(), p_len,
+                                    pitch_coarse.data(), f0.data(), speaker_id);
+    result.synth_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+
+    // 9. RMS mix (optional): scale output toward source energy
+    if (config_.rms_mix_rate < 1.0 && !synth_audio.data.empty()) {
+        double src_rms = compute_rms(audio16k.data(), n16k);
+        double out_rms = compute_rms(synth_audio.data.data(),
+                                     static_cast<int>(synth_audio.data.size()));
+        if (out_rms > 1e-8) {
+            double target = std::pow(src_rms, 1.0 - config_.rms_mix_rate) *
+                            std::pow(out_rms, config_.rms_mix_rate);
+            float scale = static_cast<float>(target / out_rms);
+            for (auto& v : synth_audio.data) v *= scale;
         }
     }
-    
-    AudioBuffer synthesized = synth_.infer(
-        target_features.data(), frames,
-        pitch.data(), pitchf.data(),
-        speaker_id);
-    
-    auto synth_end = std::chrono::high_resolution_clock::now();
-    result.synth_ms = std::chrono::duration<double, std::milli>(
-        synth_end - synth_start).count();
-    
-    // Step 5: Apply RMS energy blending
-    if (config_.rms_mix_rate > 0.0 && config_.rms_mix_rate < 1.0) {
-        apply_rms_blend(synthesized.data.data(), input.data.data(),
-                       std::min(static_cast<int>(synthesized.data.size()),
-                               static_cast<int>(input.data.size())),
-                       config_.rms_mix_rate);
-    }
-    
-    // Resample to target sample rate if needed
-    if (config_.target_sample_rate > 0 && 
-        config_.target_sample_rate != synthesized.sample_rate) {
-        std::vector<float> resampled = io::resample_linear(
-            synthesized.data.data(),
-            static_cast<int>(synthesized.data.size()),
-            synthesized.sample_rate,
-            config_.target_sample_rate);
-        
-        synthesized.data = std::move(resampled);
-        synthesized.sample_rate = config_.target_sample_rate;
-    }
-    
-    result.audio = std::move(synthesized);
+
+    result.audio = std::move(synth_audio);
+    result.audio.sample_rate = synth_cfg_.sample_rate;
     result.success = true;
-    
-    auto total_end = std::chrono::high_resolution_clock::now();
-    result.total_ms = std::chrono::duration<double, std::milli>(
-        total_end - total_start).count();
-    
+    result.total_ms = std::chrono::duration<double, std::milli>(clock::now() - t_start).count();
+    (void)hop;
     return result;
 }
 
-ModelVersion VoiceConversionPipeline::version() const {
-    return config_.version;
+VCResult VoiceConversionPipeline::convert_file(const std::string& input_path,
+                                               const std::string& output_path,
+                                               int speaker_id) {
+    VCResult result;
+    auto audio = io::read_audio(input_path, 16000);
+    if (!audio.has_value()) {
+        result.error_message = "failed to read input: " + input_path;
+        return result;
+    }
+    result = convert_buffer(*audio, speaker_id);
+    if (!result.success) return result;
+
+    if (!io::write_audio(output_path, result.audio.data.data(),
+                         static_cast<int>(result.audio.data.size()),
+                         result.audio.sample_rate, config_.output_format)) {
+        result.success = false;
+        result.error_message = "failed to write output: " + output_path;
+    }
+    return result;
 }
 
-int VoiceConversionPipeline::num_speakers() const {
-    return config_.num_speakers;
-}
+ModelVersion VoiceConversionPipeline::version() const { return config_.version; }
+int VoiceConversionPipeline::num_speakers() const { return config_.num_speakers; }
 
 }  // namespace voxmutatio::pipeline

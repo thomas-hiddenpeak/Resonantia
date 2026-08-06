@@ -81,9 +81,9 @@ TEST_CASE("WAV write and read round-trip", "[io][wav]") {
     REQUIRE(buffer->sample_rate == sample_rate);
     REQUIRE(buffer->num_samples() == static_cast<std::size_t>(num_samples));
     
-    // Compare samples (allow small quantization error for int16 conversion)
+    // Compare samples (int16 quantization has absolute error up to ~1/32768).
     for (int i = 0; i < num_samples; ++i) {
-        REQUIRE(buffer->data[i] == Catch::Approx(samples[i]).epsilon(1e-2));
+        REQUIRE(buffer->data[i] == Catch::Approx(samples[i]).margin(1e-4));
     }
 }
 
