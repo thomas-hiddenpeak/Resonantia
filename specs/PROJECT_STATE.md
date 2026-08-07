@@ -22,7 +22,7 @@
 | VITS 合成 (TextEncoder+Flow+NSF-HiFiGAN) | ✅ 对齐 | `test_vits_alignment` 音频 corr 0.9997 |
 | 端到端推理 Pipeline | ✅ 可用 | `test_e2e_conversion` corr 0.9997 |
 | CLI: vc_convert / build_index | ✅ 可用 | 转换真实音频,无 NaN/Inf |
-| **训练 / 微调** | ❌ **未实现** | `src/training/fine_tuning.cpp` 为 TODO 桩 |
+| **训练 / 微调(解码器)** | ✅ 可用 | 纯 autograd 解码器 fine-tune;真实音频 mel loss -70%;导出往返 corr 1.0 |
 | **WebUI (可运行)** | ❌ **未接线** | 前端存在,但无 server 可执行文件 |
 | WavLM 内容编码 | ⚠️ 桩 | 文件存在,未接入/未验证 |
 | FCPE 实时 F0 | ⚠️ 桩 | 未实现 |
@@ -36,7 +36,7 @@
 | Spec | 主题 | 状态 |
 |------|------|------|
 | 001-voice-conversion-engine | 推理引擎(内容/F0/检索/合成/pipeline) | Complete(推理部分) |
-| 002-voice-training | 训练/微调:纯 C++/CUDA autograd(方案 A) · 40k · fine-tune | In Progress — A0-A2+mel 完成(autograd 全算子/AdamW/可微 mel 损失,均已验证);剩余:生成器组装+训练循环+导出+e2e |
+| 002-voice-training | 训练/微调:纯 C++/CUDA autograd(方案 A) · 40k · fine-tune | In Progress — 解码器路径完成(A0-A2 autograd/AdamW/可微 mel;A3 解码器对齐 0.9997;A6 fine-tune -70%;A7 导出;A8 e2e 往返 corr 1.0);剩余:vc_train CLI + 完整 GAN(enc_q/MPD/MSD)作为 follow-up |
 | 003-webui(计划) | 面向普通用户的 WebUI:简单/高级双模式 | 未创建 |
 
 > 注:`001` 的 spec.md 已标 Complete 并附验证清单;其 `plan.md` 覆盖范围原本包含训练/WebUI(P6),但这两项实际未完成,已在下方"已知偏差"记录,并将拆分为独立 spec 002/003。

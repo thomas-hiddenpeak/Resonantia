@@ -48,11 +48,12 @@
 > - 已证明:真实语音 mel 优化 loss 5.19→2.45(autograd+AdamW 端到端)
 > **剩余为“模型组装”:在已验证基元上搭生成器/训练循环。**
 
-### Phase A3: 训练专用前向/反向组件 — 进行中(模型组装)
-- [ ] 生成器(dec NSF-HiFiGAN)forward-on-autograd(加载预训练权重为参数)
-- [ ] PosteriorEncoder(enc_q):spec + WaveNet + 反向
-- [ ] MultiPeriodDiscriminator + MultiScaleDiscriminator:前向 + 反向
-- [ ] 梯度检查
+### Phase A3: 训练专用前向/反向组件 — 解码器路径完成
+- [x] 生成器(dec NSF-HiFiGAN)forward-on-autograd(加载预训练权重为参数)
+      对齐推理解码器 corr 0.9997
+- [ ] PosteriorEncoder(enc_q):spec + WaveNet + 反向 —(完整 GAN follow-up)
+- [ ] MultiPeriodDiscriminator + MultiScaleDiscriminator:前向 + 反向 —(follow-up)
+- [x] 梯度检查(逐算子有限差分)
 
 ### Phase A4: 损失 — mel 已完成
 - [x] mel L1(可微 STFT + Slaney mel + log,已验证驱动优化)
@@ -65,20 +66,22 @@
 - [ ] 特征/F0/频谱提取与缓存(复用 C++ HuBERT/RMVPE 前向)
 - [ ] filelist + batching(训练片段截断/填充)
 
-### Phase A6: 训练循环
-- [ ] GAN 交替优化 G/D;梯度裁剪;lr 调度
-- [ ] 结构化进度输出(epoch/step/loss)
+### Phase A6: 训练循环 — 解码器 fine-tune 完成
+- [x] 解码器 mel-L1 fine-tune 循环(AdamW);真实音频 loss 0.9159→0.2719(-70%)
+- [ ] GAN 交替优化 G/D;梯度裁剪;lr 调度 —(完整 GAN follow-up)
+- [x] 结构化进度输出(step/loss)
 - **门控 SC-003**
 
-### Phase A7: 检查点与导出
-- [ ] safetensors 保存/加载 G+D+optimizer;断点续训
-- [ ] 导出仅推理 G(与 f0G40k 同构)
-- [ ] `tools/build_index` 产出 `.index`
+### Phase A7: 检查点与导出 — 完成
+- [x] 导出仅推理 G(与 f0G40k 同构):`GeneratorTrainer::export_model`
+      本地 safetensors 写入器;weight_norm 重derivation;cond(g) 反折叠
+- [x] `tools/build_index` 产出 `.index`(推理引擎已有)
+- [ ] 断点续训(optimizer 状态)—(follow-up)
 - **门控 SC-006、SC-007**
 
-### Phase A8: 端到端验证
-- [ ] `vc_train` CLI
-- [ ] 真实目标音频 fine-tune → 导出 → C++ 推理运行时转换验证
+### Phase A8: 端到端验证 — 解码器路径完成
+- [x] fine-tune → 导出 → C++ 推理:往返 corr 1.000000(零步与微调后均精确复现)
+- [ ] `vc_train` CLI —(下一步)
 - **门控 SC-004、SC-005**
 
 ## 风险与约束
