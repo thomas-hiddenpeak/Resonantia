@@ -29,6 +29,16 @@ public:
     VCResult convert_buffer(const AudioBuffer& input,
                             int speaker_id = 0);
 
+    /// Update per-request conversion params without reloading models.
+    void set_runtime_params(int f0_up_key, double formant_shift,
+                            double index_rate, double rms_mix_rate, double protect) {
+        config_.f0_up_key = f0_up_key;
+        config_.formant_shift = formant_shift;
+        config_.index_rate = index_rate;
+        config_.rms_mix_rate = rms_mix_rate;
+        config_.protect = protect;
+    }
+
     /// Get config
     [[nodiscard]] const VCConfig& config() const noexcept { return config_; }
 
