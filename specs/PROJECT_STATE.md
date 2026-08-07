@@ -27,7 +27,7 @@
 | **WebUI (可运行)** | ✅ 可用 | `vc_serve`(纯 C++ HTTP,静态 + `/api/convert`),curl 验证前端可用 |
 | WavLM 内容编码 | ⚠️ 桩 | 文件存在,未接入/未验证 |
 | FCPE 实时 F0 | ⚠️ 桩 | 未实现 |
-| 声源分离 (separation/) | ❌ 未实现 | 仅设计文档提及 |
+| 声源分离 (separation/) | ✅ 可用(人声) | Open-Unmix `umxhq` 纯 C++/CUDA 前向 runner,对齐 PyTorch(model 1.6e-6、端到端 1.5e-6);已接入 `vc_preprocess --separate` + WebUI「带伴奏」链路 |
 | CLI: vc_batch / vc_probe | ⚠️ 骨架 | 存在但未随对齐更新验证 |
 
 ---
@@ -39,6 +39,7 @@
 | 001-voice-conversion-engine | 推理引擎(内容/F0/检索/合成/pipeline) | Complete(推理部分) |
 | 002-voice-training | 训练/微调:纯 C++/CUDA autograd(方案 A) · 40k | Complete(解码器 + 完整 GAN)— A0-A2 autograd/AdamW/可微 mel;解码器对齐 0.9997、fine-tune -70%、导出往返 corr 1.0;完整 VITS GAN:exp/conv2d/flip_rows 梯度检查、enc_q 重建 corr 0.956、flow 逆 9e-7、MPD-V2 判别器、KL/fm/adv,`vc_train --gan` 端到端 |
 | 003-webui | 面向普通用户的 WebUI:`vc_serve` 后端 + 前端 | Complete(基础)— 纯 C++ HTTP 服务静态前端 + /api/convert,curl 验证 |
+| 004-source-separation | 音频前处理:人声分离 / 去混响 / 去和声(纯 C++/CUDA) | In Progress — S0-S2/S5 完成:GPU STFT/iSTFT(往返 1.99e-7)、Open-Unmix 人声 runner(对齐 1.6e-6)、接入预处理+WebUI。S6(RoFormer 去混响/去和声)待做 |
 
 > 注:`001` 的 spec.md 已标 Complete 并附验证清单;其 `plan.md` 覆盖范围原本包含训练/WebUI(P6),但这两项实际未完成,已在下方"已知偏差"记录,并将拆分为独立 spec 002/003。
 
@@ -55,11 +56,12 @@
 
 ## 下一步(优先级,2026-08-07 调整后)
 
-- **P0 音频前处理(完整功能,纯 C++/CUDA)**:人声分离 / 去混响 / 去和声(`src/separation/`)。
-  宪法约束零 Python 运行时,故模型(MelBand-RoFormer / MDX-Net 等)以 C++/CUDA 自研实现。
-  见 `specs/004-source-separation/`。训练页录音类型据此映射预处理链。
-- **P0 性能**:消除训练管线气泡(Synthesizer 缓存权重,避免每次 debug/infer 重载 145MB);
-  非必要 CPU 业务(如 `compute_spec` 的 host DFT)移至 GPU;autograd kernel 剖析与优化。
+- **P0 音频前处理(完整功能,纯 C++/CUDA)**:✅ 人声分离已完成(Open-Unmix `umxhq` 纯 C++/CUDA runner,
+  对齐 model 1.6e-6 / 端到端 1.5e-6;接入 `vc_preprocess --separate` + WebUI)。去混响 / 去和声
+  待做(MelBand-RoFormer,同 STFT 前端,spec 004 S6)。见 `specs/004-source-separation/`。
+- **P0 性能**:✅ 完成。conv1d/conv2d 改 im2col+cuBLAS(先剖析:判别器 conv2d 占 GAN 步 99%),
+  完整 GAN 步 ~52s→~2s(约 25×,hq 2800 步 ~40h→~1.5h);`compute_spec` host DFT→GPU cuFFT STFT
+  (对齐 1.44e-7);Synthesizer 权重缓存。全部数值一致,15/15 测试通过。
 - **P1 实时转换(下一个里程碑,暂不建 spec)**:麦克风采集(getUserMedia/AudioWorklet)→
   vc_serve WebSocket → 流式转换(复用 `synthesizer::infer_stream` 的 skip/return 窗口)→
   扬声器回放,目标低延迟(对标 RVC 90-170ms)。
