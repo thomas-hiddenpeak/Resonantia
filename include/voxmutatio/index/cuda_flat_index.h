@@ -22,6 +22,13 @@ public:
     /// Reconstruct a vector by its index
     std::vector<float> reconstruct(int64_t idx, int dim);
 
+    /// RVC-style weighted k-NN retrieval.
+    /// For each query, finds k nearest neighbors and returns their weighted
+    /// average, where weight = (1/dist)^2 normalized (matches RVC infer).
+    /// queries: [n, dim] -> returns [n, dim].
+    std::vector<float> retrieve_weighted(const float* queries, int n_queries,
+                                         int k, int dim);
+
     /// Get total number of vectors in the index
     [[nodiscard]] int64_t total_vectors() const noexcept { return ntotal_; }
 
@@ -34,8 +41,10 @@ public:
     ~CudaFlatIndex();
 
 private:
-    float* data_ = nullptr;       // host pointer (mmap)
+    float* data_ = nullptr;       // points into map_base_ (past 16-byte header)
     float* device_data_ = nullptr; // device copy
+    void* map_base_ = nullptr;     // mmap base (whole file)
+    std::size_t map_size_ = 0;     // mmap size
     int64_t ntotal_ = 0;
     int dim_ = 0;
 };

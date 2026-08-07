@@ -41,85 +41,75 @@ void compute_l2_distances_host(const float* queries, const float* database,
 
 bool CudaFlatIndex::load(const std::string& path) {
     // Free existing resources
-    if (data_) {
-        munmap(data_, ntotal_ * dim_ * sizeof(float));
+    if (map_base_) {
+        munmap(map_base_, map_size_);
+        map_base_ = nullptr;
         data_ = nullptr;
     }
     if (device_data_) {
         cudaFree(device_data_);
         device_data_ = nullptr;
     }
-    
-    // Open file
+
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         return false;
     }
-    
+
     struct stat st;
     if (fstat(fd, &st) < 0) {
         close(fd);
         return false;
     }
-    
-    // Read header (ntotal, dim)
-    if (st.st_size < sizeof(int64_t) * 2) {
+
+    if (st.st_size < static_cast<off_t>(sizeof(int64_t) * 2)) {
         close(fd);
         return false;
     }
-    
-    void* header = mmap(nullptr, sizeof(int64_t) * 2, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (header == MAP_FAILED) {
-        close(fd);
-        return false;
-    }
-    
-    const int64_t* header_data = static_cast<const int64_t*>(header);
-    ntotal_ = header_data[0];
-    dim_ = header_data[1];
-    
-    munmap(header, sizeof(int64_t) * 2);
-    
-    // Validate
-    std::size_t expected_size = sizeof(int64_t) * 2 + 
-                                ntotal_ * dim_ * sizeof(float);
-    if (static_cast<std::size_t>(st.st_size) < expected_size) {
-        close(fd);
-        return false;
-    }
-    
-    // Mmap data
-    std::size_t data_size = ntotal_ * dim_ * sizeof(float);
-    data_ = static_cast<float*>(
-        mmap(nullptr, data_size, PROT_READ, MAP_PRIVATE, fd, 
-             sizeof(int64_t) * 2));
+
+    // mmap the entire file (offset 0 is page-aligned).
+    map_size_ = static_cast<std::size_t>(st.st_size);
+    map_base_ = mmap(nullptr, map_size_, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    
-    if (data_ == MAP_FAILED) {
-        data_ = nullptr;
+    if (map_base_ == MAP_FAILED) {
+        map_base_ = nullptr;
         return false;
     }
-    
-    // Advise kernel about random access pattern
-    madvise(data_, data_size, MADV_RANDOM);
-    
+
+    const int64_t* header = static_cast<const int64_t*>(map_base_);
+    ntotal_ = header[0];
+    dim_ = static_cast<int>(header[1]);
+
+    std::size_t data_size = static_cast<std::size_t>(ntotal_) * dim_ * sizeof(float);
+    if (sizeof(int64_t) * 2 + data_size > map_size_) {
+        munmap(map_base_, map_size_);
+        map_base_ = nullptr;
+        return false;
+    }
+
+    // data_ points just past the 16-byte header.
+    data_ = reinterpret_cast<float*>(
+        static_cast<char*>(map_base_) + sizeof(int64_t) * 2);
+    madvise(map_base_, map_size_, MADV_RANDOM);
+
     // Copy to GPU
     cudaError_t err = cudaMalloc(&device_data_, data_size);
     if (err != cudaSuccess) {
-        munmap(data_, data_size);
+        munmap(map_base_, map_size_);
+        map_base_ = nullptr;
         data_ = nullptr;
         return false;
     }
-    
     err = cudaMemcpy(device_data_, data_, data_size, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         cudaFree(device_data_);
         device_data_ = nullptr;
-        munmap(data_, data_size);
+        munmap(map_base_, map_size_);
+        map_base_ = nullptr;
         data_ = nullptr;
         return false;
     }
-    
+
     return true;
 }
 
@@ -170,9 +160,41 @@ std::vector<float> CudaFlatIndex::reconstruct(int64_t idx, int dim) {
     return result;
 }
 
+std::vector<float> CudaFlatIndex::retrieve_weighted(const float* queries,
+                                                    int n_queries, int k, int dim) {
+    if (!valid() || dim != dim_ || ntotal_ == 0) return {};
+    k = std::min<int>(k, static_cast<int>(ntotal_));
+
+    auto [dists, idxs] = search(queries, n_queries, k, dim);
+    if (idxs.empty()) return {};
+
+    std::vector<float> out(static_cast<std::size_t>(n_queries) * dim, 0.0f);
+    for (int i = 0; i < n_queries; ++i) {
+        // weight = (1/dist)^2, normalized. Guard against zero distance.
+        std::vector<double> wgt(k);
+        double wsum = 0.0;
+        for (int j = 0; j < k; ++j) {
+            double d = dists[i * k + j];
+            double w = 1.0 / (d + 1e-8);
+            w = w * w;
+            wgt[j] = w;
+            wsum += w;
+        }
+        if (wsum <= 0.0) wsum = 1.0;
+        for (int j = 0; j < k; ++j) {
+            double w = wgt[j] / wsum;
+            const float* vec = data_ + idxs[i * k + j] * dim_;
+            for (int d = 0; d < dim; ++d)
+                out[i * dim + d] += static_cast<float>(w * vec[d]);
+        }
+    }
+    return out;
+}
+
 CudaFlatIndex::~CudaFlatIndex() {
-    if (data_) {
-        munmap(data_, ntotal_ * dim_ * sizeof(float));
+    if (map_base_) {
+        munmap(map_base_, map_size_);
+        map_base_ = nullptr;
         data_ = nullptr;
     }
     if (device_data_) {

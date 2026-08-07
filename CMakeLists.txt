@@ -113,6 +113,15 @@ set_target_properties(vc_probe PROPERTIES
         LINK_FLAGS "-Wl,--disable-new-dtags"
     )
 
+    add_executable(build_index tools/build_index.cpp)
+    target_include_directories(build_index PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(build_index PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
+    set_target_properties(build_index PROPERTIES
+        BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+        INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+        LINK_FLAGS "-Wl,--disable-new-dtags"
+    )
+
 # ============================================================================
 # 测试
 # ============================================================================
@@ -187,4 +196,10 @@ if(VOXMUTATIO_BUILD_TESTS)
     target_link_libraries(test_e2e_conversion PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
     target_include_directories(test_e2e_conversion PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME test_e2e_conversion COMMAND test_e2e_conversion WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+    # Test: Feature index retrieval (RVC weighted k-NN)
+    add_executable(test_index_retrieval tests/test_index_retrieval.cpp)
+    target_link_libraries(test_index_retrieval PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
+    target_include_directories(test_index_retrieval PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME test_index_retrieval COMMAND test_index_retrieval WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 endif()

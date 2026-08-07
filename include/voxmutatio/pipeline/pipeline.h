@@ -55,6 +55,7 @@ private:
 
     // Runtime state
     bool initialized_ = false;
+    bool index_loaded_ = false;
 };
 
 }  // namespace voxmutatio::pipeline

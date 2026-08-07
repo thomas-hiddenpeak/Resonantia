@@ -67,6 +67,12 @@ bool VoiceConversionPipeline::init(const VCConfig& config) {
     synth_cfg_.spk_embed_dim = config.num_speakers;
     synth_.init(synth_cfg_);
 
+    // Optional feature retrieval index
+    index_loaded_ = false;
+    if (!config.index_path.empty()) {
+        index_loaded_ = feature_index_.load(config.index_path);
+    }
+
     initialized_ = true;
     return true;
 }
@@ -103,6 +109,18 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
     }
     int hop = 320;  // HuBERT hop at 16kHz
     int T = static_cast<int>(feats.size()) / 768;
+
+    // 2b. Feature retrieval blending (RVC index_rate)
+    t0 = clock::now();
+    if (index_loaded_ && config_.index_rate > 0.0 &&
+        feature_index_.dim() == 768) {
+        auto retrieved = feature_index_.retrieve_weighted(feats.data(), T, 8, 768);
+        if (!retrieved.empty()) {
+            index::blend_features(feats.data(), feats.data(), retrieved.data(),
+                                  T, 768, config_.index_rate);
+        }
+    }
+    result.index_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
 
     // 3. Interpolate features 2x (50Hz -> 100Hz)
     auto feats_up = interpolate_2x(feats, T, 768);
