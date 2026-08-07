@@ -95,6 +95,11 @@ Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
 /// conv_transpose1d: x[Cin,L], w[Cin,Cout,K], b[Cout] (or Tensor{}) -> [Cout,Lout].
 Tensor conv_transpose1d(const Tensor& x, const Tensor& w, const Tensor& b,
                         int Cin, int L, int Cout, int K, int stride, int pad);
+/// conv2d (no dilation/groups): x[Cin,H,W], w[Cout,Cin,kh,kw], b[Cout] (or Tensor{})
+/// -> [Cout,Hout,Wout]. For MultiPeriodDiscriminator (kw=1 typical).
+Tensor conv2d(const Tensor& x, const Tensor& w, const Tensor& b,
+              int Cin, int H, int W, int Cout, int kh, int kw,
+              int sh, int sw, int ph, int pw);
 
 // ---- Shape / gather ops (Phase A3 primitives) ----
 /// Transpose a 2D tensor: x[rows,cols] -> [cols,rows].
@@ -112,6 +117,7 @@ Tensor scale(const Tensor& x, float s);
 Tensor sqrt_op(const Tensor& x);
 Tensor log_op(const Tensor& x);   // natural log
 Tensor abs_op(const Tensor& x);
+Tensor exp_op(const Tensor& x);
 /// Frame a 1D signal [L] into overlapping frames [T, n_fft]: f[t,n]=x[t*hop+n].
 Tensor frame(const Tensor& x, int T, int n_fft, int hop);
 

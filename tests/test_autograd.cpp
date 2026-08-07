@@ -258,6 +258,34 @@ TEST_CASE("Autograd A1: conv_transpose1d", "[autograd][gradcheck][a1][conv]") {
   run(2, 5, 3, 3, 1, 1, "same");
 }
 
+TEST_CASE("Autograd GAN: exp + conv2d", "[autograd][gradcheck][gan]") {
+  std::mt19937 rng(23);
+  SECTION("exp") {
+    double e = grad_check(
+        [](std::vector<Tensor>& t) { return ag::sum(ag::exp_op(t[0])); },
+        {rand_vec(12, rng, -1.0f, 1.0f)}, {{3, 4}});
+    std::printf("[exp] %.2e\n", e);
+    CHECK(e < 3e-2);
+  }
+  SECTION("conv2d") {
+    auto run = [&](int Cin, int H, int W, int Cout, int kh, int kw, int sh, int sw,
+                   int ph, int pw, const char* label) {
+      double e = grad_check(
+          [=](std::vector<Tensor>& t) {
+            return ag::sum(ag::gelu(ag::conv2d(t[0], t[1], t[2], Cin, H, W, Cout,
+                                               kh, kw, sh, sw, ph, pw)));
+          },
+          {rand_vec(Cin * H * W, rng), rand_vec(Cout * Cin * kh * kw, rng), rand_vec(Cout, rng)},
+          {{Cin, H, W}, {Cout, Cin, kh, kw}, {Cout}});
+      std::printf("[conv2d %s] %.2e\n", label, e);
+      CHECK(e < 3e-2);
+    };
+    run(1, 8, 3, 4, 5, 1, 3, 1, 2, 0, "mpd");     // MPD period-reshape conv (kw=1)
+    run(2, 5, 4, 3, 3, 3, 1, 1, 1, 1, "square");
+    run(2, 6, 2, 2, 3, 1, 2, 1, 1, 0, "stride");
+  }
+}
+
 TEST_CASE("Autograd A3: primitives", "[autograd][gradcheck][a3]") {
   std::mt19937 rng(29);
   {

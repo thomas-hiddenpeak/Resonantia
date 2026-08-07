@@ -742,6 +742,115 @@ Tensor frame(const Tensor& x, int T, int n_fft, int hop) {
   return Tensor(out);
 }
 
+// ==== GAN ops: exp + conv2d ====
+__global__ void k_exp_f(const float* x, float* o, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = expf(x[i]);
+}
+__global__ void k_exp_b(float* dx, const float* dy, const float* y, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dx[i] += dy[i] * y[i];  // d/dx exp(x) = exp(x) = output
+}
+
+Tensor exp_op(const Tensor& x) {
+  return act_op(x,
+      [](const float* a, float* o, int n) { k_exp_f<<<grid(n), 256>>>(a, o, n); },
+      [](float* dx, const float* dy, const float* y, int n) { k_exp_b<<<grid(n), 256>>>(dx, dy, y, n); },
+      true);
+}
+
+__global__ void k_conv2d_f(const float* x, const float* w, const float* b, float* o,
+    int Cin, int H, int W, int Cout, int kh, int kw, int sh, int sw, int ph, int pw,
+    int Hout, int Wout) {
+  int ow = blockIdx.x * blockDim.x + threadIdx.x, oh = blockIdx.y, co = blockIdx.z;
+  if (ow >= Wout || oh >= Hout || co >= Cout) return;
+  float s = b ? b[co] : 0.0f;
+  for (int ci = 0; ci < Cin; ++ci) {
+    const float* xc = x + ci * H * W;
+    const float* wc = w + (co * Cin + ci) * kh * kw;
+    for (int i = 0; i < kh; ++i) {
+      int h = oh * sh - ph + i;
+      if (h < 0 || h >= H) continue;
+      for (int j = 0; j < kw; ++j) {
+        int wcol = ow * sw - pw + j;
+        if (wcol >= 0 && wcol < W) s += xc[h * W + wcol] * wc[i * kw + j];
+      }
+    }
+  }
+  o[(co * Hout + oh) * Wout + ow] = s;
+}
+__global__ void k_conv2d_dx(float* dx, const float* dout, const float* w,
+    int Cin, int H, int W, int Cout, int kh, int kw, int sh, int sw, int ph, int pw,
+    int Hout, int Wout) {
+  int ow = blockIdx.x * blockDim.x + threadIdx.x, oh = blockIdx.y, co = blockIdx.z;
+  if (ow >= Wout || oh >= Hout || co >= Cout) return;
+  float go = dout[(co * Hout + oh) * Wout + ow];
+  for (int ci = 0; ci < Cin; ++ci) {
+    const float* wc = w + (co * Cin + ci) * kh * kw;
+    for (int i = 0; i < kh; ++i) {
+      int h = oh * sh - ph + i;
+      if (h < 0 || h >= H) continue;
+      for (int j = 0; j < kw; ++j) {
+        int wcol = ow * sw - pw + j;
+        if (wcol >= 0 && wcol < W) atomicAdd(&dx[ci * H * W + h * W + wcol], go * wc[i * kw + j]);
+      }
+    }
+  }
+}
+__global__ void k_conv2d_dw(float* dw, const float* dout, const float* x,
+    int Cin, int H, int W, int Cout, int kh, int kw, int sh, int sw, int ph, int pw,
+    int Hout, int Wout) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x, total = Cout * Cin * kh * kw;
+  if (idx >= total) return;
+  int j = idx % kw, i = (idx / kw) % kh, ci = (idx / (kw * kh)) % Cin, co = idx / (kw * kh * Cin);
+  const float* xc = x + ci * H * W;
+  float s = 0.0f;
+  for (int oh = 0; oh < Hout; ++oh) {
+    int h = oh * sh - ph + i;
+    if (h < 0 || h >= H) continue;
+    for (int ow = 0; ow < Wout; ++ow) {
+      int wcol = ow * sw - pw + j;
+      if (wcol >= 0 && wcol < W) s += dout[(co * Hout + oh) * Wout + ow] * xc[h * W + wcol];
+    }
+  }
+  dw[idx] += s;
+}
+__global__ void k_conv2d_db(float* db, const float* dout, int Cout, int Hout, int Wout) {
+  int co = blockIdx.x * blockDim.x + threadIdx.x;
+  if (co >= Cout) return;
+  float s = 0.0f;
+  for (int i = 0; i < Hout * Wout; ++i) s += dout[co * Hout * Wout + i];
+  db[co] += s;
+}
+
+Tensor conv2d(const Tensor& x, const Tensor& w, const Tensor& b,
+              int Cin, int H, int W, int Cout, int kh, int kw,
+              int sh, int sw, int ph, int pw) {
+  int Hout = (H + 2 * ph - kh) / sh + 1;
+  int Wout = (W + 2 * pw - kw) / sw + 1;
+  bool has_b = static_cast<bool>(b.n);
+  bool rg = any_requires_grad({&x, &w}) ||
+            (has_b && (b.n->requires_grad || !b.n->parents.empty()));
+  auto out = make_node({Cout, Hout, Wout}, rg);
+  dim3 gf(grid(Wout), Hout, Cout);
+  k_conv2d_f<<<gf, 256>>>(x.n->data.data(), w.n->data.data(),
+                          has_b ? b.n->data.data() : nullptr, out->data.data(),
+                          Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout);
+  check_launch("conv2d");
+  if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
+  Node* o = out.get(); Node* pxn = x.n.get(); Node* pwn = w.n.get();
+  Node* pbn = has_b ? b.n.get() : nullptr;
+  out->backward_fn = [o, pxn, pwn, pbn, Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout] {
+    dim3 gd(grid(Wout), Hout, Cout);
+    k_conv2d_dx<<<gd, 256>>>(pxn->grad.data(), o->grad.data(), pwn->data.data(),
+                             Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout);
+    k_conv2d_dw<<<grid(Cout * Cin * kh * kw), 256>>>(pwn->grad.data(), o->grad.data(),
+                             pxn->data.data(), Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout);
+    if (pbn) k_conv2d_db<<<grid(Cout), 256>>>(pbn->grad.data(), o->grad.data(), Cout, Hout, Wout);
+  };
+  return Tensor(out);
+}
+
 void backward(const Tensor& loss) {
   // Topological order via DFS over parents.
   std::vector<Node*> topo;
