@@ -108,6 +108,13 @@ Tensor embedding(const Tensor& table, const std::vector<int>& idx, int dim);
 /// Scale by a constant.
 Tensor scale(const Tensor& x, float s);
 
+// ---- Elementwise math (for differentiable mel loss) ----
+Tensor sqrt_op(const Tensor& x);
+Tensor log_op(const Tensor& x);   // natural log
+Tensor abs_op(const Tensor& x);
+/// Frame a 1D signal [L] into overlapping frames [T, n_fft]: f[t,n]=x[t*hop+n].
+Tensor frame(const Tensor& x, int T, int n_fft, int hop);
+
 /// Reverse-mode backprop from a scalar loss.
 void backward(const Tensor& loss);
 

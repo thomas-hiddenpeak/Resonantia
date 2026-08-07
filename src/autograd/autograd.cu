@@ -677,6 +677,71 @@ Tensor scale(const Tensor& x, float s) {
   return Tensor(out);
 }
 
+// ==== Elementwise math for mel loss ====
+__global__ void k_sqrt_f(const float* x, float* o, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = sqrtf(fmaxf(x[i], 0.0f));
+}
+__global__ void k_sqrt_b(float* dx, const float* dy, const float* y, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dx[i] += dy[i] * 0.5f / fmaxf(y[i], 1e-12f);
+}
+__global__ void k_log_f(const float* x, float* o, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = logf(fmaxf(x[i], 1e-12f));
+}
+__global__ void k_log_b(float* dx, const float* dy, const float* x, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dx[i] += dy[i] / fmaxf(x[i], 1e-12f);
+}
+__global__ void k_abs_f(const float* x, float* o, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = fabsf(x[i]);
+}
+__global__ void k_abs_b(float* dx, const float* dy, const float* x, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dx[i] += dy[i] * ((x[i] >= 0.0f) ? 1.0f : -1.0f);
+}
+__global__ void k_frame_f(const float* x, float* o, int T, int nfft, int hop) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < T * nfft) { int t = i / nfft, n = i % nfft; o[i] = x[t * hop + n]; }
+}
+__global__ void k_frame_b(float* dx, const float* dout, int T, int nfft, int hop) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < T * nfft) { int t = i / nfft, n = i % nfft; atomicAdd(&dx[t * hop + n], dout[i]); }
+}
+
+Tensor sqrt_op(const Tensor& x) {
+  return act_op(x,
+      [](const float* a, float* o, int n) { k_sqrt_f<<<grid(n), 256>>>(a, o, n); },
+      [](float* dx, const float* dy, const float* y, int n) { k_sqrt_b<<<grid(n), 256>>>(dx, dy, y, n); },
+      true);
+}
+Tensor log_op(const Tensor& x) {
+  return act_op(x,
+      [](const float* a, float* o, int n) { k_log_f<<<grid(n), 256>>>(a, o, n); },
+      [](float* dx, const float* dy, const float* r, int n) { k_log_b<<<grid(n), 256>>>(dx, dy, r, n); },
+      false);
+}
+Tensor abs_op(const Tensor& x) {
+  return act_op(x,
+      [](const float* a, float* o, int n) { k_abs_f<<<grid(n), 256>>>(a, o, n); },
+      [](float* dx, const float* dy, const float* r, int n) { k_abs_b<<<grid(n), 256>>>(dx, dy, r, n); },
+      false);
+}
+
+Tensor frame(const Tensor& x, int T, int n_fft, int hop) {
+  auto out = make_node({T, n_fft}, any_requires_grad({&x}));
+  k_frame_f<<<grid(T * n_fft), 256>>>(x.n->data.data(), out->data.data(), T, n_fft, hop);
+  check_launch("frame");
+  out->parents = {x.n};
+  Node* o = out.get(); Node* px = x.n.get();
+  out->backward_fn = [o, px, T, n_fft, hop] {
+    k_frame_b<<<grid(T * n_fft), 256>>>(px->grad.data(), o->grad.data(), T, n_fft, hop);
+  };
+  return Tensor(out);
+}
+
 void backward(const Tensor& loss) {
   // Topological order via DFS over parents.
   std::vector<Node*> topo;

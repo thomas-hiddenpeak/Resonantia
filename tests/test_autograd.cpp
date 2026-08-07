@@ -313,6 +313,30 @@ TEST_CASE("Autograd A3: embedding", "[autograd][gradcheck][a3]") {
   std::printf("[embedding] %.2e\n", maxerr); CHECK(maxerr < 2e-2);
 }
 
+TEST_CASE("Autograd A4: mel-loss primitives", "[autograd][gradcheck][a4]") {
+  std::mt19937 rng(37);
+  {
+    auto xp = rand_vec(12, rng, 0.2f, 2.0f);
+    double es = grad_check([](std::vector<Tensor>& t) { return ag::sum(ag::sqrt_op(t[0])); }, {xp}, {{3, 4}});
+    double el = grad_check([](std::vector<Tensor>& t) { return ag::sum(ag::log_op(t[0])); }, {xp}, {{3, 4}});
+    std::printf("[sqrt] %.2e [log] %.2e\n", es, el);
+    CHECK(es < 2e-2); CHECK(el < 2e-2);
+  }
+  {
+    std::vector<float> x = {-0.8f, 0.5f, -0.3f, 0.9f, -0.6f, 0.4f};
+    double e = grad_check([](std::vector<Tensor>& t) { return ag::sum(ag::abs_op(t[0])); }, {x}, {{2, 3}});
+    std::printf("[abs] %.2e\n", e); CHECK(e < 2e-2);
+  }
+  {
+    const int T = 3, nfft = 4, hop = 2;
+    const int L = (T - 1) * hop + nfft;
+    double e = grad_check(
+        [=](std::vector<Tensor>& t) { return ag::sum(ag::mul(ag::frame(t[0], T, nfft, hop), t[1])); },
+        {rand_vec(L, rng), rand_vec(T * nfft, rng)}, {{1, L}, {T, nfft}});
+    std::printf("[frame] %.2e\n", e); CHECK(e < 2e-2);
+  }
+}
+
 TEST_CASE("Autograd A2: AdamW convex convergence", "[autograd][a2][optim]") {
   // Minimize f(x) = sum((x - target)^2). Start x = 0, expect x -> target.
   const int n = 8;
