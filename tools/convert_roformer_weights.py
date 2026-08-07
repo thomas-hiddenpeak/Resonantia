@@ -44,9 +44,14 @@ from models.bs_roformer.mel_band_roformer import MelBandRoformer  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS = os.path.join(ROOT, "models", "separation")
 FIX = os.path.join(ROOT, "tests", "fixtures", "separation")
-REPO = "anvuew/dereverb_mel_band_roformer"
-CKPT = "archive only/8_256_6/deverb_mel_band_roformer_8_256dim_6depth.ckpt"
-YAML = "archive only/8_256_6/deverb_mel_band_roformer_8_256dim_6depth.yaml"
+
+# name -> (out_name, hf_repo, ckpt_path, yaml_path). All are MelBand-RoFormer
+# checkpoints loadable by the version-matched MSST model code.
+REGISTRY = {
+    "dereverb": ("dereverb_roformer", "anvuew/dereverb_mel_band_roformer",
+                 "archive only/8_256_6/deverb_mel_band_roformer_8_256dim_6depth.ckpt",
+                 "archive only/8_256_6/deverb_mel_band_roformer_8_256dim_6depth.yaml"),
+}
 VALID = {
     "dim", "depth", "stereo", "num_stems", "time_transformer_depth",
     "freq_transformer_depth", "linear_transformer_depth", "num_bands", "dim_head",
@@ -63,6 +68,11 @@ def dump(path, arr):
 def main():
     os.makedirs(MODELS, exist_ok=True)
     os.makedirs(FIX, exist_ok=True)
+    key = sys.argv[1] if len(sys.argv) > 1 else "dereverb"
+    if key not in REGISTRY:
+        raise SystemExit(f"unknown model '{key}'; known: {list(REGISTRY)}")
+    name, REPO, CKPT, YAML = REGISTRY[key]
+    is_ref = key == "dereverb"  # only the anvuew dereverb model backs the alignment test
     cfg = yaml.load(open(hf_hub_download(REPO, YAML)), Loader=yaml.FullLoader)
     mcfg = {k: v for k, v in cfg["model"].items() if k in VALID}
     mcfg.update(flash_attn=False, attn_dropout=0.0, ff_dropout=0.0)
@@ -73,12 +83,12 @@ def main():
     sd = {k[6:] if k.startswith("model.") else k: v for k, v in sd.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not unexpected, f"unexpected keys: {unexpected[:5]}"
-    print(f"loaded cleanly ({len(sd)} tensors); missing (non-persistent buffers): {len(missing)}")
+    print(f"[{name}] loaded cleanly ({len(sd)} tensors); missing buffers: {len(missing)}")
 
     # Weights -> F32 safetensors (clone to break shared rotary buffers).
     out_sd = {k: v.float().contiguous().clone() for k, v in model.state_dict().items()
               if v.is_floating_point()}
-    save_file(out_sd, os.path.join(MODELS, "dereverb_roformer.safetensors"))
+    save_file(out_sd, os.path.join(MODELS, f"{name}.safetensors"))
 
     # Band map (registered buffers, not persistent) needed by the C++ band split.
     fi = model.freq_indices.cpu().numpy().astype(np.int64)
@@ -93,12 +103,21 @@ def main():
         "nb_output_bins": mcfg["dim_freqs_in"], "mask_estimator_depth": mcfg["mask_estimator_depth"],
         "freq_indices_len": int(fi.size), "dim_inputs": dim_inputs,
     }
-    json.dump(hp, open(os.path.join(MODELS, "dereverb_roformer.json"), "w"), indent=2)
-    fi.tofile(os.path.join(MODELS, "roformer_freq_indices.i64"))
-    nbpf.tofile(os.path.join(MODELS, "roformer_num_bands_per_freq.i64"))
-    np.asarray(dim_inputs, dtype=np.int64).tofile(os.path.join(MODELS, "roformer_dim_inputs.i64"))
+    json.dump(hp, open(os.path.join(MODELS, f"{name}.json"), "w"), indent=2)
+    fi.tofile(os.path.join(MODELS, f"{name}_freq_indices.i64"))
+    nbpf.tofile(os.path.join(MODELS, f"{name}_num_bands_per_freq.i64"))
+    np.asarray(dim_inputs, dtype=np.int64).tofile(os.path.join(MODELS, f"{name}_dim_inputs.i64"))
+    # Runtime config for the C++ runner: [nfft,hop,dim,depth,num_bands,heads,dim_head,mask_depth,ff_mult,sr]
+    ff_mult = int(cfg["model"].get("mlp_expansion_factor", 4))
+    cfg_i64 = np.asarray([mcfg["stft_n_fft"], mcfg["stft_hop_length"], mcfg["dim"],
+                          mcfg["depth"], mcfg["num_bands"], mcfg["heads"], mcfg["dim_head"],
+                          mcfg["mask_estimator_depth"], ff_mult, mcfg["sample_rate"]], dtype=np.int64)
+    cfg_i64.tofile(os.path.join(MODELS, f"{name}_config.i64"))
     print(f"band map: freq_indices={fi.size}, bands={len(dim_inputs)}, "
           f"sum dim_inputs={sum(dim_inputs)}")
+    if not is_ref:
+        print(f"[{name}] converted (no staged reference; only 'dereverb' backs the test).")
+        return
 
     # Staged reference on real audio (2 s, resampled 44100, stereo).
     import librosa
