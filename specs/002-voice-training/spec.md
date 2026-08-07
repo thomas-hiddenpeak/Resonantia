@@ -2,110 +2,122 @@
 
 **Feature Branch**: `002-voice-training`
 **Created**: 2026-08-07
-**Status**: Draft — **需要架构决策(见 §1)后才能进入 plan**
+**Status**: Approved — 架构 **A(纯 C++/CUDA autograd)** · 40k · fine-tune only
+
+## Decision (2026-08-07)
+
+用户确认 **方案 A:纯 C++/CUDA 训练(自研 autograd)**。
+
+- 训练是本项目**不可分离**的一部分,与推理同等一等公民。
+- 训练产物必须是符合本项目与参考项目风格的 **safetensors 权重 + 索引**
+  (可被 C++ 推理运行时直接加载)。
+- 采样率**先只做 40k**(与已对齐的 f0G40k 一致),后期再完善 32k/48k。
+- **只做 fine-tune**(基于预训练模型微调),不做从零预训练。
+
+宪法 XI(Python 仅在 tools/)在此语境下的解读:**训练与推理运行时都用纯
+C++/CUDA**;Python 仅用于离线数据准备的一次性辅助(如无必要则不引入)。
 
 ## 目标
 
-实现产品的另一半:**学习声线与音高**。给定目标说话人/歌手的一段音频数据集,
-产出一个可被 C++ 推理运行时(spec 001)直接加载的 safetensors 模型 + 检索索引,
-使得后续推理能"模仿与演唱"该目标声线。
-
-对应 RVC 训练管线(`train/`):数据预处理 → 特征/F0 提取 → GAN 微调
-(VITS 生成器 + 多周期判别器)→ 检查点 → 构建检索索引。
+给定目标说话人/歌手的音频数据集,通过纯 C++/CUDA 的 GAN 微调,产出
+`G_<name>.safetensors` + `<name>.index`,供推理"模仿与演唱"该目标声线。
 
 ---
 
-## 1. 架构根本决策(NON-NEGOTIABLE 前置)
+## 1. 训练管线概览(对齐 RVC)
 
-RVC 训练是**完整的对抗训练(GAN)**:VITS 生成器与多周期/多尺度判别器交替优化,
-损失包含 mel L1、KL 散度、特征匹配、对抗(LSGAN)。这需要**每个算子的反向传播 +
-优化器(AdamW)**。当前推理实现只有前向。
+```
+目标音频目录
+  → 预处理(切片/重采样 40k+16k/响度归一)
+  → 特征提取(HuBERT 内容 + RMVPE F0,复用已实现 C++ 前向)
+  → 频谱(用于 PosteriorEncoder enc_q 与 mel 损失)
+  → GAN 微调:
+       Generator(enc_p + enc_q + flow + dec)  ← 需反向
+       Discriminator(MultiPeriod + MultiScale) ← 需反向
+       损失 = mel L1 + KL + feature-matching + adversarial(LSGAN)
+       优化器 = AdamW(G) + AdamW(D)
+  → 检查点(safetensors)+ 断点续训
+  → 导出仅推理所需的 G → safetensors
+  → 构建检索索引(复用已实现 C++ build_index)
+```
 
-三条可行路线:
-
-### 方案 A:纯 C++/CUDA 训练(自研 autograd)
-- 为 VITS + 判别器所有算子实现反向 + AdamW + GAN 循环。
-- ✅ 完全符合"推理和训练都脱离 Python"的原始愿景。
-- ❌ 工程量巨大(需完整反向传播框架),远超全部推理工作之和;风险高、周期长。
-
-### 方案 B:tools/ 离线微调(uv + PyTorch),产出 safetensors(推荐)
-- 训练作为**离线、一次性**过程放在 `tools/`(uv 管理),复用 RVC 训练逻辑,
-  产出 safetensors 权重 + 索引,由**纯 C++ 推理运行时消费**。
-- ✅ 符合宪法 XI(Python 仅在 tools/;运行时零 Python 依赖),与 Orator
-  "Python 仅作 tools/ 下离线工具"的约定一致。
-- ✅ 可快速交付可用的"学习声线"能力,让产品闭环。
-- ⚠️ 训练本身不是纯 C++(但运行时仍是)。
-
-### 方案 C:纯 C++ 推理侧轻量自适应
-- 不做完整 GAN:仅在 C++ 侧优化 speaker embedding / 少量层(需要局部反向)。
-- ✅ 比 A 小;❌ 效果弱于完整微调,仍需部分 autograd。
-
-**推荐:方案 B。** 理由:训练是离线产物生产,宪法明确允许 tools/ 使用 Python;
-可最快让产品闭环("学习声线"真正可用),而运行时零 Python 依赖的核心承诺不变。
-方案 A 可作为远期 spec 单独立项。
-
-> **本 spec 在决策确定前不进入 plan/实现。** 下方需求以方案 B 为默认草拟,
-> 若选 A/C 将大幅改写。
+**关键新增(训练专用,推理未实现)**:
+- 反向自动微分引擎(autograd)+ AdamW 优化器。
+- PosteriorEncoder(enc_q,WaveNet)前向 + 反向。
+- 判别器(MPD/MSD)前向 + 反向。
+- 训练损失(mel/KL/fm/adv)前向 + 反向。
+- 生成器所有算子的**反向**(推理已有前向)。
 
 ---
 
 ## 2. User Scenarios
 
 ### Story 1 — 训练目标声线 (P1)
-用户提供目标说话人的音频(一个目录),运行训练,得到 `G_<name>.safetensors`
-与 `<name>.index`,可直接用于 `vc_convert --model G_<name>.safetensors --index <name>.index`。
-
-**Independent Test**:
 ```bash
-# 方案 B
-tools/ (uv) train --input-dir data/target_voice --pretrained f0G40k --out models/mymodel
-build/vc_convert --model models/mymodel/G.safetensors --index models/mymodel/model.index ...
+vc_train --pretrained-g models/pretrained_v2/f0G40k.safetensors \
+         --pretrained-d models/pretrained_v2/f0D40k.safetensors \
+         --hubert models/hubert_base/model.safetensors \
+         --rmvpe models/rmvpe.safetensors \
+         --input-dir data/target_voice --out models/mymodel --epochs 100
+# 产出 models/mymodel/G.safetensors + model.index
+vc_convert --model models/mymodel/G.safetensors --index models/mymodel/model.index ...
 ```
 
 ### Story 2 — 断点续训 (P2)
-训练中断后可从最近检查点恢复。
+从最近检查点恢复,loss 连续。
 
 ### Story 3 — 进度可观测 (P2)
-训练过程输出 epoch/step/loss,可被 WebUI(spec 003)展示。
+输出结构化 epoch/step/loss,供 WebUI(spec 003)消费。
 
 ---
 
-## 3. Functional Requirements(方案 B 默认)
+## 3. Functional Requirements
 
-- **FR-001** 数据预处理:切片(静音切分)、重采样到 40k/16k、响度归一。
-- **FR-002** 特征提取:HuBERT 内容特征 + RMVPE F0(可复用 C++ `build_index` 的特征路径或 tools 提取)。
-- **FR-003** 数据集构建:filelist(audio|feature|f0|speaker)。
-- **FR-004** 微调训练:加载预训练 f0G40k,GAN 微调,损失 = mel + KL + fm + adv。
-- **FR-005** 检查点:定期保存 G/D;导出**仅推理所需**的 G → safetensors(去除判别器/优化器状态)。
-- **FR-006** 索引构建:训练集特征 → `.index`(可直接调用已实现的 C++ `build_index`)。
-- **FR-007** 恢复训练:从检查点续训。
-- **FR-008** 进度输出:结构化 epoch/step/loss(供 WebUI 消费)。
+- **FR-001 Autograd**:反向自动微分引擎(Tensor + 反向图 + 拓扑反传),
+  device 存储用 RAII(CudaBuffer);每个算子有梯度检查(有限差分)门控。
+- **FR-002 Optimizer**:AdamW,凸问题上验证收敛。
+- **FR-003 训练算子反向**:linear、conv1d(dilation/stride/groups)、
+  conv_transpose1d、layer_norm、gelu/leaky_relu/tanh、attention、
+  fused tanh·sigmoid;每个都有梯度检查。
+- **FR-004 PosteriorEncoder(enc_q)**:前向 + 反向(训练用后验编码器)。
+- **FR-005 判别器**:MultiPeriodDiscriminator + MultiScaleDiscriminator 前向 + 反向。
+- **FR-006 损失**:mel L1、KL、feature-matching、adversarial(LSGAN),前向 + 反向。
+- **FR-007 数据管线**:切片、重采样(40k+16k)、响度归一、特征/F0/频谱缓存、
+  filelist、batching(变长 → 截断/填充到训练片段)。
+- **FR-008 训练循环**:GAN 交替优化 G/D;梯度裁剪;学习率调度。
+- **FR-009 检查点**:safetensors 保存/加载 G+D+optimizer state;断点续训。
+- **FR-010 导出**:导出仅推理所需 G → safetensors(与 f0G40k 同构,可被 spec 001 加载)。
+- **FR-011 索引**:训练集特征 → `.index`(复用 C++ build_index)。
+- **FR-012 CLI**:`vc_train`。
 
 ---
 
 ## 4. Success Criteria
 
-- **SC-001** 端到端可训:给定 ~10 分钟目标音频,完成 N epoch 微调,无崩溃。
-- **SC-002** 产物可用:导出的 safetensors 能被 C++ 推理运行时加载并转换出有效音频(无 NaN/Inf)。
-- **SC-003** 声线学习有效:转换输出的音色更接近目标(主观 + 目标说话人 embedding 余弦相似度提升)。
-- **SC-004** 索引可用:产出的 `.index` 能被 `vc_convert --index` 正常检索。
-- **SC-005** 断点续训:从检查点恢复后 loss 连续。
+- **SC-001 Autograd 正确**:所有算子反向相对有限差分误差 < 1e-3(梯度检查)。
+- **SC-002 优化器正确**:AdamW 在凸问题上收敛到已知最优。
+- **SC-003 端到端可训**:~10 分钟目标音频,完成 N epoch 微调无崩溃/NaN。
+- **SC-004 产物可用**:导出 safetensors 被 C++ 推理运行时加载并转换出有效音频(无 NaN/Inf)。
+- **SC-005 声线学习有效**:转换输出音色更接近目标(目标说话人 embedding 余弦相似度提升)。
+- **SC-006 断点续训**:从检查点恢复后 loss 连续。
+- **SC-007 索引可用**:产出 `.index` 被 `vc_convert --index` 正常检索。
 
 ---
 
-## 5. 待你决策的开放问题
+## 5. 质量门(NON-NEGOTIABLE)
 
-1. **训练架构 A / B / C?**(决定本 spec 走向;推荐 B)
-2. 目标采样率:先只做 40k(与已对齐的 f0G40k 一致)?还是也要 32k/48k?
-3. 训练产物是否需要同时导出 D(判别器)以便继续训练,还是只保留可推理的 G?
-4. 是否需要"从零预训练"(pretrain),还是只做"微调"(fine-tune,推荐)?
+- **梯度检查是训练的"数值对齐"**:每个反向算子必须有有限差分梯度检查测试
+  (类比推理阶段的逐样本对齐)。无梯度检查的反向算子不得合入。
+- **真实音频**:功能测试用真实目标音频(宪法 X);合成信号仅用于 autograd 单元梯度检查。
+- **可复现参考**:关键损失/子图可与 PyTorch(tools/ 离线)对拍一次以确立正确性,
+  但训练运行时不依赖 Python。
 
 ---
 
-## Completion Checklist(方案 B,待决策后细化)
+## Completion Checklist
 
-- [ ] 架构决策已确认
-- [ ] FR-001..008 实现
-- [ ] SC-001..005 验证(真实目标音频)
-- [ ] 产物经 C++ 推理运行时端到端验证
-- [ ] plan.md / tasks 建立
+- [ ] FR-001..012 实现
+- [ ] SC-001..007 验证(真实目标音频)
+- [ ] 所有反向算子梯度检查通过
+- [ ] 导出产物经 C++ 推理运行时端到端验证
+- [ ] plan.md / tasks 建立并推进

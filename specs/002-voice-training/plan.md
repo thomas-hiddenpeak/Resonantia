@@ -1,0 +1,92 @@
+# Implementation Plan: Voice Training (002)
+
+**Branch**: `002-voice-training` | **Date**: 2026-08-07
+**Architecture**: 纯 C++/CUDA 自研 autograd(方案 A) · 40k · fine-tune only
+
+> 事实基线见 [specs/PROJECT_STATE.md](../PROJECT_STATE.md)。质量门:每个反向算子必须有有限差分梯度检查(训练版"数值对齐")。
+
+## 策略
+
+复用推理阶段已实现且对齐的**前向**;新增**反向**与训练专用组件。核心是先建一个
+**最小 tape-based 反向自动微分引擎**,device 存储用 RAII(顺带偿还审计 P0 的
+裸 cudaMalloc 债务),再在其上搭生成器/判别器/损失,最后 GAN 循环。
+
+## Constitution Check (v1.4.0)
+
+| Principle | Compliance | Notes |
+|-----------|------------|-------|
+| III. Test-First | ✅ | 梯度检查门控每个反向算子 |
+| V. Zero-Dependency Purity | ✅ | 纯 C++/CUDA autograd,无第三方训练框架 |
+| VI. Numerical Alignment | ✅ | 梯度检查 + 关键子图与 PyTorch 对拍一次 |
+| X. Real Audio Only | ✅ | 功能测试用真实目标音频 |
+| XI. Python Isolation | ✅ | 训练运行时纯 C++;Python 仅离线一次性对拍 |
+
+## Phases
+
+### Phase A0: Autograd 核心 — 🚧 进行中
+- [ ] `core/cuda_buffer.h` — RAII device 缓冲(替代裸 cudaMalloc/free)
+- [ ] `autograd/tensor.{h,cpp}` — Tensor(device data + grad + shape + requires_grad)
+- [ ] `autograd/engine` — 反向图节点 + 拓扑反传 `backward(loss)`
+- [ ] 基础算子:add、mul、sum、matmul/linear(前向 + 反向)
+- [ ] `test_autograd_grad`:有限差分梯度检查(< 1e-3)
+- **门控 SC-001(部分)**
+
+### Phase A1: NN 算子反向
+- [ ] linear(bias)、conv1d(dilation/stride/groups)、conv_transpose1d
+- [ ] layer_norm、gelu、leaky_relu、tanh、sigmoid、fused tanh·sigmoid
+- [ ] 相对位置多头注意力反向
+- [ ] 每个算子梯度检查
+- **门控 SC-001(全部)**
+
+### Phase A2: 优化器
+- [ ] AdamW(带 weight decay、bias correction、grad clip)
+- [ ] 凸问题收敛测试
+- **门控 SC-002**
+
+### Phase A3: 训练专用前向/反向组件
+- [ ] PosteriorEncoder(enc_q):spec + WaveNet + 反向
+- [ ] MultiPeriodDiscriminator + MultiScaleDiscriminator:前向 + 反向
+- [ ] 梯度检查
+
+### Phase A4: 损失
+- [ ] mel L1(需可微 mel:STFT + mel 滤波前向/反向,或 GPU mel)
+- [ ] KL 散度(m_p/logs_p/m_q/logs_q)
+- [ ] feature-matching、adversarial(LSGAN)
+- [ ] 与 PyTorch 对拍一次
+
+### Phase A5: 数据管线
+- [ ] 预处理:静音切片、重采样(40k + 16k)、响度归一
+- [ ] 特征/F0/频谱提取与缓存(复用 C++ HuBERT/RMVPE 前向)
+- [ ] filelist + batching(训练片段截断/填充)
+
+### Phase A6: 训练循环
+- [ ] GAN 交替优化 G/D;梯度裁剪;lr 调度
+- [ ] 结构化进度输出(epoch/step/loss)
+- **门控 SC-003**
+
+### Phase A7: 检查点与导出
+- [ ] safetensors 保存/加载 G+D+optimizer;断点续训
+- [ ] 导出仅推理 G(与 f0G40k 同构)
+- [ ] `tools/build_index` 产出 `.index`
+- **门控 SC-006、SC-007**
+
+### Phase A8: 端到端验证
+- [ ] `vc_train` CLI
+- [ ] 真实目标音频 fine-tune → 导出 → C++ 推理运行时转换验证
+- **门控 SC-004、SC-005**
+
+## 风险与约束
+
+| 风险 | 缓解 |
+|------|------|
+| Autograd 工程量大 | 最小 tape 引擎,只实现所需算子;梯度检查逐个门控 |
+| 反向数值不稳 | 有限差分梯度检查 + 关键子图 PyTorch 对拍 |
+| 显存/性能 | RAII 显存池;训练片段定长;先正确后优化 |
+| GAN 不收敛 | 从预训练权重 fine-tune(非从零);对齐 RVC 超参 |
+
+## 复杂度记录
+
+| 选择 | 原因 | 被拒替代 |
+|------|------|---------|
+| 自研 tape autograd | 全生成器需反向,手写逐算子不可维护 | 无框架逐函数反向(不可维护) |
+| device RAII(CudaBuffer) | 训练大量临时张量;偿还审计债务 | 裸 cudaMalloc(泄漏风险、无异常安全) |

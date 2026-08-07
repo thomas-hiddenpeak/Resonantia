@@ -46,6 +46,9 @@ include_directories(
 # ============================================================================
 file(GLOB_RECURSE VOXMUTATIO_SOURCES
     "src/core/*.cpp"
+    "src/core/*.cu"
+    "src/autograd/*.cpp"
+    "src/autograd/*.cu"
     "src/separation/*.cpp"
     "src/separation/*.cu"
     "src/content/*.cpp"
@@ -202,4 +205,10 @@ if(VOXMUTATIO_BUILD_TESTS)
     target_link_libraries(test_index_retrieval PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
     target_include_directories(test_index_retrieval PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME test_index_retrieval COMMAND test_index_retrieval WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+    # Test: Autograd gradient check (training foundation, spec 002)
+    add_executable(test_autograd tests/test_autograd.cpp)
+    target_link_libraries(test_autograd PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
+    target_include_directories(test_autograd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME test_autograd COMMAND test_autograd WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 endif()
