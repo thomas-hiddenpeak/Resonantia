@@ -643,6 +643,26 @@ std::vector<float> Synthesizer::debug_decode(const float* z, const float* f0,
     return generator(w, std::move(x), frames, f0, g.data(), sample_rate_);
 }
 
+std::vector<float> Synthesizer::debug_encp(const float* features, int frames,
+                                           const int* pitch_coarse, bool want_logs) {
+    Weights w;
+    if (!w.load(config_.model_path)) return {};
+    std::vector<float> logs;
+    auto m_p = text_encoder(w, features, frames, pitch_coarse, want_logs ? &logs : nullptr);
+    if (want_logs) m_p.insert(m_p.end(), logs.begin(), logs.end());  // [m_p ; logs_p]
+    return m_p;
+}
+
+std::vector<float> Synthesizer::debug_flow_reverse(const float* x, int frames, int speaker_id) {
+    Weights w;
+    if (!w.load(config_.model_path)) return {};
+    const float* emb_g = w.get("emb_g.weight");
+    std::vector<float> g(kGin);
+    for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
+    std::vector<float> in(x, x + kInter * frames);
+    return flow_reverse(w, std::move(in), frames, g.data());
+}
+
 AudioBuffer Synthesizer::infer(const float* features, int frames,
                                const float* pitch, const float* pitchf,
                                int speaker_id) {

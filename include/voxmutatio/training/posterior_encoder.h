@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,23 @@ class PosteriorEncoder {
   autograd::Tensor pre_w_, pre_b_;
   WaveNet wn_;
   autograd::Tensor proj_w_, proj_b_;
+  std::vector<autograd::Tensor> params_;
+};
+
+/// VITS residual-coupling flow (4 couplings + flips), forward z_q -> z_p.
+/// Inverse of the inference flow_reverse; used to compute the KL prior term.
+class Flow {
+ public:
+  bool init(const std::string& g_model_path, int speaker_id = 0);
+  autograd::Tensor forward(const autograd::Tensor& z, int T) const;
+  std::vector<autograd::Tensor>& params() { return params_; }
+
+ private:
+  struct Coupling {
+    autograd::Tensor pre_w, pre_b, post_w, post_b;
+    WaveNet wn;
+  };
+  std::array<Coupling, 4> couplings_;
   std::vector<autograd::Tensor> params_;
 };
 

@@ -108,6 +108,8 @@ Tensor transpose2d(const Tensor& x, int rows, int cols);
 Tensor concat_rows(const Tensor& a, const Tensor& b, int cols);
 /// Slice rows [start, start+count) of x[rows,cols] -> [count, cols].
 Tensor slice_rows(const Tensor& x, int start, int count, int cols);
+/// Reverse row order: out[r] = x[rows-1-r] (channel flip for coupling flows).
+Tensor flip_rows(const Tensor& x, int rows, int cols);
 /// Embedding lookup: table[vocab,dim] gathered by idx[T] -> [T,dim].
 Tensor embedding(const Tensor& table, const std::vector<int>& idx, int dim);
 /// Scale by a constant.

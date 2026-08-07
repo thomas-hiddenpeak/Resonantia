@@ -178,4 +178,42 @@ ag::Tensor PosteriorEncoder::forward(const ag::Tensor& spec, int T, bool sample,
   return ag::add(m_q, ag::mul(ag::exp_op(logs_q), eps_t));
 }
 
+bool Flow::init(const std::string& path, int speaker_id) {
+  io::SafetensorsLoader L;
+  if (!L.load(path)) { fprintf(stderr, "Flow: cannot load %s\n", path.c_str()); return false; }
+  const int hidden = 192, half = 96;
+  auto param = [&](std::vector<float> host, std::vector<int> shape) {
+    auto t = ag::Tensor::from_host(host, std::move(shape), true);
+    params_.push_back(t);
+    return t;
+  };
+  for (int f = 0; f < 4; ++f) {
+    std::string p = "model.flow.flows." + std::to_string(f * 2) + ".";
+    Coupling& c = couplings_[f];
+    c.pre_w = param(load_plain(L, p + "pre.weight", hidden * half), {hidden, half, 1});
+    c.pre_b = param(load_plain(L, p + "pre.bias", hidden), {hidden});
+    c.wn.load(L, p + "enc", hidden, 3, 5, speaker_id, params_);
+    c.post_w = param(load_plain(L, p + "post.weight", half * hidden), {half, hidden, 1});
+    c.post_b = param(load_plain(L, p + "post.bias", half), {half});
+  }
+  return true;
+}
+
+ag::Tensor Flow::forward(const ag::Tensor& z, int T) const {
+  const int inter = 192, half = 96, hidden = 192;
+  ag::Tensor x = z;
+  for (int f = 0; f < 4; ++f) {
+    const Coupling& c = couplings_[f];
+    auto x0 = ag::slice_rows(x, 0, half, T);
+    auto x1 = ag::slice_rows(x, half, half, T);
+    auto h = ag::conv1d(x0, c.pre_w, c.pre_b, half, T, hidden, 1, 1, 0, 1, 1);
+    h = c.wn.forward(h, T);
+    auto m = ag::conv1d(h, c.post_w, c.post_b, hidden, T, half, 1, 1, 0, 1, 1);
+    auto x1n = ag::add(x1, m);
+    x = ag::concat_rows(x0, x1n, T);
+    x = ag::flip_rows(x, inter, T);
+  }
+  return x;
+}
+
 }  // namespace voxmutatio::training

@@ -284,6 +284,15 @@ TEST_CASE("Autograd GAN: exp + conv2d", "[autograd][gradcheck][gan]") {
     run(2, 5, 4, 3, 3, 3, 1, 1, 1, 1, "square");
     run(2, 6, 2, 2, 3, 1, 2, 1, 1, 0, "stride");
   }
+  SECTION("flip_rows") {
+    double e = grad_check(
+        [](std::vector<Tensor>& t) {
+          return ag::sum(ag::gelu(ag::flip_rows(t[0], 4, 3)));
+        },
+        {rand_vec(12, rng)}, {{4, 3}});
+    std::printf("[flip_rows] %.2e\n", e);
+    CHECK(e < 3e-2);
+  }
 }
 
 TEST_CASE("Autograd A3: primitives", "[autograd][gradcheck][a3]") {

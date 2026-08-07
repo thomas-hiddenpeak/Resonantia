@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <random>
 #include <vector>
 
 #include "voxmutatio/autograd/tensor.h"
@@ -192,4 +193,36 @@ TEST_CASE("PosteriorEncoder reconstructs real audio (enc_q + dec)", "[gan][encq]
   std::printf("[encq] mel-domain reconstruction corr = %.4f\n", corr);
   // Pretrained enc_q+dec is an autoencoder: mel content must track the target.
   CHECK(corr > 0.5);
+}
+
+TEST_CASE("Flow forward inverts inference flow_reverse", "[gan][flow]") {
+  using namespace voxmutatio;
+
+  std::string g_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+  synthesizer::SynthesizerConfig scfg;
+  scfg.model_path = g_path; scfg.version = ModelVersion::kV2;
+  scfg.sample_rate = 40000; scfg.spk_embed_dim = 109;
+  synthesizer::Synthesizer synth; REQUIRE(synth.init(scfg));
+
+  training::Flow flow; REQUIRE(flow.init(g_path, 0));
+
+  // Random latent; flow forward then the proven inference reverse must round-trip.
+  const int T = 64;
+  std::mt19937 rng(7);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<float> zq(192 * T);
+  for (auto& v : zq) v = nd(rng);
+  auto z = Tensor::from_host(zq, {192, T}, false);
+
+  auto zp = flow.forward(z, T).to_host();
+  for (float v : zp) REQUIRE(std::isfinite(v));
+  auto zback = synth.debug_flow_reverse(zp.data(), T, 0);
+  REQUIRE(zback.size() == zq.size());
+
+  double num = 0, den = 0;
+  for (size_t i = 0; i < zq.size(); ++i) { double d = zback[i] - zq[i]; num += d*d; den += (double)zq[i]*zq[i]; }
+  double rel = std::sqrt(num / den);
+  std::printf("[flow] round-trip rel error = %.2e\n", rel);
+  // flow.forward must be the exact inverse of flow_reverse.
+  CHECK(rel < 1e-3);
 }

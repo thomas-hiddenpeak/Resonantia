@@ -759,6 +759,26 @@ Tensor exp_op(const Tensor& x) {
       true);
 }
 
+__global__ void k_flip_rows_f(const float* x, float* o, int rows, int cols) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < rows * cols) { int r = i / cols, c = i % cols; o[r * cols + c] = x[(rows - 1 - r) * cols + c]; }
+}
+__global__ void k_flip_rows_b(float* dx, const float* dy, int rows, int cols) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < rows * cols) { int r = i / cols, c = i % cols; atomicAdd(&dx[r * cols + c], dy[(rows - 1 - r) * cols + c]); }
+}
+Tensor flip_rows(const Tensor& x, int rows, int cols) {
+  auto out = make_node(x.shape(), any_requires_grad({&x}));
+  k_flip_rows_f<<<grid(rows * cols), 256>>>(x.n->data.data(), out->data.data(), rows, cols);
+  check_launch("flip_rows");
+  out->parents = {x.n};
+  Node* o = out.get(); Node* px = x.n.get();
+  out->backward_fn = [o, px, rows, cols] {
+    k_flip_rows_b<<<grid(rows * cols), 256>>>(px->grad.data(), o->grad.data(), rows, cols);
+  };
+  return Tensor(out);
+}
+
 __global__ void k_conv2d_f(const float* x, const float* w, const float* b, float* o,
     int Cin, int H, int W, int Cout, int kh, int kw, int sh, int sw, int ph, int pw,
     int Hout, int Wout) {

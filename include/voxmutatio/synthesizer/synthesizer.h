@@ -104,6 +104,13 @@ public:
     std::vector<float> debug_decode(const float* z, const float* f0,
                                     int frames, int speaker_id);
 
+    /// Test hook: prior encoder stats m_p, logs_p [inter, T] each (concatenated).
+    std::vector<float> debug_encp(const float* features, int frames,
+                                  const int* pitch_coarse, bool want_logs);
+
+    /// Test hook: inference flow (reverse) applied to x [inter, T] -> [inter, T].
+    std::vector<float> debug_flow_reverse(const float* x, int frames, int speaker_id);
+
 private:
     SynthesizerConfig config_;
     int sample_rate_ = 40'000;
