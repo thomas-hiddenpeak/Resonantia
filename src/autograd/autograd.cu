@@ -83,6 +83,26 @@ void gemm_rm(bool transA, bool transB, int M, int N, int K, float alpha,
               C, N);
 }
 
+// Reuses device scratch buffers across ops/steps so im2col does not cudaMalloc/
+// cudaFree per conv (cudaFree syncs the device). Buffers return to the free list
+// via the shared_ptr deleter; capacity grows monotonically to steady state.
+class ScratchPool {
+ public:
+  static ScratchPool& get() { static ScratchPool p; return p; }
+  std::shared_ptr<core::CudaBuffer> acquire(std::size_t n) {
+    std::unique_ptr<core::CudaBuffer> buf;
+    if (!free_.empty()) { buf = std::move(free_.back()); free_.pop_back(); }
+    if (!buf) buf = std::make_unique<core::CudaBuffer>();
+    if (buf->size() < n) buf->allocate(n);
+    core::CudaBuffer* raw = buf.release();
+    return std::shared_ptr<core::CudaBuffer>(raw, [this](core::CudaBuffer* p) {
+      free_.emplace_back(p);
+    });
+  }
+ private:
+  std::vector<std::unique_ptr<core::CudaBuffer>> free_;
+};
+
 std::shared_ptr<Node> make_node(std::vector<int> shape, bool requires_grad) {
   auto nd = std::make_shared<Node>();
   nd->shape = std::move(shape);
@@ -563,8 +583,7 @@ Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
   if (groups == 1) {
     // im2col + cuBLAS GEMM: out[Cout,Lout] = W[Cout, Cin*K] @ col[Cin*K, Lout].
     const int rows = Cin * K;
-    auto col = std::make_shared<core::CudaBuffer>();
-    col->allocate(static_cast<std::size_t>(rows) * Lout);
+    auto col = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * Lout);
     k_im2col_1d<<<grid(rows * Lout), 256>>>(px->data.data(), col->data(), Cin, L, K,
                                             stride, pad, dilation, Lout);
     gemm_rm(false, false, Cout, Lout, rows, 1.0f, pw->data.data(), col->data(), 0.0f, o->data.data());
@@ -575,10 +594,9 @@ Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
       // dW += dout[Cout,Lout] @ col^T[Lout, Cin*K]
       gemm_rm(false, true, Cout, rows, Lout, 1.0f, o->grad.data(), col->data(), 1.0f, pw->grad.data());
       // dcol = W^T[Cin*K,Cout] @ dout[Cout,Lout]; scatter into dx
-      core::CudaBuffer dcol;
-      dcol.allocate(static_cast<std::size_t>(rows) * Lout);
-      gemm_rm(true, false, rows, Lout, Cout, 1.0f, pw->data.data(), o->grad.data(), 0.0f, dcol.data());
-      k_col2im_1d<<<grid(rows * Lout), 256>>>(px->grad.data(), dcol.data(), Cin, L, K,
+      auto dcol = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * Lout);
+      gemm_rm(true, false, rows, Lout, Cout, 1.0f, pw->data.data(), o->grad.data(), 0.0f, dcol->data());
+      k_col2im_1d<<<grid(rows * Lout), 256>>>(px->grad.data(), dcol->data(), Cin, L, K,
                                               stride, pad, dilation, Lout);
       if (pb) k_conv_db<<<grid(Cout), 256>>>(pb->grad.data(), o->grad.data(), Cout, Lout);
     };
@@ -934,8 +952,7 @@ Tensor conv2d(const Tensor& x, const Tensor& w, const Tensor& b,
   // im2col + cuBLAS GEMM: out[Cout, Hout*Wout] = W[Cout, Cin*kh*kw] @ col.
   const int rows = Cin * kh * kw;
   const int cols = Hout * Wout;
-  auto col = std::make_shared<core::CudaBuffer>();
-  col->allocate(static_cast<std::size_t>(rows) * cols);
+  auto col = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * cols);
   k_im2col_2d<<<grid(rows * cols), 256>>>(pxn->data.data(), col->data(), Cin, H, W,
                                           kh, kw, sh, sw, ph, pw, Hout, Wout);
   gemm_rm(false, false, Cout, cols, rows, 1.0f, pwn->data.data(), col->data(), 0.0f, o->data.data());
@@ -946,10 +963,9 @@ Tensor conv2d(const Tensor& x, const Tensor& w, const Tensor& b,
     // dW += dout[Cout,cols] @ col^T[cols,rows]
     gemm_rm(false, true, Cout, rows, cols, 1.0f, o->grad.data(), col->data(), 1.0f, pwn->grad.data());
     // dcol = W^T[rows,Cout] @ dout[Cout,cols]; scatter into dx
-    core::CudaBuffer dcol;
-    dcol.allocate(static_cast<std::size_t>(rows) * cols);
-    gemm_rm(true, false, rows, cols, Cout, 1.0f, pwn->data.data(), o->grad.data(), 0.0f, dcol.data());
-    k_col2im_2d<<<grid(rows * cols), 256>>>(pxn->grad.data(), dcol.data(), Cin, H, W,
+    auto dcol = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * cols);
+    gemm_rm(true, false, rows, cols, Cout, 1.0f, pwn->data.data(), o->grad.data(), 0.0f, dcol->data());
+    k_col2im_2d<<<grid(rows * cols), 256>>>(pxn->grad.data(), dcol->data(), Cin, H, W,
                                             kh, kw, sh, sw, ph, pw, Hout, Wout);
     if (pbn) k_conv2d_db<<<grid(Cout), 256>>>(pbn->grad.data(), o->grad.data(), Cout, Hout, Wout);
   };
