@@ -486,6 +486,30 @@ __global__ void k_conv_db(float* db, const float* dout, int Cout, int Lout) {
   db[co] += s;
 }
 
+// im2col for conv1d (groups==1): col[(c*K+k), ot] = x[c, ot*stride - pad + k*dil].
+__global__ void k_im2col_1d(const float* x, float* col, int Cin, int L, int K,
+    int stride, int pad, int dil, int Lout) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= Cin * K * Lout) return;
+  int ot = i % Lout, r = i / Lout, k = r % K, c = r / K;
+  int t = ot * stride - pad + k * dil;
+  col[r * Lout + ot] = (t >= 0 && t < L) ? x[c * L + t] : 0.0f;
+}
+// col2im (scatter dcol back into dx).
+__global__ void k_col2im_1d(float* dx, const float* dcol, int Cin, int L, int K,
+    int stride, int pad, int dil, int Lout) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= Cin * K * Lout) return;
+  int ot = i % Lout, r = i / Lout, k = r % K, c = r / K;
+  int t = ot * stride - pad + k * dil;
+  if (t >= 0 && t < L) atomicAdd(&dx[c * L + t], dcol[r * Lout + ot]);
+}
+// Broadcast add bias over columns: o[c, n] += b[c].
+__global__ void k_bias_rows(float* o, const float* b, int C, int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < C * N) o[i] += b[i / N];
+}
+
 __global__ void k_convt_f(const float* x, const float* w, const float* b, float* o,
     int Cin, int L, int Cout, int K, int stride, int pad, int Lout) {
   int ot = blockIdx.x * blockDim.x + threadIdx.x, co = blockIdx.y;
@@ -533,14 +557,41 @@ Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
   bool rg = any_requires_grad({&x, &w}) ||
             (has_b && (b.n->requires_grad || !b.n->parents.empty()));
   auto out = make_node({Cout, Lout}, rg);
+  Node* o = out.get(); Node* px = x.n.get(); Node* pw = w.n.get();
+  Node* pb = has_b ? b.n.get() : nullptr;
+
+  if (groups == 1) {
+    // im2col + cuBLAS GEMM: out[Cout,Lout] = W[Cout, Cin*K] @ col[Cin*K, Lout].
+    const int rows = Cin * K;
+    auto col = std::make_shared<core::CudaBuffer>();
+    col->allocate(static_cast<std::size_t>(rows) * Lout);
+    k_im2col_1d<<<grid(rows * Lout), 256>>>(px->data.data(), col->data(), Cin, L, K,
+                                            stride, pad, dilation, Lout);
+    gemm_rm(false, false, Cout, Lout, rows, 1.0f, pw->data.data(), col->data(), 0.0f, o->data.data());
+    if (has_b) k_bias_rows<<<grid(Cout * Lout), 256>>>(o->data.data(), pb->data.data(), Cout, Lout);
+    check_launch("conv1d_im2col");
+    if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
+    out->backward_fn = [o, px, pw, pb, col, Cin, L, Cout, K, stride, pad, dilation, Lout, rows] {
+      // dW += dout[Cout,Lout] @ col^T[Lout, Cin*K]
+      gemm_rm(false, true, Cout, rows, Lout, 1.0f, o->grad.data(), col->data(), 1.0f, pw->grad.data());
+      // dcol = W^T[Cin*K,Cout] @ dout[Cout,Lout]; scatter into dx
+      core::CudaBuffer dcol;
+      dcol.allocate(static_cast<std::size_t>(rows) * Lout);
+      gemm_rm(true, false, rows, Lout, Cout, 1.0f, pw->data.data(), o->grad.data(), 0.0f, dcol.data());
+      k_col2im_1d<<<grid(rows * Lout), 256>>>(px->grad.data(), dcol.data(), Cin, L, K,
+                                              stride, pad, dilation, Lout);
+      if (pb) k_conv_db<<<grid(Cout), 256>>>(pb->grad.data(), o->grad.data(), Cout, Lout);
+    };
+    return Tensor(out);
+  }
+
+  // Grouped convolution: naive kernels.
   dim3 gf(grid(Lout), Cout);
-  k_conv1d_f<<<gf, 256>>>(x.n->data.data(), w.n->data.data(),
-                          has_b ? b.n->data.data() : nullptr, out->data.data(),
+  k_conv1d_f<<<gf, 256>>>(px->data.data(), pw->data.data(),
+                          has_b ? pb->data.data() : nullptr, o->data.data(),
                           Cin, L, Cout, K, stride, pad, dilation, groups, Lout);
   check_launch("conv1d");
   if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
-  Node* o = out.get(); Node* px = x.n.get(); Node* pw = w.n.get();
-  Node* pb = has_b ? b.n.get() : nullptr;
   int ipg = Cin / groups;
   out->backward_fn = [o, px, pw, pb, Cin, L, Cout, K, stride, pad, dilation, groups, Lout, ipg] {
     dim3 gd(grid(Lout), Cout);
@@ -843,6 +894,31 @@ __global__ void k_conv2d_db(float* db, const float* dout, int Cout, int Hout, in
   db[co] += s;
 }
 
+// im2col for 2D conv: col[(ci*kh*kw + i*kw + j), (oh*Wout+ow)] = x[ci, h, wcol].
+__global__ void k_im2col_2d(const float* x, float* col, int Cin, int H, int W,
+    int kh, int kw, int sh, int sw, int ph, int pw, int Hout, int Wout) {
+  int cols = Hout * Wout, rows = Cin * kh * kw;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= rows * cols) return;
+  int c = idx % cols, r = idx / cols;
+  int j = r % kw, i = (r / kw) % kh, ci = r / (kw * kh);
+  int ow = c % Wout, oh = c / Wout;
+  int h = oh * sh - ph + i, wcol = ow * sw - pw + j;
+  col[idx] = (h >= 0 && h < H && wcol >= 0 && wcol < W) ? x[(ci * H + h) * W + wcol] : 0.0f;
+}
+__global__ void k_col2im_2d(float* dx, const float* dcol, int Cin, int H, int W,
+    int kh, int kw, int sh, int sw, int ph, int pw, int Hout, int Wout) {
+  int cols = Hout * Wout, rows = Cin * kh * kw;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= rows * cols) return;
+  int c = idx % cols, r = idx / cols;
+  int j = r % kw, i = (r / kw) % kh, ci = r / (kw * kh);
+  int ow = c % Wout, oh = c / Wout;
+  int h = oh * sh - ph + i, wcol = ow * sw - pw + j;
+  if (h >= 0 && h < H && wcol >= 0 && wcol < W)
+    atomicAdd(&dx[(ci * H + h) * W + wcol], dcol[idx]);
+}
+
 Tensor conv2d(const Tensor& x, const Tensor& w, const Tensor& b,
               int Cin, int H, int W, int Cout, int kh, int kw,
               int sh, int sw, int ph, int pw) {
@@ -852,20 +928,29 @@ Tensor conv2d(const Tensor& x, const Tensor& w, const Tensor& b,
   bool rg = any_requires_grad({&x, &w}) ||
             (has_b && (b.n->requires_grad || !b.n->parents.empty()));
   auto out = make_node({Cout, Hout, Wout}, rg);
-  dim3 gf(grid(Wout), Hout, Cout);
-  k_conv2d_f<<<gf, 256>>>(x.n->data.data(), w.n->data.data(),
-                          has_b ? b.n->data.data() : nullptr, out->data.data(),
-                          Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout);
-  check_launch("conv2d");
-  if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
   Node* o = out.get(); Node* pxn = x.n.get(); Node* pwn = w.n.get();
   Node* pbn = has_b ? b.n.get() : nullptr;
-  out->backward_fn = [o, pxn, pwn, pbn, Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout] {
-    dim3 gd(grid(Wout), Hout, Cout);
-    k_conv2d_dx<<<gd, 256>>>(pxn->grad.data(), o->grad.data(), pwn->data.data(),
-                             Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout);
-    k_conv2d_dw<<<grid(Cout * Cin * kh * kw), 256>>>(pwn->grad.data(), o->grad.data(),
-                             pxn->data.data(), Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout);
+
+  // im2col + cuBLAS GEMM: out[Cout, Hout*Wout] = W[Cout, Cin*kh*kw] @ col.
+  const int rows = Cin * kh * kw;
+  const int cols = Hout * Wout;
+  auto col = std::make_shared<core::CudaBuffer>();
+  col->allocate(static_cast<std::size_t>(rows) * cols);
+  k_im2col_2d<<<grid(rows * cols), 256>>>(pxn->data.data(), col->data(), Cin, H, W,
+                                          kh, kw, sh, sw, ph, pw, Hout, Wout);
+  gemm_rm(false, false, Cout, cols, rows, 1.0f, pwn->data.data(), col->data(), 0.0f, o->data.data());
+  if (has_b) k_bias_rows<<<grid(Cout * cols), 256>>>(o->data.data(), pbn->data.data(), Cout, cols);
+  check_launch("conv2d_im2col");
+  if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
+  out->backward_fn = [o, pxn, pwn, pbn, col, Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout, rows, cols] {
+    // dW += dout[Cout,cols] @ col^T[cols,rows]
+    gemm_rm(false, true, Cout, rows, cols, 1.0f, o->grad.data(), col->data(), 1.0f, pwn->grad.data());
+    // dcol = W^T[rows,Cout] @ dout[Cout,cols]; scatter into dx
+    core::CudaBuffer dcol;
+    dcol.allocate(static_cast<std::size_t>(rows) * cols);
+    gemm_rm(true, false, rows, cols, Cout, 1.0f, pwn->data.data(), o->grad.data(), 0.0f, dcol.data());
+    k_col2im_2d<<<grid(rows * cols), 256>>>(pxn->grad.data(), dcol.data(), Cin, H, W,
+                                            kh, kw, sh, sw, ph, pw, Hout, Wout);
     if (pbn) k_conv2d_db<<<grid(Cout), 256>>>(pbn->grad.data(), o->grad.data(), Cout, Hout, Wout);
   };
   return Tensor(out);

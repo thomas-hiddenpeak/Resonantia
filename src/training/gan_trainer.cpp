@@ -4,6 +4,11 @@
 #include "voxmutatio/training/gan_trainer.h"
 
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+#include <cuda_runtime.h>
 
 namespace voxmutatio::training {
 
@@ -11,6 +16,23 @@ namespace ag = voxmutatio::autograd;
 
 namespace {
 
+// Lightweight phase profiler gated by the VOX_PROFILE env var.
+struct Prof {
+  bool on;
+  std::chrono::high_resolution_clock::time_point t0;
+  Prof() : on(std::getenv("VOX_PROFILE") != nullptr) { reset(); }
+  void reset() {
+    if (on) { cudaDeviceSynchronize(); t0 = std::chrono::high_resolution_clock::now(); }
+  }
+  void mark(const char* tag) {
+    if (!on) return;
+    cudaDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::fprintf(stderr, "  [prof] %-16s %8.1f ms\n", tag, ms);
+    t0 = t1;
+  }
+};
 // mean(x) and mean(x^2) as scalar autograd tensors.
 ag::Tensor mean_(const ag::Tensor& x) {
   return ag::scale(ag::sum(x), 1.0f / static_cast<float>(x.numel()));
@@ -160,26 +182,30 @@ GANTrainer::Losses GANTrainer::train_step_full(
   Losses out{};
   const int n_sub = 9;
 
+  Prof prof;
+  // Single posterior sample + decode, shared by D and G steps (matches
+  // reference VITS: one enc_q sample, one generator forward per step).
+  ag::Tensor mq, lq;
+  auto zq = enc_q_.forward(spec_t, T, true, mq, lq);
+  auto zp = flow_.forward(zq, T);
+  auto y_hat = gen_.decode(zq, hc, T);
+  auto y_det = ag::Tensor::from_host(y_hat.to_host(), {1, L}, false);
+  prof.mark("fwd(encq+flow+dec)");
+
   // ---- Discriminator step (fake detached) ----
   {
-    ag::Tensor mq, lq;
-    auto zq = enc_q_.forward(spec_t, T, true, mq, lq);
-    auto y_hat = gen_.decode(zq, hc, T);
-    auto y_det = ag::Tensor::from_host(y_hat.to_host(), {1, L}, false);
     auto dr = disc_.forward(y_real, L);
     auto df = disc_.forward(y_det, L);
     auto ld = disc_loss(dr, df);
+    prof.mark("D.fwd(disc x2)");
     ag::backward(ld);
     d_opt_->step();
+    prof.mark("D.backward+step");
     out.d = ld.to_host()[0] + static_cast<float>(n_sub);
   }
 
   // ---- Generator step (mel + kl + feature-matching + adversarial) ----
   {
-    ag::Tensor mq, lq;
-    auto zq = enc_q_.forward(spec_t, T, true, mq, lq);
-    auto zp = flow_.forward(zq, T);
-    auto y_hat = gen_.decode(zq, hc, T);
     auto gm = mel_->log_mel(y_hat, L);
     auto lmel = mel_->l1(gm, mel_tgt, Tm);
     auto lkl = kl_loss(zp, lq, mp, lsp);
@@ -188,8 +214,10 @@ GANTrainer::Losses GANTrainer::train_step_full(
     auto ladv = gen_adv_loss(df);
     auto lfm = fm_loss(dr, df);
     auto lg = ag::add(ag::add(ag::add(ag::scale(lmel, 45.0f), ag::scale(lfm, 2.0f)), ladv), lkl);
+    prof.mark("G.fwd(mel+disc x2)");
     ag::backward(lg);
     g_opt_->step();
+    prof.mark("G.backward+step");
     out.mel = lmel.to_host()[0];
     out.fm = lfm.to_host()[0];
     out.adv = ladv.to_host()[0] + static_cast<float>(n_sub);
