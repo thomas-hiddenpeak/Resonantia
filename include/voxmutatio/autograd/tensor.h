@@ -99,4 +99,25 @@ Tensor conv_transpose1d(const Tensor& x, const Tensor& w, const Tensor& b,
 /// Reverse-mode backprop from a scalar loss.
 void backward(const Tensor& loss);
 
+/// AdamW optimizer over a fixed set of parameter tensors.
+class AdamW {
+ public:
+  AdamW(std::vector<Tensor> params, float lr, float beta1 = 0.9f,
+        float beta2 = 0.999f, float eps = 1e-8f, float weight_decay = 0.0f);
+
+  /// Apply one update step using each parameter's accumulated .grad.
+  void step();
+  /// Zero all parameter gradients.
+  void zero_grad();
+  void set_lr(float lr) { lr_ = lr; }
+  [[nodiscard]] float lr() const { return lr_; }
+  [[nodiscard]] int step_count() const { return t_; }
+
+ private:
+  std::vector<Tensor> params_;
+  std::vector<core::CudaBuffer> m_, v_;
+  float lr_, beta1_, beta2_, eps_, wd_;
+  int t_ = 0;
+};
+
 }  // namespace voxmutatio::autograd

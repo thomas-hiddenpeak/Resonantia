@@ -6,6 +6,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdio>
 #include <functional>
 #include <unordered_set>
@@ -599,6 +600,56 @@ void backward(const Tensor& loss) {
 
   for (auto it = topo.rbegin(); it != topo.rend(); ++it)
     if ((*it)->backward_fn) (*it)->backward_fn();
+  CK(cudaDeviceSynchronize());
+}
+
+// ==== AdamW ====
+
+__global__ void k_adamw(float* p, const float* g, float* m, float* v, float lr,
+                        float b1, float b2, float eps, float wd, float bc1,
+                        float bc2, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float grad = g[i];
+  float mi = b1 * m[i] + (1.0f - b1) * grad;
+  float vi = b2 * v[i] + (1.0f - b2) * grad * grad;
+  m[i] = mi;
+  v[i] = vi;
+  float mh = mi / bc1;
+  float vh = vi / bc2;
+  p[i] -= lr * (mh / (sqrtf(vh) + eps) + wd * p[i]);
+}
+
+AdamW::AdamW(std::vector<Tensor> params, float lr, float beta1, float beta2,
+             float eps, float weight_decay)
+    : params_(std::move(params)), lr_(lr), beta1_(beta1), beta2_(beta2),
+      eps_(eps), wd_(weight_decay) {
+  m_.resize(params_.size());
+  v_.resize(params_.size());
+  for (std::size_t i = 0; i < params_.size(); ++i) {
+    std::size_t n = static_cast<std::size_t>(params_[i].numel());
+    m_[i].allocate(n);
+    m_[i].zero();
+    v_[i].allocate(n);
+    v_[i].zero();
+  }
+}
+
+void AdamW::zero_grad() {
+  for (auto& p : params_) p.n->ensure_grad();
+}
+
+void AdamW::step() {
+  ++t_;
+  float bc1 = 1.0f - std::pow(beta1_, t_);
+  float bc2 = 1.0f - std::pow(beta2_, t_);
+  for (std::size_t i = 0; i < params_.size(); ++i) {
+    int n = static_cast<int>(params_[i].numel());
+    if (params_[i].n->grad.size() < static_cast<std::size_t>(n)) continue;
+    k_adamw<<<grid(n), 256>>>(params_[i].n->data.data(), params_[i].n->grad.data(),
+                              m_[i].data(), v_[i].data(), lr_, beta1_, beta2_,
+                              eps_, wd_, bc1, bc2, n);
+  }
   CK(cudaDeviceSynchronize());
 }
 

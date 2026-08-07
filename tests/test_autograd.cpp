@@ -257,3 +257,30 @@ TEST_CASE("Autograd A1: conv_transpose1d", "[autograd][gradcheck][a1][conv]") {
   run(3, 4, 2, 4, 2, 1, "up2_k4");   // generator-style upsampling
   run(2, 5, 3, 3, 1, 1, "same");
 }
+
+TEST_CASE("Autograd A2: AdamW convex convergence", "[autograd][a2][optim]") {
+  // Minimize f(x) = sum((x - target)^2). Start x = 0, expect x -> target.
+  const int n = 8;
+  std::mt19937 rng(23);
+  std::vector<float> target = rand_vec(n, rng, -2.0f, 2.0f);
+  std::vector<float> neg_target(n);
+  for (int i = 0; i < n; ++i) neg_target[i] = -target[i];
+
+  auto x = Tensor::from_host(std::vector<float>(n, 0.0f), {1, n}, true);
+  auto negt = Tensor::from_host(neg_target, {1, n}, false);
+
+  ag::AdamW opt({x}, /*lr=*/0.1f);
+  for (int it = 0; it < 400; ++it) {
+    auto diff = ag::add(x, negt);          // x - target
+    auto loss = ag::sum(ag::mul(diff, diff));
+    ag::backward(loss);
+    opt.step();
+  }
+
+  auto xh = x.to_host();
+  double max_err = 0.0;
+  for (int i = 0; i < n; ++i)
+    max_err = std::max(max_err, std::abs((double)xh[i] - target[i]));
+  std::printf("[AdamW] max |x-target| after 400 steps: %.2e\n", max_err);
+  CHECK(max_err < 1e-2);
+}
