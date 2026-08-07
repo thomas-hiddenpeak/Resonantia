@@ -1,6 +1,9 @@
 # Implementation Plan: Voice Conversion Engine
 
 **Branch**: `001-voice-conversion-engine` | **Date**: 2026-08-07
+**Status**: 推理部分 Complete(P0–P5 已完成并数值对齐);训练与 WebUI(原 P6)已拆分为独立 spec 002/003。
+
+> 事实基线见 [specs/PROJECT_STATE.md](../PROJECT_STATE.md)。本 plan 仅覆盖 001 的推理引擎范围。
 
 ## Summary
 
@@ -17,19 +20,21 @@
 **Performance Goals**: 端到端 < 5s (5s 音频, Jetson AGX Orin)
 
 ## Constitution Check
-*GATE: Must pass before Phase 0 research.*
+*GATE: 宪法 v1.4.0(11 条原则)。*
 
 | Principle | Compliance | Notes |
 |-----------|------------|-------|
 | I. Library-First | ✅ | 每个模块独立编译单元 |
-| II. CLI Interface | ✅ | vc_convert, vc_batch, vc_probe |
-| III. Test-First | ✅ | 测试骨架先行，数值对齐门控 |
-| IV. safetensors-Only | ✅ | 零拷贝 mmap，无 pickle |
-| V. Zero-Dependency Purity | ✅ | 手写 CUDA Index，无 FAISS/ONNX |
-| VI. Numerical Alignment | ✅ | L2<1e-4, F0<0.5Hz, SRCC>0.999 |
-| VII. Simplicity | ✅ | WebUI 简洁现代，不照搬 RVC-WebUI |
-| VIII. Anti-Abstraction | ✅ | 直接使用 cuBLAS/CUDA，不包装 |
-| IX. Integration-First | ✅ | test_pipeline.cpp 为最高优先级 |
+| II. CLI Interface | ✅ | vc_convert, vc_batch, vc_probe, build_index |
+| III. Test-First | ✅ | 数值对齐门控;10/10 测试通过 |
+| IV. safetensors-Only | ✅ | 零拷贝 mmap,无 pickle |
+| V. Zero-Dependency Purity | ✅ | 手写 CUDA Index,无 FAISS/ONNX |
+| VI. Numerical Alignment | ✅ | HuBERT 7e-7 / F0 1.5e-5Hz / 音频 0.9997 |
+| VII. Simplicity | ✅ | 不照搬 RVC-WebUI |
+| VIII. Anti-Abstraction | ✅ | 直接使用 cuBLAS/CUDA |
+| IX. Integration-First | ✅ | test_e2e_conversion 为最高优先级 |
+| X. Real Audio Only | ✅ | 全部用 LibriSpeech 真实语音对齐 |
+| XI. Python Isolation | ✅ | Python 仅在 tools/(uv);运行时零依赖 |
 
 ## Project Structure
 
@@ -62,42 +67,42 @@ tests/                    # 测试套件
 
 ## Implementation Phases
 
-### Phase 0: Infrastructure (P0)
-- [ ] `core/types.cpp` - 错误码字符串化
-- [ ] `core/device.cpp` - CUDA 设备管理
-- [ ] `io/safetensors.cpp` - safetensors 零拷贝加载
-- [ ] `io/audio_io.cpp` - WAV 读写 + 重采样
-- [ ] 编译验证：`cmake --build build`
+> 状态图例:✅ 完成并验证 · ⚠️ 骨架/桩 · ➡️ 拆分到独立 spec
 
-### Phase 1: Content Encoder (P1)
-- [ ] `content/hubert_encoder.cu` - HuBERT CUDA 实现
-- [ ] `content/wavlm_encoder.cu` - WavLM CUDA 实现
-- [ ] `test_hubert.cpp` - 数值对齐测试 (L2 < 1e-4)
+### Phase 0: Infrastructure (P0) — ✅ 完成
+- [x] `core/types.cpp` - 错误码字符串化
+- [x] `core/device.cpp` - CUDA 设备管理
+- [x] `io/safetensors.cpp` - safetensors 零拷贝加载(健壮 tokenizer,213/741/560 张量)
+- [x] `io/audio_io.cpp` - WAV 读写 + 重采样
+- [x] 编译验证:`cmake --build build`
 
-### Phase 2: F0 Extraction (P2)
-- [ ] `f0/rmvpe.cu` - RMVPE Conformer CUDA 实现
-- [ ] `f0/fcpe.cu` - FCPE 轻量 CUDA 实现
-- [ ] `test_f0.cpp` - F0 对齐测试 (< 0.5 Hz)
+### Phase 1: Content Encoder (P1) — ✅ HuBERT 完成 / ⚠️ WavLM 桩
+- [x] `content/hubert_encoder.cpp` - HuBERT (ContentVec) CNN 特征提取器 + 12 层 Transformer
+- [ ] `content/wavlm_encoder` - ⚠️ 文件存在但未接入/未验证(规划中)
+- [x] `test_hubert_inference.cpp` - 数值对齐(RMS 7.1e-07 < 1e-4)
 
-### Phase 3: Feature Index (P3)
-- [ ] `index/cuda_flat_index.cu` - 手写 CUDA Flat Index
-- [ ] Index 检索测试 (Top-K 一致性 100%)
+### Phase 2: F0 Extraction (P2) — ✅ RMVPE 完成 / ⚠️ FCPE 未实现
+- [x] `f0/rmvpe.cpp` + `rmvpe_ops.cu` - DeepUnet + BiGRU CUDA 实现
+- [ ] `f0/fcpe` - ⚠️ 未实现(规划中)
+- [x] `test_rmvpe_alignment.cpp` - F0 对齐(1.5e-05 Hz < 0.5 Hz)
 
-### Phase 4: Synthesizer (P4)
-- [ ] `synthesizer/text_encoder.cu` - Transformer encoder
-- [ ] `synthesizer/flow.cu` - Residual Coupling Flow
-- [ ] `synthesizer/generator_nsf.cu` - HiFiGAN + NSF
-- [ ] `test_synthesizer.cpp` - 音频对齐测试 (SRCC > 0.999)
+### Phase 3: Feature Index (P3) — ✅ 完成
+- [x] `index/cuda_flat_index.cpp` - 加权 k-NN 检索 + build_index 工具
+- [x] `test_index_retrieval.cpp` - 检索一致性(cosine 1.0)
 
-### Phase 5: Pipeline (P5)
-- [ ] `pipeline/pipeline.cpp` - 端到端编排
-- [ ] `test_pipeline.cpp` - 集成测试
-- [ ] `tools/vc_convert.cpp` - CLI 工具完善
+### Phase 4: Synthesizer (P4) — ✅ 完成
+- [x] TextEncoder(相对位置注意力) + Flow(WaveNet 耦合) + GeneratorNSF
+- [x] `test_vits_alignment.cpp` - 音频对齐(相关性 0.9997 > 0.999)
 
-### Phase 6: Polish (P6)
-- [ ] `training/` - 微调训练基础设施
-- [ ] `webui/` - WebUI 服务
-- [ ] `tools/vc_batch.cpp` - 批量转换
+### Phase 5: Pipeline (P5) — ✅ 完成
+- [x] `pipeline/pipeline.cpp` - 端到端编排(含 index_rate 混合)
+- [x] `test_e2e_conversion.cpp` - 集成测试(相关性 0.9997)
+- [x] `tools/vc_convert.cpp` - CLI 工具可用
+
+### Phase 6: 训练 + WebUI — ➡️ 拆分为独立 spec
+- ➡️ `training/` 微调训练 → **spec 002-training**(当前仅 TODO 桩)
+- ➡️ `webui/` WebUI 服务 → **spec 003-webui**(前端存在但无 server 可执行文件)
+- [ ] `tools/vc_batch.cpp` - ⚠️ 骨架,待随对齐更新验证
 
 ## Complexity Tracking
 

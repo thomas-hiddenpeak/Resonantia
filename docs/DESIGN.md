@@ -1,5 +1,11 @@
 # Resonantia 架构设计
 
+> **实现状态(2026-08-07)**:本文件描述**目标架构**,部分模块为规划中。事实基线以 [specs/PROJECT_STATE.md](../specs/PROJECT_STATE.md) 为准。
+>
+> - ✅ **已实现并数值对齐**:core、io、content(HuBERT)、f0(RMVPE)、index、synthesizer(VITS)、pipeline、CLI(vc_convert/build_index)
+> - ⚠️ **桩/未接入**:content(WavLM)、f0(FCPE)、tools(vc_batch/vc_probe)
+> - ➡️ **规划中(拆为独立 spec)**:训练/微调(spec 002)、WebUI 服务(spec 003)、声源分离 separation/
+
 ## 1. 目标
 
 将 [RVC (Retrieval-based Voice Conversion)](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) 的推理和训练管线从 Python/PyTorch 完全迁移到纯 C++20/CUDA，消除对 Python 运行时的依赖，同时保持数值输出与原始实现的一致性。
