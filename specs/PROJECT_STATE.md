@@ -21,10 +21,10 @@
 | CUDA Flat Index (加权 k-NN 检索) | ✅ 可用 | `test_index_retrieval` cosine 1.0 |
 | VITS 合成 (TextEncoder+Flow+NSF-HiFiGAN) | ✅ 对齐 | `test_vits_alignment` 音频 corr 0.9997 |
 | 端到端推理 Pipeline | ✅ 可用 | `test_e2e_conversion` corr 0.9997 |
-| CLI: vc_convert / vc_train / vc_preprocess / build_index | ✅ 可用 | 转换/微调/切片/建索,真实音频端到端验证 |
+| CLI: vc_convert / vc_train / vc_preprocess / build_index / vc_serve | ✅ 可用 | 转换/微调(含 --gan)/切片/建索/HTTP 服务,真实音频端到端验证 |
 | 端到端使用工作流 (scripts/) | ✅ 可用 | `train_voice.sh` + `convert_voice.sh`:切片→微调→建索→转换全链路跑通 |
-| **训练 / 微调(解码器)** | ✅ 可用 | 纯 autograd 解码器 fine-tune;真实音频 mel loss -70%;导出往返 corr 1.0 |
-| **WebUI (可运行)** | ❌ **未接线** | 前端存在,但无 server 可执行文件 |
+| **训练 / 微调(解码器 + 完整 GAN)** | ✅ 可用 | 解码器 fine-tune(mel -70%,导出往返 corr 1.0)+ 完整 VITS GAN(enc_q/flow/KL/MPD-V2/adv/fm),真实音频损失有限收敛 |
+| **WebUI (可运行)** | ✅ 可用 | `vc_serve`(纯 C++ HTTP,静态 + `/api/convert`),curl 验证前端可用 |
 | WavLM 内容编码 | ⚠️ 桩 | 文件存在,未接入/未验证 |
 | FCPE 实时 F0 | ⚠️ 桩 | 未实现 |
 | 声源分离 (separation/) | ❌ 未实现 | 仅设计文档提及 |
@@ -37,8 +37,8 @@
 | Spec | 主题 | 状态 |
 |------|------|------|
 | 001-voice-conversion-engine | 推理引擎(内容/F0/检索/合成/pipeline) | Complete(推理部分) |
-| 002-voice-training | 训练/微调:纯 C++/CUDA autograd(方案 A) · 40k · fine-tune | In Progress — 解码器路径完成(A0-A2 autograd/AdamW/可微 mel;A3 解码器对齐 0.9997;A6 fine-tune -70%;A7 导出;A8 e2e 往返 corr 1.0);剩余:完整 GAN(enc_q/MPD/MSD)作为 follow-up |
-| 003-webui(计划) | 面向普通用户的 WebUI:简单/高级双模式 | 未创建 |
+| 002-voice-training | 训练/微调:纯 C++/CUDA autograd(方案 A) · 40k | Complete(解码器 + 完整 GAN)— A0-A2 autograd/AdamW/可微 mel;解码器对齐 0.9997、fine-tune -70%、导出往返 corr 1.0;完整 VITS GAN:exp/conv2d/flip_rows 梯度检查、enc_q 重建 corr 0.956、flow 逆 9e-7、MPD-V2 判别器、KL/fm/adv,`vc_train --gan` 端到端 |
+| 003-webui | 面向普通用户的 WebUI:`vc_serve` 后端 + 前端 | Complete(基础)— 纯 C++ HTTP 服务静态前端 + /api/convert,curl 验证 |
 
 > 注:`001` 的 spec.md 已标 Complete 并附验证清单;其 `plan.md` 覆盖范围原本包含训练/WebUI(P6),但这两项实际未完成,已在下方"已知偏差"记录,并将拆分为独立 spec 002/003。
 

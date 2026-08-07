@@ -87,7 +87,7 @@ Resonantia/
     └── cutlass/              # CUTLASS (submodule)
 ```
 
-> **实现状态**：`content/hubert`、`f0/rmvpe`、`index`、`synthesizer`、`pipeline`、`training`（解码器微调）、`io` 已实现并数值验证；`separation/`、`content/wavlm`、`f0/fcpe`、`webui`（后端服务）、`third_party/cutlass` 为规划中，当前未接入运行时。
+> **实现状态**：`content/hubert`、`f0/rmvpe`、`index`、`synthesizer`、`pipeline`、`training`（解码器微调 + 完整 VITS GAN）、`webui`（`vc_serve` 后端）、`io` 已实现并数值验证；`separation/`、`content/wavlm`、`f0/fcpe`、`third_party/cutlass` 为规划中，当前未接入运行时。
 
 ## 推理管线
 
@@ -207,9 +207,25 @@ build/vc_convert --hubert models/hubert_base/model.safetensors \
   --input song.wav --output song_alice.wav --version v2 --speakers 109 --sr 40000
 ```
 
-> 训练当前为**解码器微调**（NSF-HiFiGAN 声码器适配目标音色），从预训练权重出发、
-> 纯 C++/CUDA 自研 autograd 完成；导出模型与推理运行时逐比特兼容（往返 corr 1.0）。
-> 完整 GAN（后验编码器 + 判别器）为后续增强。
+> 训练支持两种模式，均纯 C++/CUDA 自研 autograd、导出模型与推理运行时逐比特兼容（往返 corr 1.0）：
+> - **解码器微调**（默认）：mel-L1 微调 NSF-HiFiGAN 声码器适配目标音色，快速。
+> - **完整 VITS GAN**（`vc_train --gan`）：后验编码器 enc_q + flow + 解码器 对抗
+>   MPD-V2 判别器，损失 = 45·mel + KL + 2·特征匹配 + 对抗（LSGAN），音质更高。
+>   判别器权重默认取 G 同目录的 `f0D40k.safetensors`。
+
+## WebUI
+
+面向普通用户的浏览器界面（上传音频 → 调参 → 转换 → 试听/下载）。后端 `vc_serve`
+是纯 C++ HTTP 服务（POSIX socket 手写，零第三方、零 Python 运行时），服务 `webui/`
+静态资源并处理 `POST /api/convert`。
+
+```bash
+build/vc_serve --hubert models/hubert_base/model.safetensors \
+  --model runs/alice/model.safetensors --rmvpe models/rmvpe.safetensors \
+  --index runs/alice/model.index --webroot webui --port 8080 \
+  --version v2 --speakers 109 --sr 40000
+# 浏览器打开 http://localhost:8080
+```
 
 ## 参考项目
 
