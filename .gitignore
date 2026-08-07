@@ -66,3 +66,6 @@ test_audio/
 tmp/
 temp/
 runs/
+
+# Vendored MSST reference code (offline reference generation only)
+tools/roformer_ref/
