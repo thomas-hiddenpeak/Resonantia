@@ -16,6 +16,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "voxmutatio/core/cuda_buffer.h"
@@ -97,6 +98,97 @@ __global__ void k_bias_scatter_band(const float* lin, const float* bias, float* 
   if (idx >= T * Dim) return;
   int t = idx / Dim, d = idx % Dim;
   out[(static_cast<size_t>(t) * NB + b) * Dim + d] = lin[idx] + bias[d];
+}
+
+// x[n,d] += b[d]
+__global__ void k_add_rowbias(float* x, const float* b, int N, int D) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N * D) x[i] += b[i % D];
+}
+// a[i] += b[i]
+__global__ void k_add(float* a, const float* b, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] += b[i];
+}
+__global__ void k_gelu(float* x, int n) {  // exact GELU (torch default erf form)
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) { float v = x[i]; x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678f)); }
+}
+
+// qkv[B*S, 3*H*DH] -> q,k,v [B,H,S,DH]  (rearrange 'bs (qkv h d) -> qkv b h s d')
+__global__ void k_split_heads(const float* qkv, float* q, float* k, float* v,
+                              int B, int S, int H, int DH) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int inner = H * DH, tot = B * S * inner;
+  if (idx >= tot) return;
+  int d = idx % DH, h = (idx / DH) % H, s = (idx / inner) % S, b = idx / (S * inner);
+  size_t src = (static_cast<size_t>(b) * S + s) * (3 * inner) + h * DH + d;
+  size_t dst = ((static_cast<size_t>(b) * H + h) * S + s) * DH + d;
+  q[dst] = qkv[src];
+  k[dst] = qkv[src + inner];
+  v[dst] = qkv[src + 2 * inner];
+}
+// RoPE (lucidrains interleaved pairs) on x[B,H,S,DH] in place; freqs[DH/2].
+__global__ void k_rope(float* x, const float* freqs, int B, int H, int S, int DH) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int half = DH / 2, tot = B * H * S * half;
+  if (idx >= tot) return;
+  int p = idx % half, s = (idx / half) % S;
+  size_t base = (static_cast<size_t>(idx / half)) * DH + 2 * p;
+  float ang = s * freqs[p], c = cosf(ang), sn = sinf(ang);
+  float x0 = x[base], x1 = x[base + 1];
+  x[base] = x0 * c - x1 * sn;
+  x[base + 1] = x1 * c + x0 * sn;
+}
+// Attention (online softmax) q,k,v [B,H,S,DH] -> out [B,H,S,DH]; scale = 1/sqrt(DH).
+__global__ void k_attention(const float* q, const float* k, const float* v, float* out,
+                            int B, int H, int S, int DH, float scale) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;  // (b,h,i)
+  if (idx >= B * H * S) return;
+  const float* qi = q + static_cast<size_t>(idx) * DH;
+  size_t bh = idx / S;  // (b*H+h)
+  const float* kb = k + bh * S * DH;
+  const float* vb = v + bh * S * DH;
+  float acc[64];
+  for (int d = 0; d < DH; ++d) acc[d] = 0.0f;
+  float m = -1e30f, l = 0.0f;
+  for (int j = 0; j < S; ++j) {
+    const float* kj = kb + static_cast<size_t>(j) * DH;
+    float s = 0.0f;
+    for (int d = 0; d < DH; ++d) s += qi[d] * kj[d];
+    s *= scale;
+    float mn = fmaxf(m, s), corr = __expf(m - mn), p = __expf(s - mn);
+    l = l * corr + p;
+    const float* vj = vb + static_cast<size_t>(j) * DH;
+    for (int d = 0; d < DH; ++d) acc[d] = acc[d] * corr + p * vj[d];
+    m = mn;
+  }
+  float* o = out + static_cast<size_t>(idx) * DH;
+  float inv = 1.0f / l;
+  for (int d = 0; d < DH; ++d) o[d] = acc[d] * inv;
+}
+// merge heads [B,H,S,DH] -> [B*S, H*DH]
+__global__ void k_merge_heads(const float* in, float* out, int B, int S, int H, int DH) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int inner = H * DH;
+  if (idx >= B * S * inner) return;
+  int d = idx % DH, h = (idx / DH) % H, s = (idx / inner) % S, b = idx / (S * inner);
+  out[(static_cast<size_t>(b) * S + s) * inner + h * DH + d] =
+      in[((static_cast<size_t>(b) * H + h) * S + s) * DH + d];
+}
+// mo[bs, h*DH+d] *= sigmoid(gates[bs, h])
+__global__ void k_apply_gates(float* mo, const float* gates, int BS, int H, int DH) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= BS * H * DH) return;
+  int h = (idx / DH) % H, bs = idx / (H * DH);
+  mo[idx] *= 1.0f / (1.0f + __expf(-gates[bs * H + h]));
+}
+// transpose [A,B,D] <-> [B,A,D] (swap first two dims, keep feature D)
+__global__ void k_transpose12(const float* in, float* out, int A, int Bn, int D) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= A * Bn * D) return;
+  int d = idx % D, b = (idx / D) % Bn, a = idx / (Bn * D);
+  out[(static_cast<size_t>(b) * A + a) * D + d] = in[idx];
 }
 
 std::vector<int64_t> read_i64(const std::string& path, int expect) {
@@ -266,6 +358,63 @@ struct Roformer::Impl {
     }
     CK(cudaDeviceSynchronize());
   }
+
+  // One transformer (depth 1): attn residual + ffn residual + output RMSNorm.
+  // x is [B*S, kDim] on device (B sequences of length S); modified in place.
+  void transformer(CudaBuffer& x, int B, int S, const Block& bl) const {
+    const int BS = B * S, D = kDim, H = kHeads, DH = kDhead, IN = kInner;
+    CudaBuffer xn; xn.allocate(static_cast<size_t>(BS) * D);
+    k_rmsnorm<<<grid(BS), 256>>>(x.data(), bl.attn.norm_gamma.data(), xn.data(), BS, D);
+    CudaBuffer qkv; qkv.allocate(static_cast<size_t>(BS) * 3 * IN);
+    gemm_rm(false, true, BS, 3 * IN, D, 1.0f, xn.data(), bl.attn.qkv_w.data(), 0.0f, qkv.data());
+    CudaBuffer q, k, v;
+    q.allocate(static_cast<size_t>(BS) * IN); k.allocate(q.size()); v.allocate(q.size());
+    k_split_heads<<<grid(BS * IN), 256>>>(qkv.data(), q.data(), k.data(), v.data(), B, S, H, DH);
+    int rope_n = B * H * S * (DH / 2);
+    k_rope<<<grid(rope_n), 256>>>(q.data(), bl.attn.rope_freqs.data(), B, H, S, DH);
+    k_rope<<<grid(rope_n), 256>>>(k.data(), bl.attn.rope_freqs.data(), B, H, S, DH);
+    CudaBuffer ao; ao.allocate(q.size());
+    k_attention<<<grid(B * H * S), 256>>>(q.data(), k.data(), v.data(), ao.data(),
+        B, H, S, DH, 1.0f / sqrtf((float)DH));
+    CudaBuffer mo; mo.allocate(q.size());
+    k_merge_heads<<<grid(BS * IN), 256>>>(ao.data(), mo.data(), B, S, H, DH);
+    CudaBuffer gates; gates.allocate(static_cast<size_t>(BS) * H);
+    gemm_rm(false, true, BS, H, D, 1.0f, xn.data(), bl.attn.gates_w.data(), 0.0f, gates.data());
+    k_add_rowbias<<<grid(BS * H), 256>>>(gates.data(), bl.attn.gates_b.data(), BS, H);
+    k_apply_gates<<<grid(BS * IN), 256>>>(mo.data(), gates.data(), BS, H, DH);
+    CudaBuffer att; att.allocate(static_cast<size_t>(BS) * D);
+    gemm_rm(false, true, BS, D, IN, 1.0f, mo.data(), bl.attn.out_w.data(), 0.0f, att.data());
+    k_add<<<grid(BS * D), 256>>>(x.data(), att.data(), BS * D);
+
+    CudaBuffer fn; fn.allocate(static_cast<size_t>(BS) * D);
+    k_rmsnorm<<<grid(BS), 256>>>(x.data(), bl.ffn.n0_gamma.data(), fn.data(), BS, D);
+    CudaBuffer h1; h1.allocate(static_cast<size_t>(BS) * 1024);
+    gemm_rm(false, true, BS, 1024, D, 1.0f, fn.data(), bl.ffn.w1.data(), 0.0f, h1.data());
+    k_add_rowbias<<<grid(BS * 1024), 256>>>(h1.data(), bl.ffn.b1.data(), BS, 1024);
+    k_gelu<<<grid(BS * 1024), 256>>>(h1.data(), BS * 1024);
+    CudaBuffer h2; h2.allocate(static_cast<size_t>(BS) * D);
+    gemm_rm(false, true, BS, D, 1024, 1.0f, h1.data(), bl.ffn.w4.data(), 0.0f, h2.data());
+    k_add_rowbias<<<grid(BS * D), 256>>>(h2.data(), bl.ffn.b4.data(), BS, D);
+    k_add<<<grid(BS * D), 256>>>(x.data(), h2.data(), BS * D);
+
+    CudaBuffer xo; xo.allocate(static_cast<size_t>(BS) * D);
+    k_rmsnorm<<<grid(BS), 256>>>(x.data(), bl.out_gamma.data(), xo.data(), BS, D);
+    x = std::move(xo);
+  }
+
+  // 6 blocks: each = time transformer (over T per band) + freq transformer (over bands per t).
+  // x is [T, kNbands, kDim] in place.
+  void blocks_forward(CudaBuffer& x, int T) const {
+    const size_t n = static_cast<size_t>(T) * kNbands * kDim;
+    for (int i = 0; i < kDepth; ++i) {
+      CudaBuffer xt; xt.allocate(n);
+      k_transpose12<<<grid(n), 256>>>(x.data(), xt.data(), T, kNbands, kDim);  // [T,60,D]->[60,T,D]
+      transformer(xt, kNbands, T, blocks[i][0]);                              // time
+      k_transpose12<<<grid(n), 256>>>(xt.data(), x.data(), kNbands, T, kDim);  // [60,T,D]->[T,60,D]
+      transformer(x, T, kNbands, blocks[i][1]);                               // freq
+    }
+    CK(cudaDeviceSynchronize());
+  }
 };
 
 Roformer::Roformer(const std::string& dir, const std::string& model)
@@ -298,7 +447,22 @@ std::vector<int> Roformer::debug_offsets() const {
   return v;
 }
 
-std::vector<float> Roformer::debug_blocks(const std::vector<float>&, int, int& T) const { T = 0; return {}; }
+std::vector<float> Roformer::debug_blocks(const std::vector<float>& stereo, int L, int& T) const {
+  CudaBuffer x;
+  p_->band_split(stereo, L, x, T);
+  p_->blocks_forward(x, T);
+  std::vector<float> h(static_cast<size_t>(T) * kNbands * kDim);
+  x.copy_to_host(h.data(), h.size());
+  return h;
+}
+std::vector<float> Roformer::debug_blocks_from(const std::vector<float>& bandsplit, int T) const {
+  CudaBuffer x;
+  x.copy_from_host(bandsplit.data(), bandsplit.size());
+  p_->blocks_forward(x, T);
+  std::vector<float> h(static_cast<size_t>(T) * kNbands * kDim);
+  x.copy_to_host(h.data(), h.size());
+  return h;
+}
 std::vector<float> Roformer::debug_mask(const std::vector<float>&, int, int& T) const { T = 0; return {}; }
 std::vector<float> Roformer::separate_stereo(const std::vector<float>&, int) const { return {}; }
 std::vector<float> Roformer::separate_mono(const float*, int, int) const { return {}; }

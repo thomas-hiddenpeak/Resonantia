@@ -38,6 +38,7 @@ class Roformer {
   std::vector<float> debug_bandsplit_in(const std::vector<float>& stereo, int L, int& T) const; // [T,7916]
   std::vector<float> debug_bandsplit(const std::vector<float>& stereo, int L, int& T) const; // [T,60,256]
   std::vector<float> debug_blocks(const std::vector<float>& stereo, int L, int& T) const;    // [T,60,256]
+  std::vector<float> debug_blocks_from(const std::vector<float>& bandsplit, int T) const;    // [T,60,256]->[T,60,256]
   std::vector<float> debug_mask(const std::vector<float>& stereo, int L, int& T) const;      // [T,7916]
 
  private:

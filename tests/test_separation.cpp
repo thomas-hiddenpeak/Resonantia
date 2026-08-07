@@ -195,4 +195,17 @@ TEST_CASE("MelBand-RoFormer band-split aligns with reference", "[separation][rof
   double rel_energy = std::sqrt(num / (den + 1e-12));
   std::printf("[roformer] band-split (bands 0-45) rel error = %.3e (T=%d)\n", rel_energy, T);
   CHECK(rel_energy < 1e-3);
+
+  // Transformer stack (6 blocks): feed the REFERENCE band-split so the test
+  // isolates the transformer from high-band band-split conditioning.
+  if (file_exists(fix + "rof_block_final.bin")) {
+    int Tb = T;
+    auto blk = rof.debug_blocks_from(ref, Tb);  // ref = reference band-split [T,60,256]
+    auto bref = read_bin(fix + "rof_block_final.bin");
+    REQUIRE(blk.size() == bref.size());
+    for (float v : blk) REQUIRE(std::isfinite(v));
+    double brel = rel_err(blk, bref);
+    std::printf("[roformer] transformer (from ref band-split) rel error = %.3e\n", brel);
+    CHECK(brel < 1e-3);
+  }
 }
