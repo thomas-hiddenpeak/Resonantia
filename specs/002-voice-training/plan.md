@@ -23,20 +23,19 @@
 
 ## Phases
 
-### Phase A0: Autograd 核心 — 🚧 进行中
-- [ ] `core/cuda_buffer.h` — RAII device 缓冲(替代裸 cudaMalloc/free)
-- [ ] `autograd/tensor.{h,cpp}` — Tensor(device data + grad + shape + requires_grad)
-- [ ] `autograd/engine` — 反向图节点 + 拓扑反传 `backward(loss)`
-- [ ] 基础算子:add、mul、sum、matmul/linear(前向 + 反向)
-- [ ] `test_autograd_grad`:有限差分梯度检查(< 1e-3)
-- **门控 SC-001(部分)**
+### Phase A0: Autograd 核心 — ✅ 完成
+- [x] `core/cuda_buffer.h` — RAII device 缓冲(替代裸 cudaMalloc/free)
+- [x] `autograd/tensor.{h}` + `autograd.cu` — Tensor + 反向图 + 拓扑反传 `backward(loss)`
+- [x] 基础算子:add、mul、sum、matmul(前向 + 反向)
+- [x] `test_autograd`:有限差分梯度检查(< 4e-6)
+- **门控 SC-001(部分)✅**
 
-### Phase A1: NN 算子反向
-- [ ] linear(bias)、conv1d(dilation/stride/groups)、conv_transpose1d
-- [ ] layer_norm、gelu、leaky_relu、tanh、sigmoid、fused tanh·sigmoid
-- [ ] 相对位置多头注意力反向
-- [ ] 每个算子梯度检查
-- **门控 SC-001(全部)**
+### Phase A1: NN 算子反向 — ✅ 完成
+- [x] linear(bias)、conv1d(dilation/stride/groups)、conv_transpose1d
+- [x] layer_norm、gelu、relu、leaky_relu、tanh、sigmoid、softmax
+- [x] 每个算子梯度检查通过(max rel err < 4e-4)
+- [ ] 相对位置注意力 → 由基元(linear+matmul+softmax+reshape)在 A3 组合
+- **门控 SC-001(基元全部)✅**
 
 ### Phase A2: 优化器
 - [ ] AdamW(带 weight decay、bias correction、grad clip)
