@@ -16,6 +16,7 @@
 #include "voxmutatio/synthesizer/synthesizer.h"
 #include "voxmutatio/training/discriminator.h"
 #include "voxmutatio/training/gan_trainer.h"
+#include "voxmutatio/training/posterior_encoder.h"
 
 using voxmutatio::autograd::Tensor;
 namespace ag = voxmutatio::autograd;
@@ -129,4 +130,66 @@ TEST_CASE("GAN fine-tune step runs on real audio", "[gan][finetune]") {
   std::printf("[gan] mel %.4f -> %.4f\n", first_mel, last_mel);
   // Adversarial + fm + mel training must stay finite and reduce reconstruction.
   CHECK(last_mel < first_mel);
+}
+
+TEST_CASE("PosteriorEncoder reconstructs real audio (enc_q + dec)", "[gan][encq]") {
+  using namespace voxmutatio;
+
+  auto nsff0 = load_bin("../tests/fixtures/vits_ref_nsff0.bin");
+  REQUIRE(nsff0.ok);
+  int Tfull = nsff0.shape[0];
+
+  std::string g_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+
+  synthesizer::SynthesizerConfig scfg;
+  scfg.model_path = g_path; scfg.version = ModelVersion::kV2;
+  scfg.sample_rate = 40000; scfg.spk_embed_dim = 109;
+  synthesizer::Synthesizer synth; REQUIRE(synth.init(scfg));
+  auto har_full = synth.debug_har(nsff0.data.data(), Tfull);
+
+  // Real audio @ native 40k, aligned to a whole number of frames.
+  auto a40 = io::read_audio("../tests/fixtures/speech_librispeech.wav", 40000);
+  REQUIRE(a40.has_value());
+  const int Tseg = 128, Lseg = Tseg * 400;
+  REQUIRE(static_cast<int>(a40->data.size()) >= Lseg);
+  std::vector<float> y(a40->data.begin(), a40->data.begin() + Lseg);
+  std::vector<float> har_seg(har_full.begin(), har_full.begin() + Lseg);
+
+  // Linear spectrogram (VITS: n_fft=2048, hop=400).
+  int Tspec = 0;
+  auto spec_host = training::compute_spec(y.data(), Lseg, 2048, 400, Tspec);
+  REQUIRE(Tspec == Tseg);
+  auto spec = Tensor::from_host(spec_host, {1025, Tseg}, false);
+
+  // enc_q (mean) -> z -> decoder should reconstruct the target audio.
+  training::PosteriorEncoder enc_q; REQUIRE(enc_q.init(g_path, 0));
+  training::GeneratorTrainer dec; REQUIRE(dec.init(g_path, 0));
+
+  Tensor m_q, logs_q;
+  auto z = enc_q.forward(spec, Tseg, /*sample=*/false, m_q, logs_q);
+  REQUIRE(z.shape()[0] == 192);
+  REQUIRE(z.shape()[1] == Tseg);
+
+  auto har_t = Tensor::from_host(har_seg, {1, Lseg}, false);
+  auto y_hat = dec.decode(z, har_t, Tseg).to_host();
+  REQUIRE(static_cast<int>(y_hat.size()) == Lseg);
+  for (float v : y_hat) REQUIRE(std::isfinite(v));
+
+  // Vocoder reconstruction is phase-agnostic, so compare in the mel domain.
+  training::MelSpecConfig mc;
+  mc.n_fft = 1024; mc.hop = 256; mc.n_mels = 80; mc.sample_rate = 40000;
+  training::MelLoss mel(mc);
+  int Ta = 0, Tb = 0;
+  auto ma_host = mel.target_log_mel(y_hat.data(), Lseg, Ta);
+  auto mb_host = mel.target_log_mel(y.data(), Lseg, Tb);
+  int nn = std::min(ma_host.size(), mb_host.size());
+  double ma = 0, mb = 0;
+  for (int i = 0; i < nn; ++i) { ma += ma_host[i]; mb += mb_host[i]; }
+  ma /= nn; mb /= nn;
+  double c = 0, va = 0, vb = 0;
+  for (int i = 0; i < nn; ++i) { double da = ma_host[i]-ma, db = mb_host[i]-mb; c += da*db; va += da*da; vb += db*db; }
+  double corr = c / (std::sqrt(va*vb) + 1e-12);
+  std::printf("[encq] mel-domain reconstruction corr = %.4f\n", corr);
+  // Pretrained enc_q+dec is an autoencoder: mel content must track the target.
+  CHECK(corr > 0.5);
 }
