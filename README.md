@@ -19,7 +19,7 @@ Resonantia 是 [RVC (Retrieval-based Voice Conversion)](https://github.com/RVC-P
 | VITS 合成器 | 波形相关性 | 0.9997 |
 | **端到端转换** | **波形相关性** | **0.9997** |
 
-全部 9 个测试通过。`vc_convert` CLI 可转换任意真实音频文件。
+全部 13 个测试通过。`vc_convert` 可转换任意真实音频，`vc_train` 可从真实录音微调目标声线（见下方「实际使用工作流」）。
 
 ## 设计目标
 
@@ -87,6 +87,8 @@ Resonantia/
     └── cutlass/              # CUTLASS (submodule)
 ```
 
+> **实现状态**：`content/hubert`、`f0/rmvpe`、`index`、`synthesizer`、`pipeline`、`training`（解码器微调）、`io` 已实现并数值验证；`separation/`、`content/wavlm`、`f0/fcpe`、`webui`（后端服务）、`third_party/cutlass` 为规划中，当前未接入运行时。
+
 ## 推理管线
 
 ```
@@ -152,6 +154,62 @@ Resonantia/
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
+
+## 实际使用工作流
+
+从真实录音训练目标声线，再用它转换任意语音/歌声。**运行时零 Python**——全部由
+C++/CUDA CLI 完成（`tools/` 下的 Python 仅用于一次性下载与离线对拍）。
+
+### 1. 准备模型
+
+```bash
+cd tools && uv run download_models.py && cd ..
+```
+
+需要 `models/` 下：`hubert_base/model.safetensors`（内容编码器）、`rmvpe.safetensors`
+（F0 提取）、`pretrained_v2/pretrained_v2/f0G40k.safetensors`（40k 预训练 G）。
+
+### 2. 训练目标声线
+
+```bash
+# 原始录音（一个 WAV 或一个目录）-> 切片 -> 微调 -> 检索索引
+scripts/train_voice.sh --raw my_voice/ --work runs/alice --steps 300
+```
+
+产出 `runs/alice/model.safetensors`（微调模型）与 `runs/alice/model.index`（检索索引）。
+流程：`vc_preprocess`（去静音 + 定长切片）→ `vc_train`（autograd 解码器 mel-L1 微调）
+→ `build_index`。
+
+### 3. 转换
+
+```bash
+scripts/convert_voice.sh \
+  --model runs/alice/model.safetensors \
+  --index runs/alice/model.index \
+  --input song.wav --output song_alice.wav \
+  --index-rate 0.5 --pitch 0
+```
+
+### 直接调用 CLI（脚本等价展开）
+
+```bash
+build/vc_preprocess --input my_voice/ --output-dir runs/alice/clips \
+  --sr 40000 --seg-sec 3.0 --trim
+build/vc_train --hubert models/hubert_base/model.safetensors \
+  --rmvpe models/rmvpe.safetensors \
+  --pretrained models/pretrained_v2/pretrained_v2/f0G40k.safetensors \
+  --target runs/alice/clips --out runs/alice/model.safetensors --steps 300
+build/build_index --hubert models/hubert_base/model.safetensors \
+  --input-dir runs/alice/clips --output runs/alice/model.index
+build/vc_convert --hubert models/hubert_base/model.safetensors \
+  --rmvpe models/rmvpe.safetensors --model runs/alice/model.safetensors \
+  --index runs/alice/model.index --index-rate 0.5 \
+  --input song.wav --output song_alice.wav --version v2 --speakers 109 --sr 40000
+```
+
+> 训练当前为**解码器微调**（NSF-HiFiGAN 声码器适配目标音色），从预训练权重出发、
+> 纯 C++/CUDA 自研 autograd 完成；导出模型与推理运行时逐比特兼容（往返 corr 1.0）。
+> 完整 GAN（后验编码器 + 判别器）为后续增强。
 
 ## 参考项目
 

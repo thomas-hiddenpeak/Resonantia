@@ -21,7 +21,8 @@
 | CUDA Flat Index (加权 k-NN 检索) | ✅ 可用 | `test_index_retrieval` cosine 1.0 |
 | VITS 合成 (TextEncoder+Flow+NSF-HiFiGAN) | ✅ 对齐 | `test_vits_alignment` 音频 corr 0.9997 |
 | 端到端推理 Pipeline | ✅ 可用 | `test_e2e_conversion` corr 0.9997 |
-| CLI: vc_convert / build_index / vc_train | ✅ 可用 | 转换/建索/解码器微调,均真实音频验证 |
+| CLI: vc_convert / vc_train / vc_preprocess / build_index | ✅ 可用 | 转换/微调/切片/建索,真实音频端到端验证 |
+| 端到端使用工作流 (scripts/) | ✅ 可用 | `train_voice.sh` + `convert_voice.sh`:切片→微调→建索→转换全链路跑通 |
 | **训练 / 微调(解码器)** | ✅ 可用 | 纯 autograd 解码器 fine-tune;真实音频 mel loss -70%;导出往返 corr 1.0 |
 | **WebUI (可运行)** | ❌ **未接线** | 前端存在,但无 server 可执行文件 |
 | WavLM 内容编码 | ⚠️ 桩 | 文件存在,未接入/未验证 |

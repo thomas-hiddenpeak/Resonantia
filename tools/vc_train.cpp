@@ -186,8 +186,10 @@ int main(int argc, char** argv) {
             std::cerr << "skip (latent size): " << f << "\n"; continue;
         }
 
-        // Real 40k target aligned to the reconstruction length.
-        auto t40 = io::resample_linear(a16.data(), n16, 16000, 40000);
+        // Real 40k target read natively (avoid the 16k bottleneck losing highs).
+        std::vector<float> t40;
+        if (auto a40 = io::read_audio(f, 40000)) t40 = std::move(a40->data);
+        else t40 = io::resample_linear(a16.data(), n16, 16000, 40000);
         c.tgt.assign(static_cast<size_t>(p_len) * kUpp, 0.0f);
         int copyn = std::min<int>(t40.size(), p_len * kUpp);
         std::copy(t40.begin(), t40.begin() + copyn, c.tgt.begin());

@@ -98,6 +98,15 @@ set_target_properties(vc_train PROPERTIES
     LINK_FLAGS "-Wl,--disable-new-dtags"
 )
 
+add_executable(vc_preprocess tools/vc_preprocess.cpp)
+target_include_directories(vc_preprocess PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(vc_preprocess PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
+set_target_properties(vc_preprocess PROPERTIES
+    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
+    LINK_FLAGS "-Wl,--disable-new-dtags"
+)
+
 add_executable(vc_batch tools/vc_batch.cpp)
 target_include_directories(vc_batch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(vc_batch PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
