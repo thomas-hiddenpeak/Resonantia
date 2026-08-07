@@ -67,6 +67,35 @@ Tensor matmul(const Tensor& a, const Tensor& b);
 /// Sum all elements -> scalar [1].
 Tensor sum(const Tensor& a);
 
+// ---- Bias / Linear (Phase A1) ----
+/// Broadcast add: x[R,C] + b[C] -> [R,C].
+Tensor add_bias(const Tensor& x, const Tensor& b);
+/// Linear: x[M,K] @ w[N,K]^T (+ b[N]) -> [M,N]. Pass Tensor{} for no bias.
+Tensor linear(const Tensor& x, const Tensor& w, const Tensor& b);
+
+// ---- Activations (elementwise) ----
+Tensor relu(const Tensor& x);
+Tensor leaky_relu(const Tensor& x, float slope);
+Tensor gelu(const Tensor& x);        // exact erf
+Tensor tanh_op(const Tensor& x);
+Tensor sigmoid(const Tensor& x);
+
+// ---- Softmax over last dim (x is [rows, cols]) ----
+Tensor softmax_rows(const Tensor& x, int rows, int cols);
+
+// ---- LayerNorm over last dim with affine (x is [rows, dim]) ----
+Tensor layer_norm(const Tensor& x, const Tensor& w, const Tensor& b,
+                  int rows, int dim, float eps = 1e-5f);
+
+// ---- Convolutions (channels-first) ----
+/// conv1d: x[Cin,L], w[Cout, Cin/groups, K], b[Cout] (or Tensor{}) -> [Cout,Lout].
+Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
+              int Cin, int L, int Cout, int K, int stride, int pad,
+              int dilation, int groups);
+/// conv_transpose1d: x[Cin,L], w[Cin,Cout,K], b[Cout] (or Tensor{}) -> [Cout,Lout].
+Tensor conv_transpose1d(const Tensor& x, const Tensor& w, const Tensor& b,
+                        int Cin, int L, int Cout, int K, int stride, int pad);
+
 /// Reverse-mode backprop from a scalar loss.
 void backward(const Tensor& loss);
 

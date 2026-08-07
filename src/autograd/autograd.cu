@@ -193,6 +193,391 @@ Tensor sum(const Tensor& a) {
   return Tensor(out);
 }
 
+// ==== Phase A1 kernels ====
+
+__global__ void k_add_bias(const float* x, const float* b, float* o, int R, int C) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < R * C) o[i] = x[i] + b[i % C];
+}
+__global__ void k_colsum_acc(float* db, const float* dy, int R, int C) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c < C) {
+    float s = 0.0f;
+    for (int r = 0; r < R; ++r) s += dy[r * C + c];
+    db[c] += s;
+  }
+}
+__global__ void k_relu_f(const float* x, float* o, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = fmaxf(0.0f, x[i]);
+}
+__global__ void k_relu_b(float* dx, const float* dy, const float* x, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dx[i] += (x[i] > 0.0f) ? dy[i] : 0.0f;
+}
+__global__ void k_leaky_f(const float* x, float* o, float s, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = (x[i] >= 0.0f) ? x[i] : s * x[i];
+}
+__global__ void k_leaky_b(float* dx, const float* dy, const float* x, float s, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dx[i] += dy[i] * ((x[i] >= 0.0f) ? 1.0f : s);
+}
+__global__ void k_gelu_f(const float* x, float* o, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = x[i] * 0.5f * (1.0f + erff(x[i] * 0.7071067811865476f));
+}
+__global__ void k_gelu_b(float* dx, const float* dy, const float* x, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float v = x[i];
+    float cdf = 0.5f * (1.0f + erff(v * 0.7071067811865476f));
+    float pdf = 0.3989422804014327f * expf(-0.5f * v * v);
+    dx[i] += dy[i] * (cdf + v * pdf);
+  }
+}
+__global__ void k_tanh_f(const float* x, float* o, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = tanhf(x[i]);
+}
+__global__ void k_tanh_b(float* dx, const float* dy, const float* y, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dx[i] += dy[i] * (1.0f - y[i] * y[i]);
+}
+__global__ void k_sig_f(const float* x, float* o, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = 1.0f / (1.0f + expf(-x[i]));
+}
+__global__ void k_sig_b(float* dx, const float* dy, const float* y, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dx[i] += dy[i] * y[i] * (1.0f - y[i]);
+}
+__global__ void k_softmax_f(const float* x, float* o, int R, int C) {
+  int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= R) return;
+  const float* xr = x + r * C;
+  float* orow = o + r * C;
+  float mx = xr[0];
+  for (int c = 1; c < C; ++c) mx = fmaxf(mx, xr[c]);
+  float sum = 0.0f;
+  for (int c = 0; c < C; ++c) { orow[c] = expf(xr[c] - mx); sum += orow[c]; }
+  for (int c = 0; c < C; ++c) orow[c] /= sum;
+}
+__global__ void k_softmax_b(float* dx, const float* dy, const float* y, int R, int C) {
+  int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= R) return;
+  const float* dyr = dy + r * C;
+  const float* yr = y + r * C;
+  float* dxr = dx + r * C;
+  float s = 0.0f;
+  for (int c = 0; c < C; ++c) s += dyr[c] * yr[c];
+  for (int c = 0; c < C; ++c) dxr[c] += yr[c] * (dyr[c] - s);
+}
+__global__ void k_ln_f(const float* x, const float* w, const float* b, float* o,
+                       float* mean, float* rstd, int R, int D, float eps) {
+  int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= R) return;
+  const float* xr = x + r * D;
+  float m = 0.0f;
+  for (int d = 0; d < D; ++d) m += xr[d];
+  m /= D;
+  float v = 0.0f;
+  for (int d = 0; d < D; ++d) { float t = xr[d] - m; v += t * t; }
+  v /= D;
+  float rs = rsqrtf(v + eps);
+  mean[r] = m;
+  rstd[r] = rs;
+  float* orow = o + r * D;
+  for (int d = 0; d < D; ++d) orow[d] = (xr[d] - m) * rs * w[d] + b[d];
+}
+__global__ void k_ln_b(float* dx, float* dw, float* db, const float* dy,
+                       const float* x, const float* w, const float* mean,
+                       const float* rstd, int R, int D) {
+  int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= R) return;
+  const float* xr = x + r * D;
+  const float* dyr = dy + r * D;
+  float* dxr = dx + r * D;
+  float m = mean[r], rs = rstd[r];
+  float sum1 = 0.0f, sum2 = 0.0f;
+  for (int d = 0; d < D; ++d) {
+    float xhat = (xr[d] - m) * rs;
+    float dxhat = dyr[d] * w[d];
+    sum1 += dxhat;
+    sum2 += dxhat * xhat;
+  }
+  for (int d = 0; d < D; ++d) {
+    float xhat = (xr[d] - m) * rs;
+    float dxhat = dyr[d] * w[d];
+    dxr[d] += rs * (dxhat - sum1 / D - xhat * sum2 / D);
+    atomicAdd(&dw[d], dyr[d] * xhat);
+    atomicAdd(&db[d], dyr[d]);
+  }
+}
+
+Tensor add_bias(const Tensor& x, const Tensor& b) {
+  int C = x.shape().back();
+  int R = static_cast<int>(x.numel()) / C;
+  int n = R * C;
+  auto out = make_node(x.shape(), any_requires_grad({&x, &b}));
+  k_add_bias<<<grid(n), 256>>>(x.n->data.data(), b.n->data.data(), out->data.data(), R, C);
+  check_launch("add_bias");
+  out->parents = {x.n, b.n};
+  Node* o = out.get(); Node* px = x.n.get(); Node* pb = b.n.get();
+  out->backward_fn = [o, px, pb, R, C, n] {
+    k_acc<<<grid(n), 256>>>(px->grad.data(), o->grad.data(), n);
+    k_colsum_acc<<<grid(C), 256>>>(pb->grad.data(), o->grad.data(), R, C);
+  };
+  return Tensor(out);
+}
+
+Tensor linear(const Tensor& x, const Tensor& w, const Tensor& b) {
+  int M = x.shape()[0], K = x.shape()[1], N = w.shape()[0];
+  bool has_b = static_cast<bool>(b.n);
+  bool rg = any_requires_grad({&x, &w}) ||
+            (has_b && (b.n->requires_grad || !b.n->parents.empty()));
+  auto out = make_node({M, N}, rg);
+  gemm_rm(false, true, M, N, K, 1.0f, x.n->data.data(), w.n->data.data(), 0.0f, out->data.data());
+  if (has_b) {
+    k_add_bias<<<grid(M * N), 256>>>(out->data.data(), b.n->data.data(), out->data.data(), M, N);
+    check_launch("linear_bias");
+    out->parents = {x.n, w.n, b.n};
+  } else {
+    out->parents = {x.n, w.n};
+  }
+  Node* o = out.get(); Node* px = x.n.get(); Node* pw = w.n.get();
+  Node* pb = has_b ? b.n.get() : nullptr;
+  out->backward_fn = [o, px, pw, pb, M, N, K] {
+    gemm_rm(false, false, M, K, N, 1.0f, o->grad.data(), pw->data.data(), 1.0f, px->grad.data());
+    gemm_rm(true, false, N, K, M, 1.0f, o->grad.data(), px->data.data(), 1.0f, pw->grad.data());
+    if (pb) k_colsum_acc<<<grid(N), 256>>>(pb->grad.data(), o->grad.data(), M, N);
+  };
+  return Tensor(out);
+}
+
+template <typename Fwd, typename Bwd>
+static Tensor act_op(const Tensor& x, Fwd fwd, Bwd bwd, bool use_output) {
+  int n = static_cast<int>(x.numel());
+  auto out = make_node(x.shape(), any_requires_grad({&x}));
+  fwd(x.n->data.data(), out->data.data(), n);
+  out->parents = {x.n};
+  Node* o = out.get(); Node* px = x.n.get();
+  out->backward_fn = [o, px, n, bwd, use_output] {
+    const float* ref = use_output ? o->data.data() : px->data.data();
+    bwd(px->grad.data(), o->grad.data(), ref, n);
+  };
+  return Tensor(out);
+}
+
+Tensor relu(const Tensor& x) {
+  return act_op(x,
+      [](const float* a, float* o, int n) { k_relu_f<<<grid(n), 256>>>(a, o, n); },
+      [](float* dx, const float* dy, const float* r, int n) { k_relu_b<<<grid(n), 256>>>(dx, dy, r, n); },
+      false);
+}
+Tensor leaky_relu(const Tensor& x, float slope) {
+  return act_op(x,
+      [slope](const float* a, float* o, int n) { k_leaky_f<<<grid(n), 256>>>(a, o, slope, n); },
+      [slope](float* dx, const float* dy, const float* r, int n) { k_leaky_b<<<grid(n), 256>>>(dx, dy, r, slope, n); },
+      false);
+}
+Tensor gelu(const Tensor& x) {
+  return act_op(x,
+      [](const float* a, float* o, int n) { k_gelu_f<<<grid(n), 256>>>(a, o, n); },
+      [](float* dx, const float* dy, const float* r, int n) { k_gelu_b<<<grid(n), 256>>>(dx, dy, r, n); },
+      false);
+}
+Tensor tanh_op(const Tensor& x) {
+  return act_op(x,
+      [](const float* a, float* o, int n) { k_tanh_f<<<grid(n), 256>>>(a, o, n); },
+      [](float* dx, const float* dy, const float* y, int n) { k_tanh_b<<<grid(n), 256>>>(dx, dy, y, n); },
+      true);
+}
+Tensor sigmoid(const Tensor& x) {
+  return act_op(x,
+      [](const float* a, float* o, int n) { k_sig_f<<<grid(n), 256>>>(a, o, n); },
+      [](float* dx, const float* dy, const float* y, int n) { k_sig_b<<<grid(n), 256>>>(dx, dy, y, n); },
+      true);
+}
+
+Tensor softmax_rows(const Tensor& x, int rows, int cols) {
+  auto out = make_node(x.shape(), any_requires_grad({&x}));
+  k_softmax_f<<<grid(rows), 256>>>(x.n->data.data(), out->data.data(), rows, cols);
+  check_launch("softmax");
+  out->parents = {x.n};
+  Node* o = out.get(); Node* px = x.n.get();
+  out->backward_fn = [o, px, rows, cols] {
+    k_softmax_b<<<grid(rows), 256>>>(px->grad.data(), o->grad.data(), o->data.data(), rows, cols);
+  };
+  return Tensor(out);
+}
+
+Tensor layer_norm(const Tensor& x, const Tensor& w, const Tensor& b,
+                  int rows, int dim, float eps) {
+  auto out = make_node(x.shape(), any_requires_grad({&x, &w, &b}));
+  auto mean = std::make_shared<core::CudaBuffer>(rows);
+  auto rstd = std::make_shared<core::CudaBuffer>(rows);
+  k_ln_f<<<grid(rows), 256>>>(x.n->data.data(), w.n->data.data(), b.n->data.data(),
+                              out->data.data(), mean->data(), rstd->data(), rows, dim, eps);
+  check_launch("layer_norm");
+  out->parents = {x.n, w.n, b.n};
+  Node* o = out.get(); Node* px = x.n.get(); Node* pw = w.n.get(); Node* pb = b.n.get();
+  out->backward_fn = [o, px, pw, pb, mean, rstd, rows, dim] {
+    k_ln_b<<<grid(rows), 256>>>(px->grad.data(), pw->grad.data(), pb->grad.data(),
+                                o->grad.data(), px->data.data(), pw->data.data(),
+                                mean->data(), rstd->data(), rows, dim);
+  };
+  return Tensor(out);
+}
+
+// ==== Phase A1 convolutions ====
+
+__global__ void k_conv1d_f(const float* x, const float* w, const float* b, float* o,
+    int Cin, int L, int Cout, int K, int stride, int pad, int dil, int groups, int Lout) {
+  int ot = blockIdx.x * blockDim.x + threadIdx.x, co = blockIdx.y;
+  if (ot >= Lout || co >= Cout) return;
+  int ipg = Cin / groups, opg = Cout / groups, g = co / opg, cin0 = g * ipg;
+  float s = b ? b[co] : 0.0f;
+  for (int cl = 0; cl < ipg; ++cl) {
+    const float* xc = x + (cin0 + cl) * L;
+    const float* wc = w + (co * ipg + cl) * K;
+    for (int k = 0; k < K; ++k) {
+      int t = ot * stride - pad + k * dil;
+      if (t >= 0 && t < L) s += xc[t] * wc[k];
+    }
+  }
+  o[co * Lout + ot] = s;
+}
+__global__ void k_conv1d_dx(float* dx, const float* dout, const float* w,
+    int Cin, int L, int Cout, int K, int stride, int pad, int dil, int groups, int Lout) {
+  int ot = blockIdx.x * blockDim.x + threadIdx.x, co = blockIdx.y;
+  if (ot >= Lout || co >= Cout) return;
+  int ipg = Cin / groups, opg = Cout / groups, g = co / opg, cin0 = g * ipg;
+  float go = dout[co * Lout + ot];
+  const float* wc = w + co * ipg * K;
+  for (int cl = 0; cl < ipg; ++cl) {
+    for (int k = 0; k < K; ++k) {
+      int t = ot * stride - pad + k * dil;
+      if (t >= 0 && t < L) atomicAdd(&dx[(cin0 + cl) * L + t], go * wc[cl * K + k]);
+    }
+  }
+}
+__global__ void k_conv1d_dw(float* dw, const float* dout, const float* x,
+    int Cin, int L, int Cout, int K, int stride, int pad, int dil, int groups, int Lout) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int ipg = Cin / groups, total = Cout * ipg * K;
+  if (idx >= total) return;
+  int k = idx % K, cl = (idx / K) % ipg, co = idx / (K * ipg);
+  int opg = Cout / groups, g = co / opg, cin0 = g * ipg;
+  const float* xc = x + (cin0 + cl) * L;
+  float s = 0.0f;
+  for (int ot = 0; ot < Lout; ++ot) {
+    int t = ot * stride - pad + k * dil;
+    if (t >= 0 && t < L) s += dout[co * Lout + ot] * xc[t];
+  }
+  dw[idx] += s;
+}
+__global__ void k_conv_db(float* db, const float* dout, int Cout, int Lout) {
+  int co = blockIdx.x * blockDim.x + threadIdx.x;
+  if (co >= Cout) return;
+  float s = 0.0f;
+  for (int ot = 0; ot < Lout; ++ot) s += dout[co * Lout + ot];
+  db[co] += s;
+}
+
+__global__ void k_convt_f(const float* x, const float* w, const float* b, float* o,
+    int Cin, int L, int Cout, int K, int stride, int pad, int Lout) {
+  int ot = blockIdx.x * blockDim.x + threadIdx.x, co = blockIdx.y;
+  if (ot >= Lout || co >= Cout) return;
+  float s = b ? b[co] : 0.0f;
+  for (int k = 0; k < K; ++k) {
+    int num = ot + pad - k;
+    if (num % stride != 0) continue;
+    int t = num / stride;
+    if (t < 0 || t >= L) continue;
+    for (int ci = 0; ci < Cin; ++ci) s += x[ci * L + t] * w[(ci * Cout + co) * K + k];
+  }
+  o[co * Lout + ot] = s;
+}
+__global__ void k_convt_dx(float* dx, const float* dout, const float* w,
+    int Cin, int L, int Cout, int K, int stride, int pad, int Lout) {
+  int t = blockIdx.x * blockDim.x + threadIdx.x, ci = blockIdx.y;
+  if (t >= L || ci >= Cin) return;
+  float s = 0.0f;
+  for (int k = 0; k < K; ++k) {
+    int ot = t * stride - pad + k;
+    if (ot < 0 || ot >= Lout) continue;
+    for (int co = 0; co < Cout; ++co) s += dout[co * Lout + ot] * w[(ci * Cout + co) * K + k];
+  }
+  dx[ci * L + t] += s;
+}
+__global__ void k_convt_dw(float* dw, const float* dout, const float* x,
+    int Cin, int L, int Cout, int K, int stride, int pad, int Lout) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x, total = Cin * Cout * K;
+  if (idx >= total) return;
+  int k = idx % K, co = (idx / K) % Cout, ci = idx / (K * Cout);
+  float s = 0.0f;
+  for (int t = 0; t < L; ++t) {
+    int ot = t * stride - pad + k;
+    if (ot >= 0 && ot < Lout) s += dout[co * Lout + ot] * x[ci * L + t];
+  }
+  dw[idx] += s;
+}
+
+Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
+              int Cin, int L, int Cout, int K, int stride, int pad,
+              int dilation, int groups) {
+  int Lout = (L + 2 * pad - dilation * (K - 1) - 1) / stride + 1;
+  bool has_b = static_cast<bool>(b.n);
+  bool rg = any_requires_grad({&x, &w}) ||
+            (has_b && (b.n->requires_grad || !b.n->parents.empty()));
+  auto out = make_node({Cout, Lout}, rg);
+  dim3 gf(grid(Lout), Cout);
+  k_conv1d_f<<<gf, 256>>>(x.n->data.data(), w.n->data.data(),
+                          has_b ? b.n->data.data() : nullptr, out->data.data(),
+                          Cin, L, Cout, K, stride, pad, dilation, groups, Lout);
+  check_launch("conv1d");
+  if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
+  Node* o = out.get(); Node* px = x.n.get(); Node* pw = w.n.get();
+  Node* pb = has_b ? b.n.get() : nullptr;
+  int ipg = Cin / groups;
+  out->backward_fn = [o, px, pw, pb, Cin, L, Cout, K, stride, pad, dilation, groups, Lout, ipg] {
+    dim3 gd(grid(Lout), Cout);
+    k_conv1d_dx<<<gd, 256>>>(px->grad.data(), o->grad.data(), pw->data.data(),
+                             Cin, L, Cout, K, stride, pad, dilation, groups, Lout);
+    k_conv1d_dw<<<grid(Cout * ipg * K), 256>>>(pw->grad.data(), o->grad.data(),
+                             px->data.data(), Cin, L, Cout, K, stride, pad, dilation, groups, Lout);
+    if (pb) k_conv_db<<<grid(Cout), 256>>>(pb->grad.data(), o->grad.data(), Cout, Lout);
+  };
+  return Tensor(out);
+}
+
+Tensor conv_transpose1d(const Tensor& x, const Tensor& w, const Tensor& b,
+                        int Cin, int L, int Cout, int K, int stride, int pad) {
+  int Lout = (L - 1) * stride - 2 * pad + K;
+  bool has_b = static_cast<bool>(b.n);
+  bool rg = any_requires_grad({&x, &w}) ||
+            (has_b && (b.n->requires_grad || !b.n->parents.empty()));
+  auto out = make_node({Cout, Lout}, rg);
+  dim3 gf(grid(Lout), Cout);
+  k_convt_f<<<gf, 256>>>(x.n->data.data(), w.n->data.data(),
+                         has_b ? b.n->data.data() : nullptr, out->data.data(),
+                         Cin, L, Cout, K, stride, pad, Lout);
+  check_launch("conv_transpose1d");
+  if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
+  Node* o = out.get(); Node* px = x.n.get(); Node* pw = w.n.get();
+  Node* pb = has_b ? b.n.get() : nullptr;
+  out->backward_fn = [o, px, pw, pb, Cin, L, Cout, K, stride, pad, Lout] {
+    dim3 gd(grid(L), Cin);
+    k_convt_dx<<<gd, 256>>>(px->grad.data(), o->grad.data(), pw->data.data(),
+                            Cin, L, Cout, K, stride, pad, Lout);
+    k_convt_dw<<<grid(Cin * Cout * K), 256>>>(pw->grad.data(), o->grad.data(),
+                            px->data.data(), Cin, L, Cout, K, stride, pad, Lout);
+    if (pb) k_conv_db<<<grid(Cout), 256>>>(pb->grad.data(), o->grad.data(), Cout, Lout);
+  };
+  return Tensor(out);
+}
+
 void backward(const Tensor& loss) {
   // Topological order via DFS over parents.
   std::vector<Node*> topo;
