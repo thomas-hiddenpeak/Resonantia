@@ -81,7 +81,7 @@
 
 ### Phase A8: 端到端验证 — 解码器路径完成
 - [x] fine-tune → 导出 → C++ 推理:往返 corr 1.000000(零步与微调后均精确复现)
-- [ ] `vc_train` CLI —(下一步)
+- [x] `vc_train` CLI(真实音频 → 解码器 fine-tune → 导出;`vc_convert` 加载微调 G 合成有效音频)
 - **门控 SC-004、SC-005**
 
 ## 风险与约束
