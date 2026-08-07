@@ -305,6 +305,7 @@ void handle_convert(int fd, const Request& req) {
     double index_rate = std::atof(field(parts, "index_rate", "0").c_str());
     double rms = std::atof(field(parts, "rms_mix_rate", "0.5").c_str());
     double protect = std::atof(field(parts, "protect", "0.5").c_str());
+    int filter_radius = std::atoi(field(parts, "filter_radius", "3").c_str());
 
     std::string model = g.gmodel, index;
     if (voice != "base" && voice != "base (pretrained)") {
@@ -320,7 +321,8 @@ void handle_convert(int fd, const Request& req) {
     std::string cmd = "'" + g.build + "/vc_convert' --hubert '" + g.hubert + "' --rmvpe '" + g.rmvpe +
         "' --model '" + model + "' --input '" + in + "' --output '" + out +
         "' --version v2 --speakers 109 --sr 40000 --pitch " + std::to_string(pitch) +
-        " --rms-mix " + std::to_string(rms) + " --protect " + std::to_string(protect);
+        " --rms-mix " + std::to_string(rms) + " --protect " + std::to_string(protect) +
+        " --filter-radius " + std::to_string(filter_radius);
     if (!index.empty()) cmd += " --index '" + index + "' --index-rate " + std::to_string(index_rate);
     cmd += " > /tmp/vcserve_convert.log 2>&1";
     int rc = std::system(cmd.c_str());

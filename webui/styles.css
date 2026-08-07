@@ -304,3 +304,36 @@ select {
     white-space: pre-wrap;
     word-break: break-word;
 }
+
+/* Preset description + hints */
+.preset-desc {
+    margin: 0.25rem 0 0.75rem;
+    padding: 0.6rem 0.85rem;
+    background: rgba(99, 102, 241, 0.08);
+    border-left: 3px solid var(--primary-color);
+    border-radius: 4px;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    line-height: 1.5;
+}
+.hint {
+    margin-top: 0.75rem;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+/* Advanced (collapsible) */
+details.advanced {
+    margin-top: 0.5rem;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 0.5rem 0.85rem;
+    background: var(--bg-color);
+}
+details.advanced summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    user-select: none;
+}
+details.advanced[open] summary { margin-bottom: 0.75rem; color: var(--text-color); }

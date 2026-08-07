@@ -75,6 +75,7 @@ int main(int argc, char** argv) {
         else if (arg == "--index-rate" && i + 1 < argc) config.index_rate = std::atof(argv[++i]);
         else if (arg == "--rms-mix" && i + 1 < argc) config.rms_mix_rate = std::atof(argv[++i]);
         else if (arg == "--protect" && i + 1 < argc) config.protect = std::atof(argv[++i]);
+        else if (arg == "--filter-radius" && i + 1 < argc) config.filter_radius = std::atoi(argv[++i]);
         else if (arg == "--half") config.use_half_precision = true;
         else if (arg == "--device" && i + 1 < argc) config.device = argv[++i];
         else if (arg == "--version" && i + 1 < argc) {

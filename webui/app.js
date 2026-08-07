@@ -13,6 +13,35 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
     });
 });
 
+// ---------- Presets (AINDAW-style tiers with plain-language descriptions) ----------
+let PRESETS = { inference: [], training: [] };
+async function loadPresets() {
+    try { PRESETS = await (await fetch('presets.json')).json(); } catch (e) { return; }
+    const ts = $('trainTier'); ts.innerHTML = '';
+    PRESETS.training.forEach((t) => { const o = document.createElement('option'); o.value = t.id; o.textContent = t.name; ts.appendChild(o); });
+    ts.onchange = () => applyTier(ts.value);
+    if (PRESETS.training[1]) { ts.value = PRESETS.training[1].id; applyTier(ts.value); }
+    const cs = $('convPreset'); cs.innerHTML = '';
+    PRESETS.inference.forEach((p) => { const o = document.createElement('option'); o.value = p.id; o.textContent = p.name; cs.appendChild(o); });
+    cs.onchange = () => applyPreset(cs.value);
+    if (PRESETS.inference[1]) { cs.value = PRESETS.inference[1].id; applyPreset(cs.value); }
+}
+function applyTier(id) {
+    const t = PRESETS.training.find((x) => x.id === id); if (!t) return;
+    $('trainTierDesc').textContent = t.desc;
+    $('trainMode').value = t.mode; $('trainSteps').value = t.steps; $('trainSeg').value = t.seg;
+}
+function applyPreset(id) {
+    const p = PRESETS.inference.find((x) => x.id === id); if (!p) return;
+    $('convPresetDesc').textContent = p.desc;
+    const set = (el, val, out, fmt) => { $(el).value = val; if (out) $(out).textContent = fmt ? fmt(val) : val; };
+    set('pitchShift', p.f0_up_key, 'pitchShiftValue');
+    set('indexRate', Math.round(p.index_rate * 100), 'indexRateValue', () => p.index_rate.toFixed(2));
+    set('rmsMixRate', Math.round(p.rms_mix_rate * 100), 'rmsMixRateValue', () => p.rms_mix_rate.toFixed(2));
+    set('protect', Math.round(p.protect * 100), 'protectValue', () => p.protect.toFixed(2));
+    set('filterRadius', p.filter_radius, 'filterRadiusValue');
+}
+
 // ---------- Training ----------
 let trainFiles = [];
 const trainArea = $('trainUploadArea');
@@ -26,8 +55,21 @@ trainArea.addEventListener('drop', (e) => {
 $('trainFileInput').addEventListener('change', (e) => addTrainFiles(e.target.files));
 
 function addTrainFiles(list) {
-    for (const f of list) if (f.name.match(/\.(wav|flac)$/i)) trainFiles.push(f);
+    for (const f of list) if (f.name.match(/\.(wav|flac)$/i)) { trainFiles.push(f); estimateDuration(f); }
     renderTrainFiles();
+}
+async function estimateDuration(f) {
+    try {
+        const buf = await f.arrayBuffer();
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const audio = await ctx.decodeAudioData(buf);
+        f._dur = audio.duration; ctx.close(); updateDataHint();
+    } catch (e) { /* undecodable header; ignore */ }
+}
+function updateDataHint() {
+    const sec = trainFiles.reduce((s, f) => s + (f._dur || 0), 0), m = sec / 60, el = $('trainDataHint');
+    el.textContent = `已上传约 ${m.toFixed(1)} 分钟` + (m < 10 ? '，建议 ≥ 10 分钟以获得更好效果。' : '，数据量充足 ✓');
+    el.style.color = m < 10 ? '' : 'var(--success-color)';
 }
 function renderTrainFiles() {
     const ul = $('trainFileList'); ul.innerHTML = '';
@@ -37,6 +79,7 @@ function renderTrainFiles() {
         li.querySelector('button').onclick = () => { trainFiles.splice(i, 1); renderTrainFiles(); };
         ul.appendChild(li);
     });
+    updateDataHint();
     updateTrainBtn();
 }
 function updateTrainBtn() {
@@ -131,6 +174,7 @@ bind('pitchShift', 'pitchShiftValue', (v) => v);
 bind('indexRate', 'indexRateValue', (v) => (v / 100).toFixed(2));
 bind('rmsMixRate', 'rmsMixRateValue', (v) => (v / 100).toFixed(2));
 bind('protect', 'protectValue', (v) => (v / 100).toFixed(2));
+bind('filterRadius', 'filterRadiusValue', (v) => v);
 
 $('btnConvert').addEventListener('click', async () => {
     if (!convFile) return;
@@ -147,6 +191,7 @@ $('btnConvert').addEventListener('click', async () => {
         fd.append('index_rate', $('indexRate').value / 100);
         fd.append('rms_mix_rate', $('rmsMixRate').value / 100);
         fd.append('protect', $('protect').value / 100);
+        fd.append('filter_radius', $('filterRadius').value);
         const r = await fetch(`${API}/convert`, { method: 'POST', body: fd });
         clearInterval(iv);
         if (!r.ok) throw new Error('服务器错误 ' + r.status);
@@ -169,4 +214,5 @@ $('btnConvert').addEventListener('click', async () => {
 });
 
 // initial
+loadPresets();
 loadVoices();

@@ -46,6 +46,21 @@ double compute_rms(const float* x, int n) {
     return std::sqrt(s / std::max(1, n));
 }
 
+// RVC-style F0 median filter (kernel = odd size; smooths octave jumps/breaks).
+std::vector<float> median_filter(const std::vector<float>& f0, int kernel) {
+    if (kernel < 3) return f0;
+    int r = (kernel - 1) / 2, n = static_cast<int>(f0.size());
+    std::vector<float> out(n), win;
+    win.reserve(kernel);
+    for (int i = 0; i < n; ++i) {
+        win.clear();
+        for (int j = -r; j <= r; ++j) win.push_back(f0[std::clamp(i + j, 0, n - 1)]);
+        std::sort(win.begin(), win.end());
+        out[i] = win[win.size() / 2];
+    }
+    return out;
+}
+
 }  // namespace
 
 bool VoiceConversionPipeline::init(const VCConfig& config) {
@@ -129,6 +144,7 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
     // 4. RMVPE F0 [Tr]
     t0 = clock::now();
     auto f0 = f0_extractor_.infer(audio16k.data(), n16k);
+    if (config_.filter_radius >= 3) f0 = median_filter(f0, config_.filter_radius | 1);
     result.f0_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
 
     // 5. Pitch shift

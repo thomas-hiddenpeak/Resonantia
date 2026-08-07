@@ -28,20 +28,28 @@
                         <input type="text" id="voiceName" placeholder="例如 alice（字母/数字/_/-）">
                     </div>
                     <div class="param-group">
-                        <label for="trainMode">训练模式</label>
-                        <select id="trainMode">
-                            <option value="decoder">解码器微调（快速，mel-L1）</option>
-                            <option value="gan">完整 GAN（高音质，enc_q+flow+判别器）</option>
-                        </select>
+                        <label for="trainTier">训练质量</label>
+                        <select id="trainTier"></select>
                     </div>
-                    <div class="param-group">
-                        <label for="trainSteps">训练步数</label>
-                        <input type="number" id="trainSteps" value="300" min="1" max="100000">
-                    </div>
-                    <div class="param-group">
-                        <label for="trainSeg">片段帧长</label>
-                        <input type="number" id="trainSeg" value="40" min="8" max="200">
-                    </div>
+                    <p class="preset-desc" id="trainTierDesc"></p>
+                    <details class="advanced">
+                        <summary>高级参数（可选,覆盖档位）</summary>
+                        <div class="param-group">
+                            <label for="trainMode">模式</label>
+                            <select id="trainMode">
+                                <option value="decoder">解码器微调（快速，mel-L1）</option>
+                                <option value="gan">完整 GAN（高音质，enc_q+flow+判别器）</option>
+                            </select>
+                        </div>
+                        <div class="param-group">
+                            <label for="trainSteps">训练步数</label>
+                            <input type="number" id="trainSteps" value="300" min="1" max="100000">
+                        </div>
+                        <div class="param-group">
+                            <label for="trainSeg">片段帧长</label>
+                            <input type="number" id="trainSeg" value="40" min="8" max="200">
+                        </div>
+                    </details>
                 </section>
 
                 <section class="upload-section">
@@ -52,6 +60,7 @@
                         <input type="file" id="trainFileInput" accept=".wav,.flac" multiple hidden>
                     </div>
                     <ul class="file-list" id="trainFileList"></ul>
+                    <p class="hint" id="trainDataHint">建议提供 ≥ 10 分钟 干净的单人录音（可多文件）。</p>
                 </section>
 
                 <section class="action-section">
@@ -92,25 +101,38 @@
                 <section class="params-section">
                     <h2>转换参数</h2>
                     <div class="param-group">
-                        <label for="pitchShift">音高偏移 (半音)</label>
-                        <input type="range" id="pitchShift" min="-24" max="24" value="0" step="1">
-                        <span class="param-value" id="pitchShiftValue">0</span>
+                        <label for="convPreset">效果档位</label>
+                        <select id="convPreset"></select>
                     </div>
-                    <div class="param-group">
-                        <label for="indexRate">特征检索率</label>
-                        <input type="range" id="indexRate" min="0" max="100" value="50" step="1">
-                        <span class="param-value" id="indexRateValue">0.50</span>
-                    </div>
-                    <div class="param-group">
-                        <label for="rmsMixRate">RMS 混合率</label>
-                        <input type="range" id="rmsMixRate" min="0" max="100" value="50" step="1">
-                        <span class="param-value" id="rmsMixRateValue">0.50</span>
-                    </div>
-                    <div class="param-group">
-                        <label for="protect">清音保护</label>
-                        <input type="range" id="protect" min="0" max="100" value="50" step="1">
-                        <span class="param-value" id="protectValue">0.50</span>
-                    </div>
+                    <p class="preset-desc" id="convPresetDesc"></p>
+                    <details class="advanced">
+                        <summary>高级参数（可选,覆盖档位）</summary>
+                        <div class="param-group">
+                            <label for="pitchShift">音高偏移 (半音)</label>
+                            <input type="range" id="pitchShift" min="-24" max="24" value="0" step="1">
+                            <span class="param-value" id="pitchShiftValue">0</span>
+                        </div>
+                        <div class="param-group">
+                            <label for="indexRate">特征检索率</label>
+                            <input type="range" id="indexRate" min="0" max="100" value="50" step="1">
+                            <span class="param-value" id="indexRateValue">0.50</span>
+                        </div>
+                        <div class="param-group">
+                            <label for="rmsMixRate">RMS 混合率</label>
+                            <input type="range" id="rmsMixRate" min="0" max="100" value="50" step="1">
+                            <span class="param-value" id="rmsMixRateValue">0.50</span>
+                        </div>
+                        <div class="param-group">
+                            <label for="protect">清音保护</label>
+                            <input type="range" id="protect" min="0" max="100" value="50" step="1">
+                            <span class="param-value" id="protectValue">0.50</span>
+                        </div>
+                        <div class="param-group">
+                            <label for="filterRadius">F0 平滑半径</label>
+                            <input type="range" id="filterRadius" min="0" max="7" value="3" step="1">
+                            <span class="param-value" id="filterRadiusValue">3</span>
+                        </div>
+                    </details>
                 </section>
 
                 <section class="action-section">
