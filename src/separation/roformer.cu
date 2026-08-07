@@ -303,7 +303,7 @@ struct Roformer::Impl {
     }
     auto di = read_i64(dir + "/roformer_dim_inputs.i64", kNbands);
     freq_indices = read_i64(dir + "/roformer_freq_indices.i64", kFiLen);
-    num_bands_per_freq = read_i64(dir + "/roformer_num_bands_per_freq.i64", kMerged);
+    num_bands_per_freq = read_i64(dir + "/roformer_num_bands_per_freq.i64", kNfreq);
     if (di.empty() || freq_indices.empty() || num_bands_per_freq.empty()) return;
 
     bool g = true;

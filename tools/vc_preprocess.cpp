@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "voxmutatio/io/audio_io.h"
+#include "voxmutatio/separation/roformer.h"
 #include "voxmutatio/separation/separator.h"
 
 namespace fs = std::filesystem;
@@ -62,6 +63,8 @@ void print_usage() {
         "  --separate         Extract vocals (Open-Unmix) before slicing\n"
         "  --sep-model <path> Vocal-separation weights (default:\n"
         "                     models/separation/umxhq_vocals.safetensors)\n"
+        "  --dereverb         Remove reverb (MelBand-RoFormer) before slicing\n"
+        "  --sep-dir <path>   Separation model dir (default: models/separation)\n"
         "  --help             Show this help\n";
 }
 
@@ -71,8 +74,9 @@ int main(int argc, char** argv) {
     std::string input, output_dir;
     int sr = 40000;
     double seg_sec = 3.0, hop_sec = 0.0, min_rms = 0.010, trim_thresh = 0.020;
-    bool trim = false, separate = false;
+    bool trim = false, separate = false, dereverb = false;
     std::string sep_model = "models/separation/umxhq_vocals.safetensors";
+    std::string sep_dir = "models/separation";
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -88,6 +92,8 @@ int main(int argc, char** argv) {
         else if (a == "--trim-thresh") trim_thresh = std::atof(next());
         else if (a == "--separate") separate = true;
         else if (a == "--sep-model") sep_model = next();
+        else if (a == "--dereverb") dereverb = true;
+        else if (a == "--sep-dir") sep_dir = next();
         else { std::cerr << "Unknown argument: " << a << "\n"; return 1; }
     }
     if (input.empty() || output_dir.empty()) {
@@ -118,6 +124,15 @@ int main(int argc, char** argv) {
         }
         std::cout << "Vocal separation enabled (Open-Unmix)\n";
     }
+    std::unique_ptr<voxmutatio::separation::Roformer> derev;
+    if (dereverb) {
+        derev = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, "dereverb_roformer");
+        if (!derev->valid()) {
+            std::cerr << "error: could not load de-reverb model in: " << sep_dir << "\n";
+            return 1;
+        }
+        std::cout << "De-reverb enabled (MelBand-RoFormer)\n";
+    }
 
     fs::create_directories(output_dir);
     const int seg = std::max(1, static_cast<int>(seg_sec * sr));
@@ -131,6 +146,9 @@ int main(int argc, char** argv) {
         std::vector<float> a = std::move(opt->data);
         if (sep) {
             a = sep->separate_mono(a.data(), static_cast<int>(a.size()), sr);
+        }
+        if (derev) {
+            a = derev->separate_mono(a.data(), static_cast<int>(a.size()), sr);
         }
         if (trim) {
             auto [lo, hi] = voiced_span(a, static_cast<float>(trim_thresh), sr / 10);

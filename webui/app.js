@@ -45,8 +45,8 @@ function applyPreset(id) {
         ` · RMS:${p.rms_mix_rate.toFixed(2)} · 平滑:${p.filter_radius} · 变调:${p.f0_up_key}`;
 }
 const REC_CHAINS = {
-    songDefault: '带伴奏歌曲 → 预处理链:分离人声(Open-Unmix,内置) → 切片 → 训练。✓ 会自动提取人声。（去和声/去混响开发中）',
-    vocalReverb: '纯人声(含混响) → 预处理链:去混响 → 切片 → 训练。（内置去混响开发中;当前按纯人声处理）',
+    songDefault: '带伴奏歌曲 → 预处理链:分离人声(Open-Unmix) → 去混响(MelBand-RoFormer) → 切片 → 训练。✓ 均内置自动。（去和声开发中）',
+    vocalReverb: '纯人声(含混响) → 预处理链:去混响(MelBand-RoFormer,内置) → 切片 → 训练。✓',
     vocalClean: '纯人声(干净) → 预处理链:切片 → 训练。✓ 当前即可直接训练。'
 };
 function updateRecHint() {
@@ -114,6 +114,7 @@ $('btnTrain').addEventListener('click', async () => {
     fd.append('seg', $('trainSeg').value);
     fd.append('epochs', $('trainEpochs').value);
     fd.append('separate', $('recContent').value === 'song' ? '1' : '0');
+    fd.append('dereverb', ($('recContent').value === 'song' || $('recReverb').checked) ? '1' : '0');
     trainFiles.forEach((f) => fd.append('files', f, f.name));
 
     $('btnTrain').disabled = true;
