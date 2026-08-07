@@ -55,10 +55,16 @@
 
 ## 下一步(优先级,2026-08-07 调整后)
 
-- **P0 文档真相校准**(本轮进行中):审计落盘、PROJECT_STATE、plan/DESIGN 校准、NOTICE。
-- **P1 产品闭环**:spec 002 训练;spec 003 WebUI(简单/高级双模式 + `vc_serve`)。
-- **P2 代码硬化**:CudaBuffer RAII + 显存池(消除 65 处裸 malloc);内核错误检查;方法命名决策。
-- **P3 收敛设计**:DESIGN 与现实完全对齐;处理孤儿模块。
+- **P0 音频前处理(完整功能,纯 C++/CUDA)**:人声分离 / 去混响 / 去和声(`src/separation/`)。
+  宪法约束零 Python 运行时,故模型(MelBand-RoFormer / MDX-Net 等)以 C++/CUDA 自研实现。
+  见 `specs/004-source-separation/`。训练页录音类型据此映射预处理链。
+- **P0 性能**:消除训练管线气泡(Synthesizer 缓存权重,避免每次 debug/infer 重载 145MB);
+  非必要 CPU 业务(如 `compute_spec` 的 host DFT)移至 GPU;autograd kernel 剖析与优化。
+- **P1 实时转换(下一个里程碑,暂不建 spec)**:麦克风采集(getUserMedia/AudioWorklet)→
+  vc_serve WebSocket → 流式转换(复用 `synthesizer::infer_stream` 的 skip/return 窗口)→
+  扬声器回放,目标低延迟(对标 RVC 90-170ms)。
+- **P2 产品闭环**:spec 002 训练(解码器+GAN 已完成);spec 003 WebUI(编排全流程已完成)。
+- **P3 代码硬化**:CudaBuffer RAII + 显存池;内核错误检查;方法命名决策。
 
 ---
 

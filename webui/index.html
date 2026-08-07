@@ -59,12 +59,14 @@
                 <section class="upload-section">
                     <h2>目标声线录音（可多选）</h2>
                     <div class="param-group">
-                        <label for="recType">录音类型</label>
-                        <select id="recType">
-                            <option value="clean">干净人声（直接可用）</option>
+                        <label for="recContent">录音内容</label>
+                        <select id="recContent">
+                            <option value="vocal">纯人声</option>
                             <option value="song">带伴奏的歌曲</option>
-                            <option value="reverb">有明显混响/回声</option>
                         </select>
+                    </div>
+                    <div class="param-group" id="reverbGroup">
+                        <label class="check"><input type="checkbox" id="recReverb"> 含混响/回声（需去混响）</label>
                     </div>
                     <p class="hint" id="recTypeHint"></p>
                     <div class="upload-area" id="trainUploadArea">

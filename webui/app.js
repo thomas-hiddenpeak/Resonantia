@@ -44,12 +44,20 @@ function applyPreset(id) {
         `当前参数 → F0:${p.f0method} · 检索:${p.index_rate.toFixed(2)} · 保护:${p.protect.toFixed(2)}` +
         ` · RMS:${p.rms_mix_rate.toFixed(2)} · 平滑:${p.filter_radius} · 变调:${p.f0_up_key}`;
 }
-const REC_HINTS = {
-    clean: '✓ 干净人声可直接训练。',
-    song: '⚠ 带伴奏需先分离人声（去掉伴奏/鼓/贝斯）。当前版本请先用外部工具（如 UVR5/MSST）分离后再上传；内置分离为后续能力。',
-    reverb: '⚠ 明显混响会污染音色，建议先去混响/去回声再上传；内置去混响为后续能力。'
+const REC_CHAINS = {
+    songDefault: '带伴奏歌曲 → 预处理链:分离人声 → 去和声 → 去混响 → 切片 → 训练。（内置分离/去混响开发中;当前请先用外部工具处理后上传）',
+    vocalReverb: '纯人声(含混响) → 预处理链:去混响 → 切片 → 训练。（内置去混响开发中）',
+    vocalClean: '纯人声(干净) → 预处理链:切片 → 训练。✓ 当前即可直接训练。'
 };
-function updateRecHint() { $('recTypeHint').textContent = REC_HINTS[$('recType').value] || ''; }
+function updateRecHint() {
+    const isSong = $('recContent').value === 'song';
+    $('reverbGroup').style.display = isSong ? 'none' : '';  // song implies reverb+harmony
+    $('recTypeHint').textContent = isSong
+        ? REC_CHAINS.songDefault
+        : ($('recReverb').checked ? REC_CHAINS.vocalReverb : REC_CHAINS.vocalClean);
+}
+$('recContent').addEventListener('change', updateRecHint);
+$('recReverb').addEventListener('change', updateRecHint);
 
 // ---------- Training ----------
 let trainFiles = [];
@@ -149,7 +157,7 @@ async function loadVoices() {
         sel.innerHTML = '';
         if (voices.length === 0) {
             const o = document.createElement('option');
-            o.value = ''; o.textContent = '（暂无声线,请先在①训练声线创建）'; o.disabled = true; o.selected = true;
+            o.value = ''; o.textContent = '无（请先在①训练声线创建）'; o.disabled = true; o.selected = true;
             sel.appendChild(o);
         } else {
             voices.forEach((v) => { const o = document.createElement('option'); o.value = v; o.textContent = v; sel.appendChild(o); });
