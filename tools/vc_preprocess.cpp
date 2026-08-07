@@ -12,15 +12,18 @@
  *   vc_preprocess --input <wav|dir> --output-dir <dir>
  *                 [--sr 40000] [--seg-sec 3.0] [--hop-sec 0]
  *                 [--min-rms 0.010] [--trim] [--trim-thresh 0.020]
+ *                 [--separate] [--sep-model <umxhq_vocals.safetensors>]
  */
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "voxmutatio/io/audio_io.h"
+#include "voxmutatio/separation/separator.h"
 
 namespace fs = std::filesystem;
 namespace io = voxmutatio::io;
@@ -56,6 +59,9 @@ void print_usage() {
         "  --min-rms <f>      Drop slices quieter than this RMS (default: 0.010)\n"
         "  --trim             Trim leading/trailing silence before slicing\n"
         "  --trim-thresh <f>  Amplitude threshold for --trim (default: 0.020)\n"
+        "  --separate         Extract vocals (Open-Unmix) before slicing\n"
+        "  --sep-model <path> Vocal-separation weights (default:\n"
+        "                     models/separation/umxhq_vocals.safetensors)\n"
         "  --help             Show this help\n";
 }
 
@@ -65,7 +71,8 @@ int main(int argc, char** argv) {
     std::string input, output_dir;
     int sr = 40000;
     double seg_sec = 3.0, hop_sec = 0.0, min_rms = 0.010, trim_thresh = 0.020;
-    bool trim = false;
+    bool trim = false, separate = false;
+    std::string sep_model = "models/separation/umxhq_vocals.safetensors";
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -79,6 +86,8 @@ int main(int argc, char** argv) {
         else if (a == "--min-rms") min_rms = std::atof(next());
         else if (a == "--trim") trim = true;
         else if (a == "--trim-thresh") trim_thresh = std::atof(next());
+        else if (a == "--separate") separate = true;
+        else if (a == "--sep-model") sep_model = next();
         else { std::cerr << "Unknown argument: " << a << "\n"; return 1; }
     }
     if (input.empty() || output_dir.empty()) {
@@ -100,6 +109,16 @@ int main(int argc, char** argv) {
     }
     if (files.empty()) { std::cerr << "error: no audio under " << input << "\n"; return 1; }
 
+    std::unique_ptr<voxmutatio::separation::Separator> sep;
+    if (separate) {
+        sep = std::make_unique<voxmutatio::separation::Separator>(sep_model);
+        if (!sep->valid()) {
+            std::cerr << "error: could not load separation model: " << sep_model << "\n";
+            return 1;
+        }
+        std::cout << "Vocal separation enabled (Open-Unmix)\n";
+    }
+
     fs::create_directories(output_dir);
     const int seg = std::max(1, static_cast<int>(seg_sec * sr));
     const int hop = (hop_sec > 0.0) ? std::max(1, static_cast<int>(hop_sec * sr)) : seg;
@@ -110,6 +129,9 @@ int main(int argc, char** argv) {
         auto opt = io::read_audio(f, sr);
         if (!opt) { std::cerr << "skip (read failed): " << f << "\n"; continue; }
         std::vector<float> a = std::move(opt->data);
+        if (sep) {
+            a = sep->separate_mono(a.data(), static_cast<int>(a.size()), sr);
+        }
         if (trim) {
             auto [lo, hi] = voiced_span(a, static_cast<float>(trim_thresh), sr / 10);
             if (hi > lo) a = std::vector<float>(a.begin() + lo, a.begin() + hi);
