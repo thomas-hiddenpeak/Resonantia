@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "voxmutatio/io/safetensors.h"
+#include "voxmutatio/separation/stft.h"
 
 namespace voxmutatio::training {
 
@@ -37,7 +38,7 @@ std::vector<float> load_plain(const io::SafetensorsLoader& L, const std::string&
 
 }  // namespace
 
-std::vector<float> compute_spec(const float* audio, int L, int n_fft, int hop, int& out_T) {
+std::vector<float> compute_spec_host(const float* audio, int L, int n_fft, int hop, int& out_T) {
   const int pad = (n_fft - hop) / 2;
   const int nfreq = n_fft / 2 + 1;
   const int T = L / hop;
@@ -76,6 +77,13 @@ std::vector<float> compute_spec(const float* audio, int L, int n_fft, int hop, i
     }
   }
   return spec;
+}
+
+std::vector<float> compute_spec(const float* audio, int L, int n_fft, int hop, int& out_T) {
+  // GPU cuFFT STFT with VITS reflect pad = (n_fft - hop)/2 and periodic Hann.
+  // Numerically matches compute_spec_host to ~1e-7 (see test_separation [spec]).
+  separation::Stft stft(n_fft, hop, n_fft, true, (n_fft - hop) / 2);
+  return stft.magnitude(audio, L, out_T);
 }
 
 void WaveNet::load(const io::SafetensorsLoader& L, const std::string& prefix,

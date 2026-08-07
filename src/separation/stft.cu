@@ -64,9 +64,10 @@ __global__ void k_norm(float* y, const float* wsum, int n) {
 
 }  // namespace
 
-Stft::Stft(int n_fft, int hop, int win_length, bool center)
+Stft::Stft(int n_fft, int hop, int win_length, bool center, int pad_override)
     : n_fft_(n_fft), hop_(hop), win_(win_length > 0 ? win_length : n_fft),
-      pad_(center ? n_fft / 2 : 0), center_(center) {
+      pad_(pad_override >= 0 ? pad_override : (center ? n_fft / 2 : 0)),
+      center_(center) {
   window_.resize(n_fft_, 0.0f);
   // Periodic Hann of length win_, centered in n_fft.
   int off = (n_fft_ - win_) / 2;

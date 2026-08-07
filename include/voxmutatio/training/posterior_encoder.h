@@ -19,8 +19,13 @@ namespace voxmutatio::training {
 
 /// Linear-magnitude spectrogram matching VITS (reflect pad (n_fft-hop)/2,
 /// Hann window). Returns [n_freq, T] (freq-major), sets out_T = L/hop.
+/// GPU cuFFT path (validated bit-close to compute_spec_host, rel err ~1e-7).
 std::vector<float> compute_spec(const float* audio, int L, int n_fft, int hop,
                                 int& out_T);
+
+/// Host DFT reference for compute_spec (correctness anchor / regression guard).
+std::vector<float> compute_spec_host(const float* audio, int L, int n_fft, int hop,
+                                     int& out_T);
 
 /// A single WaveNet layer's weights (weight_norm reconstructed, cond folded).
 struct WNLayer {

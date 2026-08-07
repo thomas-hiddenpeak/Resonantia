@@ -13,7 +13,10 @@ namespace voxmutatio::separation {
 
 class Stft {
  public:
-  Stft(int n_fft, int hop, int win_length = 0, bool center = true);
+  // pad_override < 0 uses center default (n_fft/2 when center, else 0); otherwise
+  // pads by exactly pad_override on each side (still reflect). VITS spec uses
+  // pad_override = (n_fft - hop) / 2.
+  Stft(int n_fft, int hop, int win_length = 0, bool center = true, int pad_override = -1);
 
   [[nodiscard]] int n_freq() const { return n_fft_ / 2 + 1; }
   [[nodiscard]] int num_frames(int L) const;
