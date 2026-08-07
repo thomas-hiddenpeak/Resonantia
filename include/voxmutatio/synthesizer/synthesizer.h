@@ -100,6 +100,10 @@ public:
     std::vector<float> debug_gen_stage0(const float* z, const float* f0,
                                         int frames, int speaker_id, int which);
 
+    /// Test hook: full generator (z + f0 -> audio [frames*400]).
+    std::vector<float> debug_decode(const float* z, const float* f0,
+                                    int frames, int speaker_id);
+
 private:
     SynthesizerConfig config_;
     int sample_rate_ = 40'000;

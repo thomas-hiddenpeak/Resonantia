@@ -27,6 +27,11 @@ class GeneratorTrainer {
   /// Trainable parameters (for the optimizer).
   std::vector<autograd::Tensor>& params() { return params_; }
 
+  /// Export fine-tuned weights to a safetensors compatible with inference:
+  /// copies all source tensors, overrides dec.* with fine-tuned values
+  /// (fused weights re-derived to weight_g/weight_v; cond fold removed).
+  bool export_model(const std::string& src_g_path, const std::string& out_path);
+
   [[nodiscard]] int upp() const { return 400; }
 
  private:
@@ -36,6 +41,7 @@ class GeneratorTrainer {
   std::array<std::array<autograd::Tensor, 3>, 12> c1w_, c1b_, c2w_, c2b_;
   autograd::Tensor conv_post_w_;
   std::vector<autograd::Tensor> params_;
+  std::vector<float> cond_g_init_;  // cond(g) folded into conv_pre bias at init
 
   autograd::Tensor resblock(const autograd::Tensor& xn, int idx, int C, int L,
                             int kernel, const int* dil);

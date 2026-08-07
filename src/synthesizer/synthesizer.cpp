@@ -632,6 +632,17 @@ std::vector<float> Synthesizer::debug_gen_stage0(const float* z, const float* f0
     return acc;
 }
 
+std::vector<float> Synthesizer::debug_decode(const float* z, const float* f0,
+                                             int frames, int speaker_id) {
+    Weights w;
+    if (!w.load(config_.model_path)) return {};
+    const float* emb_g = w.get("emb_g.weight");
+    std::vector<float> g(kGin);
+    for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
+    std::vector<float> x(z, z + kInter * frames);
+    return generator(w, std::move(x), frames, f0, g.data(), sample_rate_);
+}
+
 AudioBuffer Synthesizer::infer(const float* features, int frames,
                                const float* pitch, const float* pitchf,
                                int speaker_id) {
