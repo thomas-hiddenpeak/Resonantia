@@ -96,6 +96,7 @@ def main():
     json.dump(hp, open(os.path.join(MODELS, "dereverb_roformer.json"), "w"), indent=2)
     fi.tofile(os.path.join(MODELS, "roformer_freq_indices.i64"))
     nbpf.tofile(os.path.join(MODELS, "roformer_num_bands_per_freq.i64"))
+    np.asarray(dim_inputs, dtype=np.int64).tofile(os.path.join(MODELS, "roformer_dim_inputs.i64"))
     print(f"band map: freq_indices={fi.size}, bands={len(dim_inputs)}, "
           f"sum dim_inputs={sum(dim_inputs)}")
 
@@ -111,6 +112,8 @@ def main():
     h = []
     h.append(model.band_split.register_forward_hook(
         lambda m, i, o: caps.__setitem__("band_split", o.detach())))
+    h.append(model.band_split.register_forward_pre_hook(
+        lambda m, i: caps.__setitem__("band_split_in", i[0].detach())))
     for i in range(mcfg["depth"]):
         ft = model.layers[i][1]  # freq transformer, output == x after block i
         h.append(ft.register_forward_hook(
@@ -122,7 +125,16 @@ def main():
     for x in h:
         x.remove()
 
+    # torch STFT of channel 0 (precision reference for our cuFFT Stft).
+    win = torch.hann_window(mcfg["stft_win_length"])
+    s0 = torch.stft(torch.from_numpy(stereo[0]).float(), n_fft=mcfg["stft_n_fft"],
+                    hop_length=mcfg["stft_hop_length"], win_length=mcfg["stft_win_length"],
+                    window=win, center=True, normalized=False, return_complex=True)
+    dump(os.path.join(FIX, "rof_stft_re.bin"), s0.real.numpy())
+    dump(os.path.join(FIX, "rof_stft_im.bin"), s0.imag.numpy())
+
     dump(os.path.join(FIX, "rof_input_wave.bin"), stereo)
+    dump(os.path.join(FIX, "rof_band_split_in.bin"), caps["band_split_in"].numpy())
     dump(os.path.join(FIX, "rof_band_split.bin"), caps["band_split"].numpy())
     dump(os.path.join(FIX, "rof_block_final.bin"), caps[f"block{mcfg['depth']-1}"].numpy())
     dump(os.path.join(FIX, "rof_mask.bin"), caps["mask"].numpy())

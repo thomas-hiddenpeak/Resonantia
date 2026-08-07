@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "voxmutatio/io/audio_io.h"
+#include "voxmutatio/separation/roformer.h"
 #include "voxmutatio/separation/separator.h"
 #include "voxmutatio/separation/stft.h"
 #include "voxmutatio/training/posterior_encoder.h"
@@ -146,4 +147,52 @@ TEST_CASE("Open-Unmix vocals runner aligns with reference", "[separation][umx]")
   double e2e_rel = rel_err(voc, ref_voc);
   std::printf("[umx] end-to-end vocal rel error = %.3e\n", e2e_rel);
   CHECK(e2e_rel < 5e-2);
+}
+
+TEST_CASE("MelBand-RoFormer band-split aligns with reference", "[separation][roformer]") {
+  using namespace voxmutatio;
+  const std::string dir = "../models/separation";
+  const std::string fix = "../tests/fixtures/separation/";
+  if (!file_exists(dir + "/dereverb_roformer.safetensors") || !file_exists(fix + "rof_band_split.bin")) {
+    WARN("RoFormer weights/reference absent (run tools/convert_roformer_weights.py); skipping");
+    return;
+  }
+  separation::Roformer rof(dir);
+  REQUIRE(rof.valid());
+
+  auto wave = read_bin(fix + "rof_input_wave.bin");
+  int L = static_cast<int>(wave.size() / 2);
+  int T = 0;
+
+  // STFT front-end matches torch.stft to float precision.
+  if (file_exists(fix + "rof_stft_re.bin")) {
+    separation::Stft st(rof.n_fft(), rof.hop());
+    int Ts = 0;
+    std::vector<float> re, im;
+    st.forward(wave.data(), L, re, im, Ts);
+    CHECK(rel_err(re, read_bin(fix + "rof_stft_re.bin")) < 1e-5);
+    CHECK(rel_err(im, read_bin(fix + "rof_stft_im.bin")) < 1e-5);
+  }
+
+  // Gather + complex fold (band-split input) matches to float precision.
+  auto bin = rof.debug_bandsplit_in(wave, L, T);
+  CHECK(rel_err(bin, read_bin(fix + "rof_band_split_in.bin")) < 1e-5);
+
+  // Band-split output: energy-carrying bands align tightly. High mel bands are
+  // near-silent on clean speech, where RMSNorm amplifies float32 STFT rounding
+  // (both cuFFT and torch); those are validated end-to-end on realistic input.
+  auto bs = rof.debug_bandsplit(wave, L, T);
+  auto ref = read_bin(fix + "rof_band_split.bin");
+  REQUIRE(bs.size() == ref.size());
+  for (float v : bs) REQUIRE(std::isfinite(v));
+  double num = 0, den = 0;
+  for (int t = 0; t < T; ++t)
+    for (int b = 0; b < 46; ++b)
+      for (int k = 0; k < 256; ++k) {
+        size_t i = ((size_t)t * 60 + b) * 256 + k;
+        double e = bs[i] - ref[i]; num += e * e; den += (double)ref[i] * ref[i];
+      }
+  double rel_energy = std::sqrt(num / (den + 1e-12));
+  std::printf("[roformer] band-split (bands 0-45) rel error = %.3e (T=%d)\n", rel_energy, T);
+  CHECK(rel_energy < 1e-3);
 }
