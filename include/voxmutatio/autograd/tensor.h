@@ -96,6 +96,18 @@ Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
 Tensor conv_transpose1d(const Tensor& x, const Tensor& w, const Tensor& b,
                         int Cin, int L, int Cout, int K, int stride, int pad);
 
+// ---- Shape / gather ops (Phase A3 primitives) ----
+/// Transpose a 2D tensor: x[rows,cols] -> [cols,rows].
+Tensor transpose2d(const Tensor& x, int rows, int cols);
+/// Concatenate along dim 0 (rows): a[Ra,cols], b[Rb,cols] -> [Ra+Rb, cols].
+Tensor concat_rows(const Tensor& a, const Tensor& b, int cols);
+/// Slice rows [start, start+count) of x[rows,cols] -> [count, cols].
+Tensor slice_rows(const Tensor& x, int start, int count, int cols);
+/// Embedding lookup: table[vocab,dim] gathered by idx[T] -> [T,dim].
+Tensor embedding(const Tensor& table, const std::vector<int>& idx, int dim);
+/// Scale by a constant.
+Tensor scale(const Tensor& x, float s);
+
 /// Reverse-mode backprop from a scalar loss.
 void backward(const Tensor& loss);
 

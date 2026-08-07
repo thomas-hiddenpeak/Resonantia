@@ -579,6 +579,104 @@ Tensor conv_transpose1d(const Tensor& x, const Tensor& w, const Tensor& b,
   return Tensor(out);
 }
 
+// ==== Phase A3 shape/gather primitives ====
+
+__global__ void k_transpose(const float* x, float* y, int R, int C) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < R * C) { int r = i / C, c = i % C; y[c * R + r] = x[i]; }
+}
+__global__ void k_transpose_acc(float* dx, const float* dy, int R, int C) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < R * C) { int r = i / C, c = i % C; dx[i] += dy[c * R + r]; }
+}
+__global__ void k_embed_f(const float* table, const int* idx, float* o, int T, int D) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < T * D) { int t = i / D, d = i % D; o[i] = table[idx[t] * D + d]; }
+}
+__global__ void k_embed_b(float* dtable, const int* idx, const float* dy, int T, int D) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < T * D) { int t = i / D, d = i % D; atomicAdd(&dtable[idx[t] * D + d], dy[i]); }
+}
+__global__ void k_scale(const float* x, float* o, float s, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = x[i] * s;
+}
+__global__ void k_acc_scaled(float* dst, const float* src, float s, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] += src[i] * s;
+}
+
+Tensor transpose2d(const Tensor& x, int rows, int cols) {
+  auto out = make_node({cols, rows}, any_requires_grad({&x}));
+  k_transpose<<<grid(rows * cols), 256>>>(x.n->data.data(), out->data.data(), rows, cols);
+  check_launch("transpose2d");
+  out->parents = {x.n};
+  Node* o = out.get(); Node* px = x.n.get();
+  out->backward_fn = [o, px, rows, cols] {
+    k_transpose_acc<<<grid(rows * cols), 256>>>(px->grad.data(), o->grad.data(), rows, cols);
+  };
+  return Tensor(out);
+}
+
+Tensor concat_rows(const Tensor& a, const Tensor& b, int cols) {
+  int Ra = static_cast<int>(a.numel()) / cols;
+  int Rb = static_cast<int>(b.numel()) / cols;
+  auto out = make_node({Ra + Rb, cols}, any_requires_grad({&a, &b}));
+  cudaMemcpy(out->data.data(), a.n->data.data(), Ra * cols * sizeof(float), cudaMemcpyDeviceToDevice);
+  cudaMemcpy(out->data.data() + Ra * cols, b.n->data.data(), Rb * cols * sizeof(float), cudaMemcpyDeviceToDevice);
+  out->parents = {a.n, b.n};
+  Node* o = out.get(); Node* pa = a.n.get(); Node* pb = b.n.get();
+  int na = Ra * cols, nb = Rb * cols;
+  out->backward_fn = [o, pa, pb, na, nb] {
+    k_acc<<<grid(na), 256>>>(pa->grad.data(), o->grad.data(), na);
+    k_acc<<<grid(nb), 256>>>(pb->grad.data(), o->grad.data() + na, nb);
+  };
+  return Tensor(out);
+}
+
+Tensor slice_rows(const Tensor& x, int start, int count, int cols) {
+  auto out = make_node({count, cols}, any_requires_grad({&x}));
+  cudaMemcpy(out->data.data(), x.n->data.data() + start * cols,
+             count * cols * sizeof(float), cudaMemcpyDeviceToDevice);
+  out->parents = {x.n};
+  Node* o = out.get(); Node* px = x.n.get();
+  int n = count * cols, off = start * cols;
+  out->backward_fn = [o, px, n, off] {
+    k_acc<<<grid(n), 256>>>(px->grad.data() + off, o->grad.data(), n);
+  };
+  return Tensor(out);
+}
+
+Tensor embedding(const Tensor& table, const std::vector<int>& idx, int dim) {
+  int T = static_cast<int>(idx.size());
+  auto out = make_node({T, dim}, any_requires_grad({&table}));
+  int* d_idx_raw = nullptr;
+  cudaMalloc(&d_idx_raw, T * sizeof(int));
+  cudaMemcpy(d_idx_raw, idx.data(), T * sizeof(int), cudaMemcpyHostToDevice);
+  std::shared_ptr<int> d_idx(d_idx_raw, [](int* p) { if (p) cudaFree(p); });
+  k_embed_f<<<grid(T * dim), 256>>>(table.n->data.data(), d_idx.get(), out->data.data(), T, dim);
+  check_launch("embedding");
+  out->parents = {table.n};
+  Node* o = out.get(); Node* pt = table.n.get();
+  out->backward_fn = [o, pt, d_idx, T, dim] {
+    k_embed_b<<<grid(T * dim), 256>>>(pt->grad.data(), d_idx.get(), o->grad.data(), T, dim);
+  };
+  return Tensor(out);
+}
+
+Tensor scale(const Tensor& x, float s) {
+  int n = static_cast<int>(x.numel());
+  auto out = make_node(x.shape(), any_requires_grad({&x}));
+  k_scale<<<grid(n), 256>>>(x.n->data.data(), out->data.data(), s, n);
+  check_launch("scale");
+  out->parents = {x.n};
+  Node* o = out.get(); Node* px = x.n.get();
+  out->backward_fn = [o, px, s, n] {
+    k_acc_scaled<<<grid(n), 256>>>(px->grad.data(), o->grad.data(), s, n);
+  };
+  return Tensor(out);
+}
+
 void backward(const Tensor& loss) {
   // Topological order via DFS over parents.
   std::vector<Node*> topo;

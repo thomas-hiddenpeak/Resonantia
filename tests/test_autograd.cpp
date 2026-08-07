@@ -258,6 +258,61 @@ TEST_CASE("Autograd A1: conv_transpose1d", "[autograd][gradcheck][a1][conv]") {
   run(2, 5, 3, 3, 1, 1, "same");
 }
 
+TEST_CASE("Autograd A3: primitives", "[autograd][gradcheck][a3]") {
+  std::mt19937 rng(29);
+  {
+    const int R = 3, C = 4;
+    double e = grad_check(
+        [R, C](std::vector<Tensor>& t) { return ag::sum(ag::mul(ag::transpose2d(t[0], R, C), t[1])); },
+        {rand_vec(R * C, rng), rand_vec(C * R, rng)}, {{R, C}, {C, R}});
+    std::printf("[transpose2d] %.2e\n", e); CHECK(e < 2e-2);
+  }
+  {
+    const int Ra = 2, Rb = 3, C = 4;
+    double e = grad_check(
+        [Ra, Rb, C](std::vector<Tensor>& t) { return ag::sum(ag::mul(ag::concat_rows(t[0], t[1], C), t[2])); },
+        {rand_vec(Ra * C, rng), rand_vec(Rb * C, rng), rand_vec((Ra + Rb) * C, rng)},
+        {{Ra, C}, {Rb, C}, {Ra + Rb, C}});
+    std::printf("[concat_rows] %.2e\n", e); CHECK(e < 2e-2);
+  }
+  {
+    const int R = 5, C = 3, start = 1, count = 3;
+    double e = grad_check(
+        [=](std::vector<Tensor>& t) { return ag::sum(ag::mul(ag::slice_rows(t[0], start, count, C), t[1])); },
+        {rand_vec(R * C, rng), rand_vec(count * C, rng)}, {{R, C}, {count, C}});
+    std::printf("[slice_rows] %.2e\n", e); CHECK(e < 2e-2);
+  }
+  {
+    const int R = 3, C = 4;
+    double e = grad_check(
+        [R, C](std::vector<Tensor>& t) { return ag::sum(ag::mul(ag::scale(t[0], 2.5f), t[1])); },
+        {rand_vec(R * C, rng), rand_vec(R * C, rng)}, {{R, C}, {R, C}});
+    std::printf("[scale] %.2e\n", e); CHECK(e < 2e-2);
+  }
+}
+
+TEST_CASE("Autograd A3: embedding", "[autograd][gradcheck][a3]") {
+  std::mt19937 rng(31);
+  const int V = 6, D = 4;
+  std::vector<int> idx = {0, 3, 1, 5, 3};  // repeat (3) tests accumulation
+  auto table_host = rand_vec(V * D, rng);
+  auto table = Tensor::from_host(table_host, {V, D}, true);
+  ag::backward(ag::sum(ag::gelu(ag::embedding(table, idx, D))));
+  auto analytic = table.grad_to_host();
+
+  const float eps = 1e-2f;
+  double maxerr = 0.0;
+  for (int i = 0; i < V * D; ++i) {
+    auto h = table_host; h[i] += eps;
+    float fp = ag::sum(ag::gelu(ag::embedding(Tensor::from_host(h, {V, D}, false), idx, D))).to_host()[0];
+    h[i] -= 2 * eps;
+    float fm = ag::sum(ag::gelu(ag::embedding(Tensor::from_host(h, {V, D}, false), idx, D))).to_host()[0];
+    double num = (fp - fm) / (2 * eps);
+    maxerr = std::max(maxerr, std::abs((double)analytic[i] - num) / (1.0 + std::abs(num)));
+  }
+  std::printf("[embedding] %.2e\n", maxerr); CHECK(maxerr < 2e-2);
+}
+
 TEST_CASE("Autograd A2: AdamW convex convergence", "[autograd][a2][optim]") {
   // Minimize f(x) = sum((x - target)^2). Start x = 0, expect x -> target.
   const int n = 8;
