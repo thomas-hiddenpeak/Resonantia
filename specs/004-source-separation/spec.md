@@ -50,11 +50,19 @@ share the runner**. So the module is: STFT → model → mask → apply → iSTF
 - `vc_serve` maps 录音内容/含混响 → the chain; training preprocessing runs it.
 
 ## Phases
-- [x] S0: spec + module skeleton + GPU STFT/iSTFT foundation (this round).
-- [ ] S1: STFT round-trip numerical test (reconstruct == input within tol).
-- [ ] S2: conv U-Net (MDX-style) forward runner + weight conversion + alignment vs ref.
-- [ ] S3: chunked overlap-add long-audio inference; vocal/instrumental stems.
-- [ ] S4: de-reverb + de-harmony weights on the same runner.
+- [x] S0: spec + module skeleton + GPU STFT/iSTFT foundation.
+- [x] S1: STFT round-trip numerical test (reconstruct == input within tol; 1.99e-7).
+- [x] S2: vocal-separation forward runner + weight conversion + alignment.
+      **First runner = Open-Unmix `umxhq` (vocals)**: STFT(4096/1024) magnitude ->
+      per-frame FC/BatchNorm -> 3-layer bidirectional LSTM -> mask -> mixture-phase
+      iSTFT. Pure C++/CUDA, forward-only (`src/separation/separator.cu`), self-
+      contained cuBLAS + custom LSTM/BatchNorm kernels. `tools/convert_separation_
+      weights.py` converts the checkpoint to F32 safetensors + dumps a staged
+      reference. **Aligned vs PyTorch: model 1.6e-6, STFT 1.6e-7, end-to-end 1.5e-6.**
+      (Chosen over MDX-TDF first: torch-loadable, deterministic, fully alignable.)
+- [ ] S3: chunked overlap-add for very long audio (whole-sequence LSTM already OK
+      for typical clips; matches Open-Unmix full-track behaviour).
+- [ ] S4: de-reverb + de-harmony weights (MelBand-RoFormer runner, S6) on same front-end.
 - [ ] S5: wire into vc_preprocess + WebUI chain; real-audio validation.
 - [ ] S6 (SOTA): MelBand-RoFormer runner (band-split + rotary attention).
 

@@ -7,11 +7,35 @@
 
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <vector>
 
 #include "voxmutatio/io/audio_io.h"
+#include "voxmutatio/separation/separator.h"
 #include "voxmutatio/separation/stft.h"
 #include "voxmutatio/training/posterior_encoder.h"
+
+namespace {
+bool file_exists(const std::string& p) { std::ifstream f(p); return f.good(); }
+std::vector<float> read_bin(const std::string& p) {
+  std::ifstream f(p, std::ios::binary | std::ios::ate);
+  if (!f.good()) return {};
+  auto n = static_cast<std::size_t>(f.tellg()) / sizeof(float);
+  std::vector<float> v(n);
+  f.seekg(0);
+  f.read(reinterpret_cast<char*>(v.data()), n * sizeof(float));
+  return v;
+}
+double rel_err(const std::vector<float>& a, const std::vector<float>& b) {
+  double num = 0, den = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    double d = static_cast<double>(a[i]) - b[i];
+    num += d * d;
+    den += static_cast<double>(b[i]) * b[i];
+  }
+  return std::sqrt(num / (den + 1e-12));
+}
+}  // namespace
 
 TEST_CASE("STFT/iSTFT round-trip reconstructs real audio", "[separation][stft]") {
   using namespace voxmutatio;
@@ -74,4 +98,52 @@ TEST_CASE("GPU STFT magnitude matches host compute_spec (VITS pad)", "[separatio
   std::printf("[spec] GPU-vs-host rel error = %.2e, max abs = %.2e (T=%d)\n", rel, maxabs, T_gpu);
   for (float v : spec_gpu) REQUIRE(std::isfinite(v));
   CHECK(rel < 1e-4);
+}
+
+TEST_CASE("Open-Unmix vocals runner aligns with reference", "[separation][umx]") {
+  using namespace voxmutatio;
+  const std::string weights = "../models/separation/umxhq_vocals.safetensors";
+  const std::string fix = "../tests/fixtures/separation/";
+  if (!file_exists(weights) || !file_exists(fix + "umx_mix_mag.bin")) {
+    WARN("umxhq weights/reference absent (run tools/convert_separation_weights.py); skipping");
+    return;
+  }
+
+  separation::Separator sep(weights);
+  REQUIRE(sep.valid());
+  const int nf = sep.nb_output_bins();  // 2049
+
+  // --- Model alignment: dumped mixture magnitude -> estimated vocal magnitude ---
+  auto mix = read_bin(fix + "umx_mix_mag.bin");
+  auto ref_out = read_bin(fix + "umx_model_out.bin");
+  REQUIRE(!mix.empty());
+  int F = static_cast<int>(mix.size() / (2 * nf));
+  REQUIRE(static_cast<int>(mix.size()) == 2 * nf * F);
+  auto est = sep.run_model(mix, F);
+  REQUIRE(est.size() == ref_out.size());
+  for (float v : est) REQUIRE(std::isfinite(v));
+  double model_rel = rel_err(est, ref_out);
+  std::printf("[umx] model rel error = %.3e (F=%d)\n", model_rel, F);
+  CHECK(model_rel < 1e-3);
+
+  // --- STFT front-end: our Stft magnitude vs the dumped mixture magnitude ---
+  auto wave = read_bin(fix + "umx_input_wave.bin");
+  int T = static_cast<int>(wave.size() / 2);
+  separation::Stft st(sep.n_fft(), sep.hop());
+  int Tf = 0;
+  auto mag0 = st.magnitude(wave.data(), T, Tf);          // channel 0
+  REQUIRE(Tf == F);
+  std::vector<float> mix_c0(mix.begin(), mix.begin() + static_cast<std::size_t>(nf) * F);
+  double stft_rel = rel_err(mag0, mix_c0);
+  std::printf("[umx] STFT rel error = %.3e\n", stft_rel);
+  CHECK(stft_rel < 1e-3);
+
+  // --- End-to-end separation vs reference vocal waveform ---
+  auto voc = sep.separate_stereo(wave, T);
+  auto ref_voc = read_bin(fix + "umx_vocal_wave.bin");
+  REQUIRE(voc.size() == ref_voc.size());
+  for (float v : voc) REQUIRE(std::isfinite(v));
+  double e2e_rel = rel_err(voc, ref_voc);
+  std::printf("[umx] end-to-end vocal rel error = %.3e\n", e2e_rel);
+  CHECK(e2e_rel < 5e-2);
 }
