@@ -321,6 +321,12 @@ select {
     color: var(--text-muted);
     font-size: 0.85rem;
 }
+.param-summary {
+    margin: 0.1rem 0 0.75rem;
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 0.82rem;
+    color: var(--primary-color);
+}
 
 /* Advanced (collapsible) */
 details.advanced {

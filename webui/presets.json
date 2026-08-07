@@ -2,26 +2,31 @@
   "inference": [
     { "id": "safe", "name": "最稳 · 通用",
       "desc": "中庸档:中等检索 + 保留源动态。任何首次尝试都稳。",
-      "index_rate": 0.66, "protect": 0.33, "rms_mix_rate": 1.0, "filter_radius": 3, "f0_up_key": 0 },
+      "f0method": "rmvpe", "index_rate": 0.66, "protect": 0.33, "rms_mix_rate": 1.0, "filter_radius": 3, "f0_up_key": 0 },
     { "id": "balanced", "name": "平衡 · 推荐",
       "desc": "检索偏强但留余地 + 默认保护 + 弱化原唱动态。日常翻唱首选。",
-      "index_rate": 0.75, "protect": 0.33, "rms_mix_rate": 0.4, "filter_radius": 3, "f0_up_key": 0 },
+      "f0method": "rmvpe", "index_rate": 0.75, "protect": 0.33, "rms_mix_rate": 0.4, "filter_radius": 3, "f0_up_key": 0 },
     { "id": "timbre", "name": "最贴音色",
       "desc": "检索拉满 + 保护放松 + 弱化原唱动态。最像目标声线,代价:训练没覆盖的元音可能糊。",
-      "index_rate": 1.0, "protect": 0.25, "rms_mix_rate": 0.4, "filter_radius": 3, "f0_up_key": 0 },
+      "f0method": "rmvpe", "index_rate": 1.0, "protect": 0.25, "rms_mix_rate": 0.4, "filter_radius": 3, "f0_up_key": 0 },
     { "id": "sing", "name": "唱歌 · 高音顺滑",
       "desc": "更强的 F0 平滑 + 弱化原唱动态,长音/滑音更顺,减少哑音跳变。适合歌声翻唱。",
-      "index_rate": 0.75, "protect": 0.33, "rms_mix_rate": 0.35, "filter_radius": 5, "f0_up_key": 0 }
+      "f0method": "rmvpe", "index_rate": 0.75, "protect": 0.33, "rms_mix_rate": 0.35, "filter_radius": 5, "f0_up_key": 0 }
   ],
   "training": [
     { "id": "fast", "name": "快速试听",
-      "desc": "解码器 mel 微调,最快出结果,用于验证流程与听个大概。",
-      "mode": "decoder", "steps": 200, "seg": 32 },
+      "desc": "解码器 mel 微调,约数百步最快出结果,验证流程/听个大概(单卡约十几分钟)。",
+      "mode": "decoder", "steps": 800, "seg": 32 },
     { "id": "standard", "name": "标准 · 推荐",
-      "desc": "完整 GAN(enc_q+flow+判别器),音质与耗时平衡。日常推荐。",
-      "mode": "gan", "steps": 400, "seg": 32 },
+      "desc": "完整 GAN(enc_q+flow+判别器),约上千步,音质与耗时平衡(单卡数小时)。",
+      "mode": "gan", "steps": 1200, "seg": 32 },
     { "id": "hq", "name": "高音质",
-      "desc": "完整 GAN 长时训练,音质最好,耗时最长(数据越多越值得)。",
-      "mode": "gan", "steps": 1000, "seg": 40 }
-  ]
+      "desc": "完整 GAN 长训(~2800 步,参考 RVC 实践),音质最好耗时最长;建议数据 ≥ 10 分钟。",
+      "mode": "gan", "steps": 2800, "seg": 40 }
+  ],
+  "notes": {
+    "epochs": "高级里可填「训练轮数」——1 轮=遍历所有片段一次,步数随数据量自适应(参考 RVC epoch,好数据约 200 轮);填了轮数覆盖步数。GAN 每步较慢,轮数酌情。",
+    "f0method": "目前 F0 统一用 RMVPE(音质最佳);crepe/fcpe 为后续。"
+  }
 }
+

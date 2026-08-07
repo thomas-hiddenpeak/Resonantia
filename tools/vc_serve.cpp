@@ -195,7 +195,7 @@ void finish(const std::string& stage, bool error) {
     g_job.stage = stage; g_job.error = error; g_job.done = true; g_job.running = false;
 }
 
-void run_training(std::string name, std::string mode, int steps, int seg) {
+void run_training(std::string name, std::string mode, int steps, int seg, int epochs) {
     std::string dir = g.runs + "/" + name, log = dir + "/train.log";
     std::string clips = dir + "/clips", model = dir + "/model.safetensors", index = dir + "/model.index";
     auto sh = [&](const std::string& cmd) {
@@ -203,7 +203,8 @@ void run_training(std::string name, std::string mode, int steps, int seg) {
         return std::system(full.c_str());
     };
     { std::ofstream(log, std::ios::trunc) << "[serve] training '" << name << "' mode=" << mode
-        << " steps=" << steps << " seg=" << seg << "\n"; }
+        << (epochs > 0 ? " epochs=" + std::to_string(epochs) : " steps=" + std::to_string(steps))
+        << " seg=" << seg << "\n"; }
 
     set_stage("preprocessing");
     int rc = sh("'" + g.build + "/vc_preprocess' --input '" + dir + "/raw' --output-dir '" + clips +
@@ -214,9 +215,10 @@ void run_training(std::string name, std::string mode, int steps, int seg) {
     std::string t = "'" + g.build + "/vc_train'";
     if (mode == "gan") t += " --gan --dmodel '" + g.dmodel + "'";
     t += " --hubert '" + g.hubert + "' --rmvpe '" + g.rmvpe + "' --pretrained '" + g.gmodel +
-         "' --target '" + clips + "' --out '" + model + "' --steps " + std::to_string(steps) +
+         "' --target '" + clips + "' --out '" + model + "'" +
+         (epochs > 0 ? " --epochs " + std::to_string(epochs) : " --steps " + std::to_string(steps)) +
          " --seg " + std::to_string(seg) +
-         " 2>&1 | grep --line-buffered -E 'step|mel|Device|frames|Exported|clips|done|error|GAN'";
+         " 2>&1 | grep --line-buffered -E 'step|mel|Device|frames|Epochs|Exported|clips|done|error|GAN'";
     rc = sh(t);
     if (rc != 0) { finish("error", true); return; }
 
@@ -255,10 +257,12 @@ void handle_train(int fd, const Request& req) {
     std::string name = field(parts, "name", ""), mode = field(parts, "mode", "decoder");
     int steps = std::atoi(field(parts, "steps", "300").c_str());
     int seg = std::atoi(field(parts, "seg", "40").c_str());
+    int epochs = std::atoi(field(parts, "epochs", "0").c_str());
     if (!safe_name(name)) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"invalid voice name (letters, digits, _ or - only)\"}"); return; }
     if (mode != "decoder" && mode != "gan") mode = "decoder";
     steps = std::max(1, std::min(steps, 100000));
     seg = std::max(8, std::min(seg, 200));
+    epochs = std::max(0, std::min(epochs, 2000));
 
     std::string raw = g.runs + "/" + name + "/raw";
     fs::create_directories(raw);
@@ -272,7 +276,7 @@ void handle_train(int fd, const Request& req) {
 
     { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "queued"; g_job.done = false; g_job.error = false; }
     g_job.running = true;
-    std::thread(run_training, name, mode, steps, seg).detach();
+    std::thread(run_training, name, mode, steps, seg, epochs).detach();
     send_json(fd, "{\"job\":\"" + json_escape(name) + "\",\"files\":" + std::to_string(nfiles) + "}");
 }
 

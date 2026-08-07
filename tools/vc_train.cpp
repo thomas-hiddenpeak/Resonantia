@@ -86,6 +86,7 @@ void print_usage() {
         "  --dmodel <path>  Discriminator safetensors (default: f0D40k next to G)\n"
         "  --speaker <id>   Source speaker embedding id (default: 0)\n"
         "  --steps <n>      Training steps (default: 300)\n"
+        "  --epochs <n>     Passes over the dataset; overrides --steps (RVC-style, ~200)\n"
         "  --lr <f>         AdamW learning rate (default: 2e-4)\n"
         "  --seg <frames>   Training segment length in frames (default: 40)\n"
         "  --seed <n>       RNG seed (default: 0)\n"
@@ -96,7 +97,7 @@ void print_usage() {
 
 int main(int argc, char** argv) {
     std::string hubert_path, rmvpe_path, pretrained, target, out, dmodel;
-    int speaker = 0, steps = 300, seg = 40;
+    int speaker = 0, steps = 300, seg = 40, epochs = 0;
     unsigned seed = 0;
     float lr = 2e-4f;
     bool gan_mode = false;
@@ -114,6 +115,7 @@ int main(int argc, char** argv) {
         else if (a == "--out") out = next("--out");
         else if (a == "--speaker") speaker = std::atoi(next("--speaker"));
         else if (a == "--steps") steps = std::atoi(next("--steps"));
+        else if (a == "--epochs") epochs = std::atoi(next("--epochs"));
         else if (a == "--lr") lr = std::atof(next("--lr"));
         else if (a == "--seg") seg = std::atoi(next("--seg"));
         else if (a == "--seed") seed = static_cast<unsigned>(std::atoi(next("--seed")));
@@ -219,6 +221,16 @@ int main(int argc, char** argv) {
         std::cout << "  " << fs::path(f).filename().string() << ": " << p_len << " frames\n";
     }
     if (clips.empty()) { std::cerr << "error: no usable clips\n"; return 1; }
+
+    // Epoch = one pass over all segments; steps scale with the dataset size (RVC-style).
+    if (epochs > 0) {
+        long long total_frames = 0;
+        for (const auto& c : clips) total_frames += c.T;
+        int per_epoch = std::max<int>(1, static_cast<int>(total_frames / seg));
+        steps = std::max(1, epochs * per_epoch);
+        std::cout << "Epochs " << epochs << " x " << per_epoch << " seg/epoch ("
+                  << total_frames << " frames) -> " << steps << " steps\n";
+    }
 
     // Differentiable 40k log-mel loss.
     training::MelSpecConfig mcfg;

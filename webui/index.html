@@ -49,11 +49,24 @@
                             <label for="trainSeg">片段帧长</label>
                             <input type="number" id="trainSeg" value="40" min="8" max="200">
                         </div>
+                        <div class="param-group">
+                            <label for="trainEpochs">训练轮数 epochs（&gt;0 覆盖步数,随数据量自适应）</label>
+                            <input type="number" id="trainEpochs" value="0" min="0" max="2000">
+                        </div>
                     </details>
                 </section>
 
                 <section class="upload-section">
                     <h2>目标声线录音（可多选）</h2>
+                    <div class="param-group">
+                        <label for="recType">录音类型</label>
+                        <select id="recType">
+                            <option value="clean">干净人声（直接可用）</option>
+                            <option value="song">带伴奏的歌曲</option>
+                            <option value="reverb">有明显混响/回声</option>
+                        </select>
+                    </div>
+                    <p class="hint" id="recTypeHint"></p>
                     <div class="upload-area" id="trainUploadArea">
                         <div class="upload-icon">🎵</div>
                         <p>拖拽目标说话人音频到此，或点击选择（.wav/.flac，建议数分钟）</p>
@@ -105,6 +118,7 @@
                         <select id="convPreset"></select>
                     </div>
                     <p class="preset-desc" id="convPresetDesc"></p>
+                    <p class="param-summary" id="convParamSummary"></p>
                     <details class="advanced">
                         <summary>高级参数（可选,覆盖档位）</summary>
                         <div class="param-group">
