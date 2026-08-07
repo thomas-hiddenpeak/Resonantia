@@ -14,7 +14,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace voxmutatio::synthesizer {
@@ -34,16 +37,30 @@ constexpr int kGin = 256;
 constexpr float kLRelu = 0.1f;
 
 struct Weights {
-    io::SafetensorsLoader loader;
+    std::shared_ptr<io::SafetensorsLoader> loader;
     std::string prefix = "model.";
-    bool load(const std::string& p) { return loader.load(p); }
+    // Cache the mmap'd, header-parsed loader per path: repeated w.load() calls in
+    // debug_*/infer reuse it instead of re-mmapping+re-parsing 145MB each time.
+    bool load(const std::string& p) {
+        static std::mutex m;
+        static std::unordered_map<std::string, std::shared_ptr<io::SafetensorsLoader>> cache;
+        std::lock_guard<std::mutex> lk(m);
+        auto it = cache.find(p);
+        if (it == cache.end()) {
+            auto l = std::make_shared<io::SafetensorsLoader>();
+            if (!l->load(p)) return false;
+            it = cache.emplace(p, std::move(l)).first;
+        }
+        loader = it->second;
+        return true;
+    }
     const float* get(const std::string& n) const {
-        const uint8_t* p = loader.data(prefix + n);
+        const uint8_t* p = loader->data(prefix + n);
         if (!p) fprintf(stderr, "VITS: missing '%s'\n", (prefix + n).c_str());
         return reinterpret_cast<const float*>(p);
     }
     const io::Tensor* meta(const std::string& n) const {
-        return loader.get_tensor(prefix + n);
+        return loader->get_tensor(prefix + n);
     }
     bool has(const std::string& n) const { return meta(n) != nullptr; }
 };
