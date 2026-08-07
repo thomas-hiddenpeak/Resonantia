@@ -37,18 +37,25 @@
 - [ ] 相对位置注意力 → 由基元(linear+matmul+softmax+reshape)在 A3 组合
 - **门控 SC-001(基元全部)✅**
 
-### Phase A2: 优化器
-- [ ] AdamW(带 weight decay、bias correction、grad clip)
-- [ ] 凸问题收敛测试
-- **门控 SC-002**
+### Phase A2: 优化器 — ✅ 完成
+- [x] AdamW(decoupled weight decay、bias correction、per-param m/v RAII)
+- [x] 凸问题收敛测试(max|x-target| 1.2e-7)
+- **门控 SC-002✅**
 
-### Phase A3: 训练专用前向/反向组件
+> **可微分算子集 + mel 损失地基已完成(A0–A2 + mel):**
+> - 额外基元:transpose2d/concat_rows/slice_rows/embedding/scale/sqrt/log/abs/frame(均梯度检查)
+> - 可微 mel 损失(`training/mel_loss`):frame→DFT matmul→幅度→Slaney mel→log→L1
+> - 已证明:真实语音 mel 优化 loss 5.19→2.45(autograd+AdamW 端到端)
+> **剩余为“模型组装”:在已验证基元上搭生成器/训练循环。**
+
+### Phase A3: 训练专用前向/反向组件 — 进行中(模型组装)
+- [ ] 生成器(dec NSF-HiFiGAN)forward-on-autograd(加载预训练权重为参数)
 - [ ] PosteriorEncoder(enc_q):spec + WaveNet + 反向
 - [ ] MultiPeriodDiscriminator + MultiScaleDiscriminator:前向 + 反向
 - [ ] 梯度检查
 
-### Phase A4: 损失
-- [ ] mel L1(需可微 mel:STFT + mel 滤波前向/反向,或 GPU mel)
+### Phase A4: 损失 — mel 已完成
+- [x] mel L1(可微 STFT + Slaney mel + log,已验证驱动优化)
 - [ ] KL 散度(m_p/logs_p/m_q/logs_q)
 - [ ] feature-matching、adversarial(LSGAN)
 - [ ] 与 PyTorch 对拍一次

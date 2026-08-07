@@ -36,7 +36,7 @@
 | Spec | 主题 | 状态 |
 |------|------|------|
 | 001-voice-conversion-engine | 推理引擎(内容/F0/检索/合成/pipeline) | Complete(推理部分) |
-| 002-voice-training | 训练/微调:纯 C++/CUDA autograd(方案 A) · 40k · fine-tune | In Progress — A0/A1 完成(autograd + NN 算子反向,梯度检查通过) |
+| 002-voice-training | 训练/微调:纯 C++/CUDA autograd(方案 A) · 40k · fine-tune | In Progress — A0-A2+mel 完成(autograd 全算子/AdamW/可微 mel 损失,均已验证);剩余:生成器组装+训练循环+导出+e2e |
 | 003-webui(计划) | 面向普通用户的 WebUI:简单/高级双模式 | 未创建 |
 
 > 注:`001` 的 spec.md 已标 Complete 并附验证清单;其 `plan.md` 覆盖范围原本包含训练/WebUI(P6),但这两项实际未完成,已在下方"已知偏差"记录,并将拆分为独立 spec 002/003。
