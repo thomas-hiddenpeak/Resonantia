@@ -207,5 +207,47 @@ TEST_CASE("MelBand-RoFormer band-split aligns with reference", "[separation][rof
     double brel = rel_err(blk, bref);
     std::printf("[roformer] transformer (from ref band-split) rel error = %.3e\n", brel);
     CHECK(brel < 1e-3);
+
+    // Mask estimator: feed reference block-final -> mask [T,7916].
+    if (file_exists(fix + "rof_mask.bin")) {
+      auto mk = rof.debug_mask(bref, Tb);
+      auto mref = read_bin(fix + "rof_mask.bin");
+      REQUIRE(mk.size() == mref.size());
+      for (float v : mk) REQUIRE(std::isfinite(v));
+      double mrel = rel_err(mk, mref);
+      std::printf("[roformer] mask estimator (from ref) rel error = %.3e\n", mrel);
+      CHECK(mrel < 2e-3);
+
+      // Stage 4 isolation: reference mask + input -> apply/iSTFT -> output.
+      if (file_exists(fix + "rof_output_wave.bin")) {
+        auto ap = rof.debug_apply(mref, wave, L, Tb);
+        auto oref = read_bin(fix + "rof_output_wave.bin");
+        int Lo = std::min((int)(ap.size()/2), (int)(oref.size()/2));
+        double n = 0, d = 0;
+        for (int c = 0; c < 2; ++c)
+          for (int i = 2048; i < Lo - 2048; ++i) {
+            double e = ap[(size_t)c*(ap.size()/2)+i] - oref[(size_t)c*(oref.size()/2)+i];
+            n += e*e; d += (double)oref[(size_t)c*(oref.size()/2)+i]*oref[(size_t)c*(oref.size()/2)+i];
+          }
+        std::printf("[roformer] mask-apply/iSTFT (from ref mask) rel error = %.3e\n", std::sqrt(n/(d+1e-12)));
+        CHECK(std::sqrt(n/(d+1e-12)) < 1e-2);
+      }
+    }
+  }
+
+  // Full de-reverb forward: finite output; end-to-end vs torch on energy content.
+  if (file_exists(fix + "rof_output_wave.bin")) {
+    auto out = rof.separate_stereo(wave, L);
+    auto oref = read_bin(fix + "rof_output_wave.bin");
+    int Lout = std::min((int)(out.size() / 2), (int)(oref.size() / 2));
+    for (float v : out) REQUIRE(std::isfinite(v));
+    // energy-weighted rel error over both channels (ignore istft edge frames).
+    double n = 0, d = 0;
+    for (int c = 0; c < 2; ++c)
+      for (int i = 2048; i < Lout - 2048; ++i) {
+        double e = out[(size_t)c * (out.size()/2) + i] - oref[(size_t)c * (oref.size()/2) + i];
+        n += e * e; d += (double)oref[(size_t)c*(oref.size()/2)+i] * oref[(size_t)c*(oref.size()/2)+i];
+      }
+    std::printf("[roformer] end-to-end de-reverb rel error = %.3e (Lout=%d)\n", std::sqrt(n/(d+1e-12)), Lout);
   }
 }

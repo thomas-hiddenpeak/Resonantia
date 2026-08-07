@@ -114,6 +114,10 @@ __global__ void k_gelu(float* x, int n) {  // exact GELU (torch default erf form
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) { float v = x[i]; x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678f)); }
 }
+__global__ void k_tanh(float* x, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = tanhf(x[i]);
+}
 
 // qkv[B*S, 3*H*DH] -> q,k,v [B,H,S,DH]  (rearrange 'bs (qkv h d) -> qkv b h s d')
 __global__ void k_split_heads(const float* qkv, float* q, float* k, float* v,
@@ -189,6 +193,53 @@ __global__ void k_transpose12(const float* in, float* out, int A, int Bn, int D)
   if (idx >= A * Bn * D) return;
   int d = idx % D, b = (idx / D) % Bn, a = idx / (Bn * D);
   out[(static_cast<size_t>(b) * A + a) * D + d] = in[idx];
+}
+
+// extract band b: out[t, d] = blk[(t*NB + b)*D + d]
+__global__ void k_extract_band(const float* blk, float* out, int b, int NB, int T, int D) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= T * D) return;
+  int t = idx / D, d = idx % D;
+  out[idx] = blk[(static_cast<size_t>(t) * NB + b) * D + d];
+}
+// GLU + scatter: mask[t, off+d] = m2[t,d] * sigmoid(m2[t, din+d])  (band chunk in kBandIn)
+__global__ void k_glu_scatter(const float* m2, float* mask, int off, int din, int T) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= T * din) return;
+  int t = idx / din, d = idx % din;
+  float a = m2[static_cast<size_t>(t) * (2 * din) + d];
+  float g = m2[static_cast<size_t>(t) * (2 * din) + din + d];
+  mask[static_cast<size_t>(t) * kBandIn + off + d] = a * (1.0f / (1.0f + __expf(-g)));
+}
+// Scatter-add complex masks into merged freq (bands overlap): mask[t, k, c] with
+// feature k*2+c maps to merged freq fi[k]. summed[m, t] (re/im) accumulated.
+__global__ void k_scatter_mask(const float* mask, const int64_t* fi, float* sre,
+                               float* sim, int T) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= T * kFiLen) return;
+  int t = idx / kFiLen, k = idx % kFiLen;
+  int m = (int)fi[k];
+  float re = mask[static_cast<size_t>(t) * kBandIn + k * 2];
+  float im = mask[static_cast<size_t>(t) * kBandIn + k * 2 + 1];
+  atomicAdd(&sre[static_cast<size_t>(m) * T + t], re);
+  atomicAdd(&sim[static_cast<size_t>(m) * T + t], im);
+}
+// Average mask (/num_bands_per_freq), complex-multiply with stft, zero DC, split to
+// channel re/im. merged m=f*2+s, nbpf indexed by f. stft re/im [2,kNfreq,T].
+__global__ void k_apply_mask(const float* re, const float* im, const float* sre,
+                             const float* sim, const float* nbpf, float* ore,
+                             float* oim, int T) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= kMerged * T) return;
+  int t = idx % T, m = idx / T;
+  int s = m & 1, f = m >> 1;
+  float denom = fmaxf(nbpf[f], 1e-8f);
+  float mr = sre[idx] / denom, mi = sim[idx] / denom;
+  if (f == 0) { mr = 0.0f; mi = 0.0f; }  // zero DC
+  size_t src = (static_cast<size_t>(s) * kNfreq + f) * T + t;
+  float xr = re[src], xi = im[src];
+  ore[src] = xr * mr - xi * mi;
+  oim[src] = xr * mi + xi * mr;
 }
 
 std::vector<int64_t> read_i64(const std::string& path, int expect) {
@@ -415,6 +466,82 @@ struct Roformer::Impl {
     }
     CK(cudaDeviceSynchronize());
   }
+
+  // Mask estimator: per band MLP(256->1024->1024->din*2, Tanh) + GLU -> mask [T, kBandIn].
+  void mask_estimator(const CudaBuffer& blk, CudaBuffer& mask_out, int T) const {
+    mask_out.allocate(static_cast<size_t>(T) * kBandIn);
+    CudaBuffer bandin, h1, h2, m2;
+    for (int b = 0; b < kNbands; ++b) {
+      int din = dim_in[b];
+      bandin.allocate(static_cast<size_t>(T) * kDim);
+      k_extract_band<<<grid(T * kDim), 256>>>(blk.data(), bandin.data(), b, kNbands, T, kDim);
+      h1.allocate(static_cast<size_t>(T) * 1024);
+      gemm_rm(false, true, T, 1024, kDim, 1.0f, bandin.data(), mask[b].w0.data(), 0.0f, h1.data());
+      k_add_rowbias<<<grid(T * 1024), 256>>>(h1.data(), mask[b].b0.data(), T, 1024);
+      k_tanh<<<grid(T * 1024), 256>>>(h1.data(), T * 1024);
+      h2.allocate(static_cast<size_t>(T) * 1024);
+      gemm_rm(false, true, T, 1024, 1024, 1.0f, h1.data(), mask[b].w2.data(), 0.0f, h2.data());
+      k_add_rowbias<<<grid(T * 1024), 256>>>(h2.data(), mask[b].b2.data(), T, 1024);
+      k_tanh<<<grid(T * 1024), 256>>>(h2.data(), T * 1024);
+      m2.allocate(static_cast<size_t>(T) * din * 2);
+      gemm_rm(false, true, T, din * 2, 1024, 1.0f, h2.data(), mask[b].w4.data(), 0.0f, m2.data());
+      k_add_rowbias<<<grid(T * din * 2), 256>>>(m2.data(), mask[b].b4.data(), T, din * 2);
+      k_glu_scatter<<<grid(T * din), 256>>>(m2.data(), mask_out.data(), off_in[b], din, T);
+    }
+    CK(cudaDeviceSynchronize());
+  }
+
+  // Full forward: stereo planar [2,L] -> stem planar [2,L].
+  std::vector<float> forward(const std::vector<float>& stereo, int L) const {
+    int T = 0;
+    CudaBuffer d_re, d_im;
+    stft_stereo(stereo, L, d_re, d_im, T);
+    CudaBuffer x;
+    band_split(stereo, L, x, T);
+    blocks_forward(x, T);
+    CudaBuffer mask_out;
+    mask_estimator(x, mask_out, T);
+    return apply_mask(mask_out, d_re, d_im, T, L);
+  }
+
+  // Stage 4: scatter-average complex mask, multiply STFT, zero DC, iSTFT per channel.
+  std::vector<float> apply_mask(const CudaBuffer& mask_out, const CudaBuffer& d_re,
+                                const CudaBuffer& d_im, int T, int L) const {
+    CudaBuffer d_fi;
+    d_fi.copy_from_host(reinterpret_cast<const float*>(freq_indices.data()), freq_indices.size() * 2);
+    CudaBuffer sre, sim, ore, oim;
+    sre.allocate(static_cast<size_t>(kMerged) * T); sre.zero();
+    sim.allocate(static_cast<size_t>(kMerged) * T); sim.zero();
+    ore.allocate(static_cast<size_t>(2) * kNfreq * T);
+    oim.allocate(static_cast<size_t>(2) * kNfreq * T);
+    k_scatter_mask<<<grid(T * kFiLen), 256>>>(mask_out.data(),
+        reinterpret_cast<const int64_t*>(d_fi.data()), sre.data(), sim.data(), T);
+    k_apply_mask<<<grid(kMerged * T), 256>>>(d_re.data(), d_im.data(), sre.data(), sim.data(),
+        d_num_bands_per_freq.data(), ore.data(), oim.data(), T);
+    CK(cudaDeviceSynchronize());
+
+    std::vector<float> hre(static_cast<size_t>(2) * kNfreq * T), him(hre.size());
+    ore.copy_to_host(hre.data(), hre.size());
+    oim.copy_to_host(him.data(), him.size());
+    std::vector<float> out(static_cast<size_t>(2) * L, 0.0f);
+    for (int c = 0; c < 2; ++c) {
+      std::vector<float> cre(hre.begin() + static_cast<size_t>(c) * kNfreq * T,
+                             hre.begin() + static_cast<size_t>(c + 1) * kNfreq * T);
+      std::vector<float> cim(him.begin() + static_cast<size_t>(c) * kNfreq * T,
+                             him.begin() + static_cast<size_t>(c + 1) * kNfreq * T);
+      auto ch = stft.inverse(cre, cim, T, L);
+      for (int i = 0; i < L && i < (int)ch.size(); ++i) out[static_cast<size_t>(c) * L + i] = ch[i];
+    }
+    return out;
+  }
+
+  std::vector<float> apply_from_host_mask(const std::vector<float>& mask_host,
+                                          const std::vector<float>& stereo, int L, int T) const {
+    CudaBuffer d_re, d_im; int Ts = 0;
+    stft_stereo(stereo, L, d_re, d_im, Ts);
+    CudaBuffer mask_out; mask_out.copy_from_host(mask_host.data(), mask_host.size());
+    return apply_mask(mask_out, d_re, d_im, T, L);
+  }
 };
 
 Roformer::Roformer(const std::string& dir, const std::string& model)
@@ -463,8 +590,35 @@ std::vector<float> Roformer::debug_blocks_from(const std::vector<float>& bandspl
   x.copy_to_host(h.data(), h.size());
   return h;
 }
-std::vector<float> Roformer::debug_mask(const std::vector<float>&, int, int& T) const { T = 0; return {}; }
-std::vector<float> Roformer::separate_stereo(const std::vector<float>&, int) const { return {}; }
-std::vector<float> Roformer::separate_mono(const float*, int, int) const { return {}; }
+std::vector<float> Roformer::debug_mask(const std::vector<float>& blk_ref, int T) const {
+  CudaBuffer x, mask_out;
+  x.copy_from_host(blk_ref.data(), blk_ref.size());
+  p_->mask_estimator(x, mask_out, T);
+  std::vector<float> h(static_cast<size_t>(T) * kBandIn);
+  mask_out.copy_to_host(h.data(), h.size());
+  return h;
+}
+
+std::vector<float> Roformer::separate_stereo(const std::vector<float>& stereo, int L) const {
+  return p_->forward(stereo, L);
+}
+
+std::vector<float> Roformer::debug_apply(const std::vector<float>& mask,
+                                         const std::vector<float>& stereo, int L, int T) const {
+  return p_->apply_from_host_mask(mask, stereo, L, T);
+}
+
+std::vector<float> Roformer::separate_mono(const float* audio, int L, int sr) const {
+  auto r = (sr == kSr) ? std::vector<float>(audio, audio + L)
+                       : io::resample_linear(audio, L, sr, kSr);
+  int L44 = static_cast<int>(r.size());
+  std::vector<float> stereo(static_cast<size_t>(2) * L44);
+  for (int i = 0; i < L44; ++i) { stereo[i] = r[i]; stereo[L44 + i] = r[i]; }
+  auto st = p_->forward(stereo, L44);
+  std::vector<float> mono(L44);
+  for (int i = 0; i < L44; ++i) mono[i] = 0.5f * (st[i] + st[L44 + i]);
+  if (sr == kSr) return mono;
+  return io::resample_linear(mono.data(), L44, kSr, sr);
+}
 
 }  // namespace voxmutatio::separation
