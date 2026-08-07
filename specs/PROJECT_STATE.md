@@ -54,17 +54,24 @@
 
 ---
 
-## 下一步(优先级,2026-08-07 调整后)
+## 下一步(优先级,2026-08-08 调整后)
 
-- **P0 音频前处理(完整功能,纯 C++/CUDA)**:✅ 人声分离已完成(Open-Unmix `umxhq` 纯 C++/CUDA runner,
-  对齐 model 1.6e-6 / 端到端 1.5e-6;接入 `vc_preprocess --separate` + WebUI)。去混响 / 去和声
-  待做(MelBand-RoFormer,同 STFT 前端,spec 004 S6)。见 `specs/004-source-separation/`。
-- **P0 性能**:✅ 完成。conv1d/conv2d 改 im2col+cuBLAS(先剖析:判别器 conv2d 占 GAN 步 99%),
-  完整 GAN 步 ~52s→~2s(约 25×,hq 2800 步 ~40h→~1.5h);`compute_spec` host DFT→GPU cuFFT STFT
-  (对齐 1.44e-7);Synthesizer 权重缓存。全部数值一致,15/15 测试通过。
-- **P1 实时转换(下一个里程碑,暂不建 spec)**:麦克风采集(getUserMedia/AudioWorklet)→
-  vc_serve WebSocket → 流式转换(复用 `synthesizer::infer_stream` 的 skip/return 窗口)→
-  扬声器回放,目标低延迟(对标 RVC 90-170ms)。
+> **人类测试门槛(用户声明)**:人类测试仅在**项目全部目标达成后**进行。分离子项
+> (去混响 / 去和声)与实时转换均为**必须完成项**,不得延后到人类测试之后。
+
+- **P0 音频前处理(分离,纯 C++/CUDA)** — 部分完成,剩余为人类测试门槛项:
+  - ✅ **人声分离**:Open-Unmix `umxhq` 纯 C++/CUDA runner,对齐 model 1.6e-6 / 端到端 1.5e-6;
+    接入 `vc_preprocess --separate` + WebUI。
+  - ❌ **去混响** 与 ❌ **去和声(卡拉 OK)**:目标 MelBand-RoFormer(同 STFT 前端,一套
+    runner 换权重)。已摸底真实 checkpoint 架构(dim256/depth6/60 频带/RoPE 门控注意力/
+    hyper-connections,~896 张量);属纯 CUDA 重实现完整 Transformer,为剩余最大工程,
+    需先锁定与权重匹配的 bs-roformer 版本参考再分阶段对齐(spec 004 S6)。
+- **P0 性能** — ✅ 完成。conv1d/conv2d im2col+cuBLAS(先剖析:判别器 conv2d 占 GAN 步 99%)+
+  im2col 显存池(消除每-conv cudaMalloc/Free);完整 GAN 步 ~52s→~1.3s(约 40×,hq 2800 步
+  ~40h→~1h);`compute_spec` host DFT→GPU cuFFT STFT(对齐 1.44e-7)。全部数值一致,15/15 通过。
+  进一步杆杆(未做):多段 batch(吸吐最大,改变动态)、TF32(弃用:威胁解码器对齐 0.9997)。
+- **P0 实时转换(人类测试门槛项)**:麦克风采集(getUserMedia/AudioWorklet)→ vc_serve
+  WebSocket → 流式转换(复用 `synthesizer::infer_stream` skip/return 窗)→ 回放,低延迟(对标 RVC 90-170ms)。
 - **P2 产品闭环**:spec 002 训练(解码器+GAN 已完成);spec 003 WebUI(编排全流程已完成)。
 - **P3 代码硬化**:CudaBuffer RAII + 显存池;内核错误检查;方法命名决策。
 
