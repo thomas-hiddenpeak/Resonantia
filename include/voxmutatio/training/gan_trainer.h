@@ -15,6 +15,7 @@
 #include "voxmutatio/training/discriminator.h"
 #include "voxmutatio/training/generator_trainer.h"
 #include "voxmutatio/training/mel_loss.h"
+#include "voxmutatio/training/posterior_encoder.h"
 
 namespace voxmutatio::training {
 
@@ -24,12 +25,19 @@ class GANTrainer {
             int speaker_id, const MelSpecConfig& mel_cfg,
             float g_lr = 1e-4f, float d_lr = 1e-4f);
 
-  struct Losses { float d, g, mel, fm, adv; };
+  struct Losses { float d, g, mel, fm, adv, kl; };
 
-  /// One alternating D-then-G update on a segment.
-  /// z[192,T], har[1,L], target[1,L] (real 40k), L = T*upp.
+  /// Decoder-only GAN (frozen posterior z): z[192,T], har[1,L], target[1,L].
   Losses train_step(const std::vector<float>& z, const std::vector<float>& har,
                     const std::vector<float>& target, int T, int L);
+
+  /// Full GAN: enc_q(spec) -> z_q -> {flow -> z_p (KL), dec -> y_hat}.
+  /// spec[n_spec*T], har[1,L], target[1,L], m_p/logs_p[192*T] (prior consts).
+  Losses train_step_full(const std::vector<float>& spec,
+                         const std::vector<float>& har,
+                         const std::vector<float>& target,
+                         const std::vector<float>& m_p,
+                         const std::vector<float>& logs_p, int T, int L);
 
   bool export_model(const std::string& src, const std::string& out) {
     return gen_.export_model(src, out);
@@ -38,10 +46,13 @@ class GANTrainer {
 
  private:
   GeneratorTrainer gen_;
+  PosteriorEncoder enc_q_;
+  Flow flow_;
   Discriminator disc_;
   std::unique_ptr<MelLoss> mel_;
   std::unique_ptr<autograd::AdamW> g_opt_, d_opt_;
   int n_mels_ = 80;
+  int n_spec_ = 1025;
 };
 
 }  // namespace voxmutatio::training

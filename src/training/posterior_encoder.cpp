@@ -170,7 +170,7 @@ ag::Tensor PosteriorEncoder::forward(const ag::Tensor& spec, int T, bool sample,
   logs_q = ag::slice_rows(stats, kInter, kInter, T);
   if (!sample) return m_q;
 
-  std::mt19937 rng(1234);
+  static std::mt19937 rng(12345);
   std::normal_distribution<float> nd(0.0f, 1.0f);
   std::vector<float> eps(static_cast<std::size_t>(kInter) * T);
   for (auto& e : eps) e = nd(rng);

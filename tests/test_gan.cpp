@@ -226,3 +226,67 @@ TEST_CASE("Flow forward inverts inference flow_reverse", "[gan][flow]") {
   // flow.forward must be the exact inverse of flow_reverse.
   CHECK(rel < 1e-3);
 }
+
+TEST_CASE("Full GAN step (enc_q + flow + KL + disc) on real audio", "[gan][full]") {
+  using namespace voxmutatio;
+
+  auto nsff0 = load_bin("../tests/fixtures/vits_ref_nsff0.bin");
+  auto m_p = load_bin("../tests/fixtures/vits_ref_m_p.bin");
+  auto logs_p = load_bin("../tests/fixtures/vits_ref_logs_p.bin");
+  REQUIRE(nsff0.ok); REQUIRE(m_p.ok); REQUIRE(logs_p.ok);
+  int Tfull = nsff0.shape[0];
+  REQUIRE(m_p.shape[0] == 192);
+
+  std::string g_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+  std::string d_path = "../models/pretrained_v2/pretrained_v2/f0D40k.safetensors";
+
+  synthesizer::SynthesizerConfig scfg;
+  scfg.model_path = g_path; scfg.version = ModelVersion::kV2;
+  scfg.sample_rate = 40000; scfg.spk_embed_dim = 109;
+  synthesizer::Synthesizer synth; REQUIRE(synth.init(scfg));
+  auto har_full = synth.debug_har(nsff0.data.data(), Tfull);
+
+  auto a40 = io::read_audio("../tests/fixtures/speech_librispeech.wav", 40000);
+  REQUIRE(a40.has_value());
+
+  const int Tseg = 64, Lseg = Tseg * 400;
+  REQUIRE(static_cast<int>(a40->data.size()) >= Lseg);
+  std::vector<float> target(a40->data.begin(), a40->data.begin() + Lseg);
+  std::vector<float> har_seg(har_full.begin(), har_full.begin() + Lseg);
+
+  int Tspec = 0;
+  auto spec = training::compute_spec(target.data(), Lseg, 2048, 400, Tspec);
+  REQUIRE(Tspec == Tseg);
+
+  // Prior stats (enc_p output) sliced to the segment.
+  std::vector<float> mp_seg(192 * Tseg), lsp_seg(192 * Tseg);
+  for (int c = 0; c < 192; ++c)
+    for (int t = 0; t < Tseg; ++t) {
+      mp_seg[c * Tseg + t] = m_p.data[c * Tfull + t];
+      lsp_seg[c * Tseg + t] = logs_p.data[c * Tfull + t];
+    }
+
+  training::MelSpecConfig mcfg;
+  mcfg.n_fft = 1024; mcfg.hop = 256; mcfg.n_mels = 80; mcfg.sample_rate = 40000;
+
+  training::GANTrainer gan;
+  REQUIRE(gan.init(g_path, d_path, 0, mcfg, 1e-4f, 1e-4f));
+
+  float first_mel = 0.0f, last_mel = 0.0f;
+  const int steps = 6;
+  for (int it = 0; it < steps; ++it) {
+    auto ls = gan.train_step_full(spec, har_seg, target, mp_seg, lsp_seg, Tseg, Lseg);
+    if (it == 0) first_mel = ls.mel;
+    last_mel = ls.mel;
+    std::printf("[gan-full] step %d  D=%.3f G=%.3f (mel=%.4f kl=%.4f fm=%.4f adv=%.4f)\n",
+                it + 1, ls.d, ls.g, ls.mel, ls.kl, ls.fm, ls.adv);
+    REQUIRE(std::isfinite(ls.d));
+    REQUIRE(std::isfinite(ls.g));
+    REQUIRE(std::isfinite(ls.mel));
+    REQUIRE(std::isfinite(ls.kl));
+    REQUIRE(std::isfinite(ls.fm));
+  }
+  std::printf("[gan-full] mel %.4f -> %.4f\n", first_mel, last_mel);
+  // Full posterior-path GAN must stay finite and reduce reconstruction.
+  CHECK(last_mel < first_mel);
+}
