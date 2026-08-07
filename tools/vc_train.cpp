@@ -32,8 +32,10 @@
 #include "voxmutatio/f0/rmvpe.h"
 #include "voxmutatio/io/audio_io.h"
 #include "voxmutatio/synthesizer/synthesizer.h"
+#include "voxmutatio/training/gan_trainer.h"
 #include "voxmutatio/training/generator_trainer.h"
 #include "voxmutatio/training/mel_loss.h"
+#include "voxmutatio/training/posterior_encoder.h"
 
 using namespace voxmutatio;
 namespace ag = voxmutatio::autograd;
@@ -68,6 +70,9 @@ struct Clip {
     std::vector<float> z;    // [192, T]
     std::vector<float> har;  // [T*400]
     std::vector<float> tgt;  // [T*400]
+    std::vector<float> spec;    // [1025, T] (GAN: enc_q input)
+    std::vector<float> m_p;     // [192, T]  (GAN: prior mean)
+    std::vector<float> logs_p;  // [192, T]  (GAN: prior log-std)
     int T = 0;
 };
 
@@ -77,6 +82,8 @@ void print_usage() {
         "  vc_train --hubert <dir> --rmvpe <path> --pretrained <G.safetensors>\n"
         "           --target <wav|dir> --out <G_finetuned.safetensors> [options]\n\n"
         "Options:\n"
+        "  --gan            Full GAN fine-tune (enc_q+flow+dec vs discriminator)\n"
+        "  --dmodel <path>  Discriminator safetensors (default: f0D40k next to G)\n"
         "  --speaker <id>   Source speaker embedding id (default: 0)\n"
         "  --steps <n>      Training steps (default: 300)\n"
         "  --lr <f>         AdamW learning rate (default: 2e-4)\n"
@@ -88,15 +95,18 @@ void print_usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string hubert_path, rmvpe_path, pretrained, target, out;
+    std::string hubert_path, rmvpe_path, pretrained, target, out, dmodel;
     int speaker = 0, steps = 300, seg = 40;
     unsigned seed = 0;
     float lr = 2e-4f;
+    bool gan_mode = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&](const char* n) { return (i + 1 < argc) ? argv[++i] : (std::cerr << "missing value for " << n << "\n", ""); };
         if (a == "--help" || a == "-h") { print_usage(); return 0; }
+        else if (a == "--gan") { gan_mode = true; continue; }
+        else if (a == "--dmodel") dmodel = next("--dmodel");
         else if (a == "--hubert") hubert_path = next("--hubert");
         else if (a == "--rmvpe") rmvpe_path = next("--rmvpe");
         else if (a == "--pretrained") pretrained = next("--pretrained");
@@ -194,6 +204,17 @@ int main(int argc, char** argv) {
         int copyn = std::min<int>(t40.size(), p_len * kUpp);
         std::copy(t40.begin(), t40.begin() + copyn, c.tgt.begin());
 
+        if (gan_mode) {
+            int Ts = 0;
+            c.spec = training::compute_spec(c.tgt.data(), p_len * kUpp, 2048, kUpp, Ts);
+            auto mp_lsp = synth.debug_encp(feats_up.data(), p_len, coarse.data(), true);
+            if (Ts != p_len || static_cast<int>(mp_lsp.size()) != 2 * 192 * p_len) {
+                std::cerr << "skip (gan feats): " << f << "\n"; continue;
+            }
+            c.m_p.assign(mp_lsp.begin(), mp_lsp.begin() + 192 * p_len);
+            c.logs_p.assign(mp_lsp.begin() + 192 * p_len, mp_lsp.end());
+        }
+
         clips.push_back(std::move(c));
         std::cout << "  " << fs::path(f).filename().string() << ": " << p_len << " frames\n";
     }
@@ -204,10 +225,49 @@ int main(int argc, char** argv) {
     mcfg.n_fft = 1024; mcfg.hop = 256; mcfg.n_mels = 80; mcfg.sample_rate = 40000;
     training::MelLoss mel(mcfg);
 
-    ag::AdamW opt(trainer.params(), lr);
     std::mt19937 rng(seed);
     const int Lseg = seg * kUpp;
 
+    if (gan_mode) {
+        if (dmodel.empty())
+            dmodel = (fs::path(pretrained).parent_path() / "f0D40k.safetensors").string();
+        training::GANTrainer gan;
+        if (!gan.init(pretrained, dmodel, speaker, mcfg, lr, lr)) {
+            std::cerr << "error: GAN init failed (need " << dmodel << ")\n"; return 1;
+        }
+        std::cout << "GAN fine-tune: steps=" << steps << " seg=" << seg << " lr=" << lr << "\n";
+        float first = -1.0f, last = 0.0f;
+        for (int it = 0; it < steps; ++it) {
+            const Clip& c = clips[rng() % clips.size()];
+            int maxs = c.T - seg;
+            int s = (maxs > 0) ? static_cast<int>(rng() % (maxs + 1)) : 0;
+            std::vector<float> spec_seg(1025 * seg), mp_seg(192 * seg), lsp_seg(192 * seg),
+                har_seg(Lseg), tgt_seg(Lseg);
+            for (int k = 0; k < 1025; ++k)
+                for (int t = 0; t < seg; ++t) spec_seg[k * seg + t] = c.spec[k * c.T + (s + t)];
+            for (int k = 0; k < 192; ++k)
+                for (int t = 0; t < seg; ++t) {
+                    mp_seg[k * seg + t] = c.m_p[k * c.T + (s + t)];
+                    lsp_seg[k * seg + t] = c.logs_p[k * c.T + (s + t)];
+                }
+            std::copy(c.har.begin() + static_cast<size_t>(s) * kUpp,
+                      c.har.begin() + static_cast<size_t>(s + seg) * kUpp, har_seg.begin());
+            std::copy(c.tgt.begin() + static_cast<size_t>(s) * kUpp,
+                      c.tgt.begin() + static_cast<size_t>(s + seg) * kUpp, tgt_seg.begin());
+            auto ls = gan.train_step_full(spec_seg, har_seg, tgt_seg, mp_seg, lsp_seg, seg, Lseg);
+            if (first < 0.0f) first = ls.mel;
+            last = ls.mel;
+            if ((it + 1) % 10 == 0 || it == 0)
+                std::printf("  step %4d/%d  D=%.3f G=%.3f (mel=%.4f kl=%.4f fm=%.4f adv=%.4f)\n",
+                            it + 1, steps, ls.d, ls.g, ls.mel, ls.kl, ls.fm, ls.adv);
+        }
+        std::printf("GAN fine-tune done: mel %.4f -> %.4f\n", first, last);
+        if (!gan.export_model(pretrained, out)) { std::cerr << "error: export failed\n"; return 1; }
+        std::cout << "Exported fine-tuned model: " << out << "\n";
+        return 0;
+    }
+
+    ag::AdamW opt(trainer.params(), lr);
     std::cout << "Fine-tuning decoder: steps=" << steps << " seg=" << seg
               << " lr=" << lr << "\n";
     float running = 0.0f; int rn = 0; float first = -1.0f, last = 0.0f;
