@@ -49,6 +49,29 @@ void gemm_rm(bool tA, bool tB, int M, int N, int K, float alpha,
               N, M, K, &alpha, B, ldb, A, lda, &beta, C, N);
 }
 
+// Strided-batched row-major C[b][M,N] = alpha*op(A)[M,K] @ op(B)[K,N].
+void gemm_batched(bool tA, bool tB, int M, int N, int K, float alpha,
+                  const float* A, long sA, const float* B, long sB,
+                  float beta, float* C, long sC, int batch) {
+  int lda = tA ? M : K, ldb = tB ? K : N;
+  cublasSgemmStridedBatched(cublas(), tB ? CUBLAS_OP_T : CUBLAS_OP_N,
+      tA ? CUBLAS_OP_T : CUBLAS_OP_N, N, M, K, &alpha, B, ldb, sB, A, lda, sA,
+      &beta, C, N, sC, batch);
+}
+
+// Softmax over the last dim (width W) of rows x W matrix, in place.
+__global__ void k_softmax_rows(float* x, int rows, int W) {
+  int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  float* row = x + static_cast<size_t>(r) * W;
+  float m = -1e30f;
+  for (int j = 0; j < W; ++j) m = fmaxf(m, row[j]);
+  float s = 0.0f;
+  for (int j = 0; j < W; ++j) { float e = __expf(row[j] - m); row[j] = e; s += e; }
+  float inv = 1.0f / s;
+  for (int j = 0; j < W; ++j) row[j] *= inv;
+}
+
 // MelBand-RoFormer dimensions are config-driven (read from roformer_config.i64):
 // n_fft, hop, dim, depth, num_bands, heads, dim_head, mask_depth, ff_mult, sr.
 // Attention head dim is capped at 64 (k_attention accumulator).
@@ -146,32 +169,7 @@ __global__ void k_rope(float* x, const float* freqs, int B, int H, int S, int DH
   x[base + 1] = x1 * c + x0 * sn;
 }
 // Attention (online softmax) q,k,v [B,H,S,DH] -> out [B,H,S,DH]; scale = 1/sqrt(DH).
-__global__ void k_attention(const float* q, const float* k, const float* v, float* out,
-                            int B, int H, int S, int DH, float scale) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;  // (b,h,i)
-  if (idx >= B * H * S) return;
-  const float* qi = q + static_cast<size_t>(idx) * DH;
-  size_t bh = idx / S;  // (b*H+h)
-  const float* kb = k + bh * S * DH;
-  const float* vb = v + bh * S * DH;
-  float acc[64];
-  for (int d = 0; d < DH; ++d) acc[d] = 0.0f;
-  float m = -1e30f, l = 0.0f;
-  for (int j = 0; j < S; ++j) {
-    const float* kj = kb + static_cast<size_t>(j) * DH;
-    float s = 0.0f;
-    for (int d = 0; d < DH; ++d) s += qi[d] * kj[d];
-    s *= scale;
-    float mn = fmaxf(m, s), corr = __expf(m - mn), p = __expf(s - mn);
-    l = l * corr + p;
-    const float* vj = vb + static_cast<size_t>(j) * DH;
-    for (int d = 0; d < DH; ++d) acc[d] = acc[d] * corr + p * vj[d];
-    m = mn;
-  }
-  float* o = out + static_cast<size_t>(idx) * DH;
-  float inv = 1.0f / l;
-  for (int d = 0; d < DH; ++d) o[d] = acc[d] * inv;
-}
+// (Replaced by cuBLAS strided-batched GEMM + k_softmax_rows in transformer().)
 // merge heads [B,H,S,DH] -> [B*S, H*DH]
 __global__ void k_merge_heads(const float* in, float* out, int B, int S, int H, int DH) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -446,9 +444,15 @@ struct Roformer::Impl {
     int rope_n = B * H * S * (DH / 2);
     k_rope<<<grid(rope_n), 256>>>(q.data(), bl.attn.rope_freqs.data(), B, H, S, DH);
     k_rope<<<grid(rope_n), 256>>>(k.data(), bl.attn.rope_freqs.data(), B, H, S, DH);
+    // Attention via batched GEMM: scores = softmax(Q K^T / sqrt(DH)); out = scores V.
+    CudaBuffer scores; scores.allocate(static_cast<size_t>(B) * H * S * S);
+    gemm_batched(false, true, S, S, DH, 1.0f / sqrtf((float)DH),
+                 q.data(), (long)S * DH, k.data(), (long)S * DH, 0.0f,
+                 scores.data(), (long)S * S, B * H);
+    k_softmax_rows<<<grid(B * H * S), 256>>>(scores.data(), B * H * S, S);
     CudaBuffer ao; ao.allocate(q.size());
-    k_attention<<<grid(B * H * S), 256>>>(q.data(), k.data(), v.data(), ao.data(),
-        B, H, S, DH, 1.0f / sqrtf((float)DH));
+    gemm_batched(false, false, S, DH, S, 1.0f, scores.data(), (long)S * S,
+                 v.data(), (long)S * DH, 0.0f, ao.data(), (long)S * DH, B * H);
     CudaBuffer mo; mo.allocate(q.size());
     k_merge_heads<<<grid(BS * IN), 256>>>(ao.data(), mo.data(), B, S, H, DH);
     CudaBuffer gates; gates.allocate(static_cast<size_t>(BS) * H);
