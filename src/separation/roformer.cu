@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -277,6 +278,7 @@ struct Roformer::Impl {
   int nfft = 2048, hop = 512, nfreq = 1025, merged = 2050;
   int dim = 256, depth = 6, num_bands = 60, heads = 8, dim_head = 64, inner = 512;
   int ff_hidden = 1024, mask_depth = 2, sr = 44100, fi_len = 0, band_in = 0;
+  int chunk_size = 0;  // long-audio chunk (samples); 0 -> process whole input
   std::unique_ptr<Stft> stft;
   // band split
   std::vector<CudaBuffer> bs_gamma, bs_w, bs_b;
@@ -306,6 +308,7 @@ struct Roformer::Impl {
     num_bands = (int)cfg[4]; heads = (int)cfg[5]; dim_head = (int)cfg[6];
     mask_depth = (int)cfg[7]; ff_hidden = dim * (int)cfg[8];
     sr = cfg.size() > 9 ? (int)cfg[9] : 44100;
+    chunk_size = cfg.size() > 10 ? (int)cfg[10] : 0;
     nfreq = nfft / 2 + 1; merged = nfreq * 2; inner = heads * dim_head;
     if (dim_head > kMaxDhead) { fprintf(stderr, "roformer: dim_head %d > %d unsupported\n", dim_head, kMaxDhead); return; }
     stft = std::make_unique<Stft>(nfft, hop);
@@ -524,6 +527,31 @@ struct Roformer::Impl {
     return apply_mask(mask_out, d_re, d_im, T, L);
   }
 
+  // Chunked overlap-add for long audio (time attention is O(T^2)): 50% Hann
+  // overlap, normalize by window sum so single-cover regions recover exactly.
+  std::vector<float> forward_chunked(const std::vector<float>& stereo, int L) const {
+    if (chunk_size <= 0 || L <= chunk_size) return forward(stereo, L);
+    const int cs = chunk_size, hop = cs / 2;
+    std::vector<float> win(cs);
+    for (int i = 0; i < cs; ++i) win[i] = 0.5f - 0.5f * std::cos(2.0 * M_PI * i / cs);
+    std::vector<float> out(static_cast<size_t>(2) * L, 0.0f), wsum(L, 0.0f);
+    std::vector<float> chunk(static_cast<size_t>(2) * cs);
+    for (int start = 0; start < L; start += hop) {
+      int len = std::min(cs, L - start);
+      std::fill(chunk.begin(), chunk.end(), 0.0f);
+      for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < len; ++i) chunk[static_cast<size_t>(c) * cs + i] = stereo[static_cast<size_t>(c) * L + start + i];
+      auto y = forward(chunk, cs);
+      for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < len; ++i) out[static_cast<size_t>(c) * L + start + i] += y[static_cast<size_t>(c) * cs + i] * win[i];
+      for (int i = 0; i < len; ++i) wsum[start + i] += win[i];
+      if (start + cs >= L) break;
+    }
+    for (int c = 0; c < 2; ++c)
+      for (int i = 0; i < L; ++i) out[static_cast<size_t>(c) * L + i] /= std::max(wsum[i], 1e-6f);
+    return out;
+  }
+
   // Stage 4: scatter-average complex mask, multiply STFT, zero DC, iSTFT per channel.
   std::vector<float> apply_mask(const CudaBuffer& mask_out, const CudaBuffer& d_re,
                                 const CudaBuffer& d_im, int T, int L) const {
@@ -620,7 +648,7 @@ std::vector<float> Roformer::debug_mask(const std::vector<float>& blk_ref, int T
 }
 
 std::vector<float> Roformer::separate_stereo(const std::vector<float>& stereo, int L) const {
-  return p_->forward(stereo, L);
+  return p_->forward_chunked(stereo, L);
 }
 
 std::vector<float> Roformer::debug_apply(const std::vector<float>& mask,
@@ -635,7 +663,7 @@ std::vector<float> Roformer::separate_mono(const float* audio, int L, int sr) co
   int L44 = static_cast<int>(r.size());
   std::vector<float> stereo(static_cast<size_t>(2) * L44);
   for (int i = 0; i < L44; ++i) { stereo[i] = r[i]; stereo[L44 + i] = r[i]; }
-  auto st = p_->forward(stereo, L44);
+  auto st = p_->forward_chunked(stereo, L44);
   std::vector<float> mono(L44);
   for (int i = 0; i < L44; ++i) mono[i] = 0.5f * (st[i] + st[L44 + i]);
   if (sr == msr) return mono;

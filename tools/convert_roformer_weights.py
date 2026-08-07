@@ -107,11 +107,13 @@ def main():
     fi.tofile(os.path.join(MODELS, f"{name}_freq_indices.i64"))
     nbpf.tofile(os.path.join(MODELS, f"{name}_num_bands_per_freq.i64"))
     np.asarray(dim_inputs, dtype=np.int64).tofile(os.path.join(MODELS, f"{name}_dim_inputs.i64"))
-    # Runtime config for the C++ runner: [nfft,hop,dim,depth,num_bands,heads,dim_head,mask_depth,ff_mult,sr]
+    # Runtime config for the C++ runner: [nfft,hop,dim,depth,num_bands,heads,dim_head,mask_depth,ff_mult,sr,chunk_size]
     ff_mult = int(cfg["model"].get("mlp_expansion_factor", 4))
+    chunk_size = int(cfg.get("audio", {}).get("chunk_size", mcfg["sample_rate"] * 8))
     cfg_i64 = np.asarray([mcfg["stft_n_fft"], mcfg["stft_hop_length"], mcfg["dim"],
                           mcfg["depth"], mcfg["num_bands"], mcfg["heads"], mcfg["dim_head"],
-                          mcfg["mask_estimator_depth"], ff_mult, mcfg["sample_rate"]], dtype=np.int64)
+                          mcfg["mask_estimator_depth"], ff_mult, mcfg["sample_rate"],
+                          chunk_size], dtype=np.int64)
     cfg_i64.tofile(os.path.join(MODELS, f"{name}_config.i64"))
     print(f"band map: freq_indices={fi.size}, bands={len(dim_inputs)}, "
           f"sum dim_inputs={sum(dim_inputs)}")
