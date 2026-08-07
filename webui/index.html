@@ -3,117 +3,138 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Resonantia - Voice Conversion</title>
+    <title>Resonantia — 声线训练与语音转换</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <div class="container">
         <header>
             <h1>🎙️ Resonantia</h1>
-            <p class="subtitle">High-Performance Voice Conversion Engine</p>
+            <p class="subtitle">纯 C++/CUDA 声线训练与语音转换引擎</p>
         </header>
 
+        <nav class="tabs">
+            <button class="tab-btn active" data-tab="train">① 训练声线</button>
+            <button class="tab-btn" data-tab="convert">② 语音转换</button>
+        </nav>
+
         <main>
-            <!-- 文件上传区域 -->
-            <section class="upload-section">
-                <h2>音频上传</h2>
-                <div class="upload-area" id="uploadArea">
-                    <div class="upload-icon">📁</div>
-                    <p>拖拽音频文件到此处，或点击选择文件</p>
-                    <input type="file" id="fileInput" accept=".wav,.flac" hidden>
-                </div>
-                <div class="file-info" id="fileInfo" style="display: none;">
-                    <span class="file-name"></span>
-                    <button class="btn-remove" id="btnRemove">✕</button>
-                </div>
-            </section>
-
-            <!-- 参数设置区域 -->
-            <section class="params-section">
-                <h2>转换参数</h2>
-                
-                <div class="param-group">
-                    <label for="speakerId">说话人 ID</label>
-                    <input type="number" id="speakerId" value="0" min="0">
-                </div>
-
-                <div class="param-group">
-                    <label for="pitchShift">音高偏移 (半音)</label>
-                    <input type="range" id="pitchShift" min="-24" max="24" value="0" step="1">
-                    <span class="param-value" id="pitchShiftValue">0</span>
-                </div>
-
-                <div class="param-group">
-                    <label for="indexRate">特征检索率</label>
-                    <input type="range" id="indexRate" min="0" max="100" value="0" step="1">
-                    <span class="param-value" id="indexRateValue">0.0</span>
-                </div>
-
-                <div class="param-group">
-                    <label for="rmsMixRate">RMS 混合率</label>
-                    <input type="range" id="rmsMixRate" min="0" max="100" value="50" step="1">
-                    <span class="param-value" id="rmsMixRateValue">0.5</span>
-                </div>
-
-                <div class="param-group">
-                    <label for="protect">清音保护</label>
-                    <input type="range" id="protect" min="0" max="100" value="50" step="1">
-                    <span class="param-value" id="protectValue">0.5</span>
-                </div>
-            </section>
-
-            <!-- 转换按钮 -->
-            <section class="action-section">
-                <button class="btn-convert" id="btnConvert" disabled>
-                    开始转换
-                </button>
-            </section>
-
-            <!-- 进度显示 -->
-            <section class="progress-section" id="progressSection" style="display: none;">
-                <h2>转换进度</h2>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progressFill"></div>
-                </div>
-                <div class="progress-info" id="progressInfo">
-                    准备中...
-                </div>
-            </section>
-
-            <!-- 结果区域 -->
-            <section class="result-section" id="resultSection" style="display: none;">
-                <h2>转换结果</h2>
-                <div class="audio-player">
-                    <audio controls id="resultAudio"></audio>
-                </div>
-                <div class="result-actions">
-                    <button class="btn-download" id="btnDownload">下载 WAV</button>
-                    <button class="btn-compare" id="btnCompare">对比原声</button>
-                </div>
-                <div class="result-stats" id="resultStats"></div>
-            </section>
-
-            <!-- 对比播放器 -->
-            <section class="compare-section" id="compareSection" style="display: none;">
-                <h2>音频对比</h2>
-                <div class="compare-players">
-                    <div class="player-wrapper">
-                        <h3>原声</h3>
-                        <audio controls id="originalAudio"></audio>
+            <!-- ============ 训练声线 ============ -->
+            <div class="tab-panel active" id="panel-train">
+                <section class="params-section">
+                    <h2>设定目标声线</h2>
+                    <div class="param-group">
+                        <label for="voiceName">声线名称</label>
+                        <input type="text" id="voiceName" placeholder="例如 alice（字母/数字/_/-）">
                     </div>
-                    <div class="player-wrapper">
-                        <h3>转换后</h3>
-                        <audio controls id="convertedAudio"></audio>
+                    <div class="param-group">
+                        <label for="trainMode">训练模式</label>
+                        <select id="trainMode">
+                            <option value="decoder">解码器微调（快速，mel-L1）</option>
+                            <option value="gan">完整 GAN（高音质，enc_q+flow+判别器）</option>
+                        </select>
                     </div>
-                </div>
-            </section>
+                    <div class="param-group">
+                        <label for="trainSteps">训练步数</label>
+                        <input type="number" id="trainSteps" value="300" min="1" max="100000">
+                    </div>
+                    <div class="param-group">
+                        <label for="trainSeg">片段帧长</label>
+                        <input type="number" id="trainSeg" value="40" min="8" max="200">
+                    </div>
+                </section>
+
+                <section class="upload-section">
+                    <h2>目标声线录音（可多选）</h2>
+                    <div class="upload-area" id="trainUploadArea">
+                        <div class="upload-icon">🎵</div>
+                        <p>拖拽目标说话人音频到此，或点击选择（.wav/.flac，建议数分钟）</p>
+                        <input type="file" id="trainFileInput" accept=".wav,.flac" multiple hidden>
+                    </div>
+                    <ul class="file-list" id="trainFileList"></ul>
+                </section>
+
+                <section class="action-section">
+                    <button class="btn-convert" id="btnTrain" disabled>开始训练</button>
+                </section>
+
+                <section class="progress-section" id="trainProgress" style="display:none;">
+                    <h2>训练进度 — <span id="trainStage">…</span></h2>
+                    <div class="progress-bar"><div class="progress-fill" id="trainFill"></div></div>
+                    <pre class="log-box" id="trainLog"></pre>
+                </section>
+            </div>
+
+            <!-- ============ 语音转换 ============ -->
+            <div class="tab-panel" id="panel-convert">
+                <section class="params-section">
+                    <h2>选择声线</h2>
+                    <div class="param-group">
+                        <label for="voiceSelect">目标声线</label>
+                        <select id="voiceSelect"></select>
+                        <button class="btn-small" id="btnRefreshVoices">刷新</button>
+                    </div>
+                </section>
+
+                <section class="upload-section">
+                    <h2>待转换音频</h2>
+                    <div class="upload-area" id="convUploadArea">
+                        <div class="upload-icon">📁</div>
+                        <p>拖拽音频到此处，或点击选择文件</p>
+                        <input type="file" id="convFileInput" accept=".wav,.flac" hidden>
+                    </div>
+                    <div class="file-info" id="convFileInfo" style="display:none;">
+                        <span class="file-name"></span>
+                        <button class="btn-remove" id="btnConvRemove">✕</button>
+                    </div>
+                </section>
+
+                <section class="params-section">
+                    <h2>转换参数</h2>
+                    <div class="param-group">
+                        <label for="pitchShift">音高偏移 (半音)</label>
+                        <input type="range" id="pitchShift" min="-24" max="24" value="0" step="1">
+                        <span class="param-value" id="pitchShiftValue">0</span>
+                    </div>
+                    <div class="param-group">
+                        <label for="indexRate">特征检索率</label>
+                        <input type="range" id="indexRate" min="0" max="100" value="50" step="1">
+                        <span class="param-value" id="indexRateValue">0.50</span>
+                    </div>
+                    <div class="param-group">
+                        <label for="rmsMixRate">RMS 混合率</label>
+                        <input type="range" id="rmsMixRate" min="0" max="100" value="50" step="1">
+                        <span class="param-value" id="rmsMixRateValue">0.50</span>
+                    </div>
+                    <div class="param-group">
+                        <label for="protect">清音保护</label>
+                        <input type="range" id="protect" min="0" max="100" value="50" step="1">
+                        <span class="param-value" id="protectValue">0.50</span>
+                    </div>
+                </section>
+
+                <section class="action-section">
+                    <button class="btn-convert" id="btnConvert" disabled>开始转换</button>
+                </section>
+
+                <section class="progress-section" id="convProgress" style="display:none;">
+                    <h2>转换进度</h2>
+                    <div class="progress-bar"><div class="progress-fill" id="convFill"></div></div>
+                    <div class="progress-info" id="convInfo">准备中…</div>
+                </section>
+
+                <section class="result-section" id="resultSection" style="display:none;">
+                    <h2>转换结果</h2>
+                    <div class="audio-player"><audio controls id="resultAudio"></audio></div>
+                    <div class="result-actions">
+                        <button class="btn-download" id="btnDownload">下载 WAV</button>
+                    </div>
+                </section>
+            </div>
         </main>
 
-        <footer>
-            <p>Resonantia v0.1.0 | Powered by C++20/CUDA</p>
-        </footer>
+        <footer><p>Resonantia | Powered by C++20/CUDA · 零 Python 运行时</p></footer>
     </div>
-
     <script src="app.js"></script>
 </body>
 </html>

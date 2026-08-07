@@ -215,17 +215,25 @@ build/vc_convert --hubert models/hubert_base/model.safetensors \
 
 ## WebUI
 
-面向普通用户的浏览器界面（上传音频 → 调参 → 转换 → 试听/下载）。后端 `vc_serve`
-是纯 C++ HTTP 服务（POSIX socket 手写，零第三方、零 Python 运行时），服务 `webui/`
-静态资源并处理 `POST /api/convert`。
+面向普通用户的浏览器界面，**统一调度训练与推理全流程**,双标签:
+
+- **① 训练声线**:命名目标声线 → 选择模式(解码器微调 / 完整 GAN)与步数 →
+  上传目标说话人录音(可多选)→ 一键训练。后端自动执行 切片 → 微调 → 建索引,
+  并实时回传阶段与训练日志。
+- **② 语音转换**:从已训练声线下拉选择 → 上传待转换音频 → 调参(音高/检索率/
+  RMS/保护)→ 转换 → 试听/下载。
+
+后端 `vc_serve` 是纯 C++ HTTP 服务(POSIX socket 手写,零第三方、零 Python 运行时),
+作为**编排层**调用已验证的 CLI(vc_preprocess / vc_train / build_index / vc_convert)
+子进程完成各阶段;训练在后台线程执行,不阻塞界面。声线模型存于 `runs/<name>/`。
 
 ```bash
-build/vc_serve --hubert models/hubert_base/model.safetensors \
-  --model runs/alice/model.safetensors --rmvpe models/rmvpe.safetensors \
-  --index runs/alice/model.index --webroot webui --port 8080 \
-  --version v2 --speakers 109 --sr 40000
+build/vc_serve --repo "$PWD" --webroot webui --port 8080
 # 浏览器打开 http://localhost:8080
 ```
+
+接口:`GET /api/voices`、`POST /api/train`(multipart 录音+参数)、
+`GET /api/train/status`、`POST /api/convert`(选声线+音频)。
 
 ## 参考项目
 

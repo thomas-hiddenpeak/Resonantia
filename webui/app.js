@@ -1,207 +1,172 @@
-// Resonantia WebUI - Frontend Application
+// Resonantia WebUI — orchestrates training + inference via the vc_serve backend.
+const API = '/api';
+const $ = (id) => document.getElementById(id);
 
-const API_BASE = '/api';
-
-// DOM Elements
-const uploadArea = document.getElementById('uploadArea');
-const fileInput = document.getElementById('fileInput');
-const fileInfo = document.getElementById('fileInfo');
-const btnRemove = document.getElementById('btnRemove');
-const btnConvert = document.getElementById('btnConvert');
-const progressSection = document.getElementById('progressSection');
-const progressFill = document.getElementById('progressFill');
-const progressInfo = document.getElementById('progressInfo');
-const resultSection = document.getElementById('resultSection');
-const resultAudio = document.getElementById('resultAudio');
-const btnDownload = document.getElementById('btnDownload');
-const btnCompare = document.getElementById('btnCompare');
-const compareSection = document.getElementById('compareSection');
-const originalAudio = document.getElementById('originalAudio');
-const convertedAudio = document.getElementById('convertedAudio');
-
-// State
-let currentFile = null;
-let originalAudioUrl = null;
-let convertedAudioUrl = null;
-
-// Parameter controls
-const speakerId = document.getElementById('speakerId');
-const pitchShift = document.getElementById('pitchShift');
-const pitchShiftValue = document.getElementById('pitchShiftValue');
-const indexRate = document.getElementById('indexRate');
-const indexRateValue = document.getElementById('indexRateValue');
-const rmsMixRate = document.getElementById('rmsMixRate');
-const rmsMixRateValue = document.getElementById('rmsMixRateValue');
-const protect = document.getElementById('protect');
-const protectValue = document.getElementById('protectValue');
-
-// Upload handlers
-uploadArea.addEventListener('click', () => fileInput.click());
-
-uploadArea.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    uploadArea.style.borderColor = 'var(--primary-color)';
+// ---------- Tabs ----------
+document.querySelectorAll('.tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));
+        btn.classList.add('active');
+        $('panel-' + btn.dataset.tab).classList.add('active');
+        if (btn.dataset.tab === 'convert') loadVoices();
+    });
 });
 
-uploadArea.addEventListener('dragleave', () => {
-    uploadArea.style.borderColor = 'var(--border-color)';
+// ---------- Training ----------
+let trainFiles = [];
+const trainArea = $('trainUploadArea');
+trainArea.addEventListener('click', () => $('trainFileInput').click());
+trainArea.addEventListener('dragover', (e) => { e.preventDefault(); trainArea.classList.add('drag'); });
+trainArea.addEventListener('dragleave', () => trainArea.classList.remove('drag'));
+trainArea.addEventListener('drop', (e) => {
+    e.preventDefault(); trainArea.classList.remove('drag');
+    addTrainFiles(e.dataTransfer.files);
 });
+$('trainFileInput').addEventListener('change', (e) => addTrainFiles(e.target.files));
 
-uploadArea.addEventListener('drop', (e) => {
-    e.preventDefault();
-    uploadArea.style.borderColor = 'var(--border-color)';
-    
-    const files = e.dataTransfer.files;
-    if (files.length > 0) {
-        handleFile(files[0]);
+function addTrainFiles(list) {
+    for (const f of list) if (f.name.match(/\.(wav|flac)$/i)) trainFiles.push(f);
+    renderTrainFiles();
+}
+function renderTrainFiles() {
+    const ul = $('trainFileList'); ul.innerHTML = '';
+    trainFiles.forEach((f, i) => {
+        const li = document.createElement('li');
+        li.innerHTML = `<span>${f.name}</span> <button data-i="${i}">✕</button>`;
+        li.querySelector('button').onclick = () => { trainFiles.splice(i, 1); renderTrainFiles(); };
+        ul.appendChild(li);
+    });
+    updateTrainBtn();
+}
+function updateTrainBtn() {
+    const name = $('voiceName').value.trim();
+    $('btnTrain').disabled = !(trainFiles.length > 0 && /^[A-Za-z0-9_-]+$/.test(name));
+}
+$('voiceName').addEventListener('input', updateTrainBtn);
+
+$('btnTrain').addEventListener('click', async () => {
+    const name = $('voiceName').value.trim();
+    const fd = new FormData();
+    fd.append('name', name);
+    fd.append('mode', $('trainMode').value);
+    fd.append('steps', $('trainSteps').value);
+    fd.append('seg', $('trainSeg').value);
+    trainFiles.forEach((f) => fd.append('files', f, f.name));
+
+    $('btnTrain').disabled = true;
+    $('trainProgress').style.display = 'block';
+    $('trainStage').textContent = '提交中…';
+    $('trainFill').style.width = '5%';
+    try {
+        const r = await fetch(`${API}/train`, { method: 'POST', body: fd });
+        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error || r.status); }
+        pollTrain(name);
+    } catch (err) {
+        $('trainStage').textContent = '失败: ' + err.message;
+        $('btnTrain').disabled = false;
     }
 });
 
-fileInput.addEventListener('change', (e) => {
-    if (e.target.files.length > 0) {
-        handleFile(e.target.files[0]);
+const STAGES = { queued: 10, preprocessing: 25, training: 55, indexing: 90, done: 100, error: 100 };
+async function pollTrain(name) {
+    try {
+        const r = await fetch(`${API}/train/status?name=${encodeURIComponent(name)}`);
+        const s = await r.json();
+        $('trainStage').textContent = s.stage;
+        $('trainFill').style.width = (STAGES[s.stage] || 50) + '%';
+        $('trainLog').textContent = s.log || '';
+        $('trainLog').scrollTop = $('trainLog').scrollHeight;
+        if (s.running || (!s.done && s.stage !== 'idle')) {
+            setTimeout(() => pollTrain(name), 1500);
+        } else {
+            $('btnTrain').disabled = false;
+            if (!s.error) { $('trainStage').textContent = '完成 ✓ 已生成声线「' + name + '」'; loadVoices(); }
+        }
+    } catch (e) {
+        setTimeout(() => pollTrain(name), 2500);
     }
-});
-
-function handleFile(file) {
-    if (!file.name.match(/\.(wav|flac)$/i)) {
-        alert('请上传 WAV 或 FLAC 格式的音频文件');
-        return;
-    }
-    
-    currentFile = file;
-    
-    // Show file info
-    fileInfo.querySelector('.file-name').textContent = file.name;
-    fileInfo.style.display = 'flex';
-    uploadArea.style.display = 'none';
-    
-    // Create preview URL
-    if (originalAudioUrl) {
-        URL.revokeObjectURL(originalAudioUrl);
-    }
-    originalAudioUrl = URL.createObjectURL(file);
-    originalAudio.src = originalAudioUrl;
-    
-    // Enable convert button
-    btnConvert.disabled = false;
 }
 
-btnRemove.addEventListener('click', () => {
-    currentFile = null;
-    fileInput.value = '';
-    fileInfo.style.display = 'none';
-    uploadArea.style.display = 'block';
-    btnConvert.disabled = true;
-    
-    if (originalAudioUrl) {
-        URL.revokeObjectURL(originalAudioUrl);
-        originalAudioUrl = null;
-    }
-});
-
-// Parameter value displays
-pitchShift.addEventListener('input', () => {
-    pitchShiftValue.textContent = pitchShift.value;
-});
-
-indexRate.addEventListener('input', () => {
-    indexRateValue.textContent = (indexRate.value / 100).toFixed(2);
-});
-
-rmsMixRate.addEventListener('input', () => {
-    rmsMixRateValue.textContent = (rmsMixRate.value / 100).toFixed(2);
-});
-
-protect.addEventListener('input', () => {
-    protectValue.textContent = (protect.value / 100).toFixed(2);
-});
-
-// Convert handler
-btnConvert.addEventListener('click', async () => {
-    if (!currentFile) return;
-    
-    btnConvert.disabled = true;
-    progressSection.style.display = 'block';
-    resultSection.style.display = 'none';
-    compareSection.style.display = 'none';
-    
+// ---------- Voices ----------
+async function loadVoices() {
     try {
-        const formData = new FormData();
-        formData.append('audio', currentFile);
-        formData.append('speaker_id', speakerId.value);
-        formData.append('f0_up_key', pitchShift.value);
-        formData.append('index_rate', indexRate.value / 100);
-        formData.append('rms_mix_rate', rmsMixRate.value / 100);
-        formData.append('protect', protect.value / 100);
-        
-        // Simulate progress (backend doesn't support streaming yet)
-        let progress = 0;
-        const progressInterval = setInterval(() => {
-            progress += Math.random() * 15;
-            if (progress > 90) progress = 90;
-            
-            progressFill.style.width = progress + '%';
-            progressInfo.textContent = `转换中... ${Math.round(progress)}%`;
-        }, 500);
-        
-        const response = await fetch(`${API_BASE}/convert`, {
-            method: 'POST',
-            body: formData
-        });
-        
-        clearInterval(progressInterval);
-        
-        if (!response.ok) {
-            throw new Error(`Server error: ${response.status}`);
-        }
-        
-        const blob = await response.blob();
-        
-        if (convertedAudioUrl) {
-            URL.revokeObjectURL(convertedAudioUrl);
-        }
-        convertedAudioUrl = URL.createObjectURL(blob);
-        
-        // Update UI
-        progressFill.style.width = '100%';
-        progressInfo.textContent = '转换完成!';
-        
+        const r = await fetch(`${API}/voices`);
+        const d = await r.json();
+        const sel = $('voiceSelect'); const cur = sel.value;
+        sel.innerHTML = '';
+        const base = document.createElement('option'); base.value = 'base'; base.textContent = d.base || 'base';
+        sel.appendChild(base);
+        (d.voices || []).forEach((v) => { const o = document.createElement('option'); o.value = v; o.textContent = v; sel.appendChild(o); });
+        if (cur) sel.value = cur;
+    } catch (e) { /* backend offline */ }
+}
+$('btnRefreshVoices').addEventListener('click', loadVoices);
+
+// ---------- Convert ----------
+let convFile = null, convUrl = null;
+const convArea = $('convUploadArea');
+convArea.addEventListener('click', () => $('convFileInput').click());
+convArea.addEventListener('dragover', (e) => { e.preventDefault(); convArea.classList.add('drag'); });
+convArea.addEventListener('dragleave', () => convArea.classList.remove('drag'));
+convArea.addEventListener('drop', (e) => { e.preventDefault(); convArea.classList.remove('drag'); if (e.dataTransfer.files[0]) setConvFile(e.dataTransfer.files[0]); });
+$('convFileInput').addEventListener('change', (e) => { if (e.target.files[0]) setConvFile(e.target.files[0]); });
+
+function setConvFile(f) {
+    if (!f.name.match(/\.(wav|flac)$/i)) { alert('请上传 WAV 或 FLAC'); return; }
+    convFile = f;
+    $('convFileInfo').querySelector('.file-name').textContent = f.name;
+    $('convFileInfo').style.display = 'flex';
+    convArea.style.display = 'none';
+    $('btnConvert').disabled = false;
+}
+$('btnConvRemove').addEventListener('click', () => {
+    convFile = null; $('convFileInput').value = '';
+    $('convFileInfo').style.display = 'none'; convArea.style.display = 'block';
+    $('btnConvert').disabled = true;
+});
+
+const bind = (id, out, f) => { const el = $(id); el.addEventListener('input', () => $(out).textContent = f(el.value)); };
+bind('pitchShift', 'pitchShiftValue', (v) => v);
+bind('indexRate', 'indexRateValue', (v) => (v / 100).toFixed(2));
+bind('rmsMixRate', 'rmsMixRateValue', (v) => (v / 100).toFixed(2));
+bind('protect', 'protectValue', (v) => (v / 100).toFixed(2));
+
+$('btnConvert').addEventListener('click', async () => {
+    if (!convFile) return;
+    $('btnConvert').disabled = true;
+    $('convProgress').style.display = 'block';
+    $('resultSection').style.display = 'none';
+    let p = 0;
+    const iv = setInterval(() => { p = Math.min(90, p + Math.random() * 12); $('convFill').style.width = p + '%'; $('convInfo').textContent = `转换中… ${Math.round(p)}%`; }, 500);
+    try {
+        const fd = new FormData();
+        fd.append('audio', convFile, convFile.name);
+        fd.append('voice', $('voiceSelect').value || 'base');
+        fd.append('f0_up_key', $('pitchShift').value);
+        fd.append('index_rate', $('indexRate').value / 100);
+        fd.append('rms_mix_rate', $('rmsMixRate').value / 100);
+        fd.append('protect', $('protect').value / 100);
+        const r = await fetch(`${API}/convert`, { method: 'POST', body: fd });
+        clearInterval(iv);
+        if (!r.ok) throw new Error('服务器错误 ' + r.status);
+        const blob = await r.blob();
+        if (convUrl) URL.revokeObjectURL(convUrl);
+        convUrl = URL.createObjectURL(blob);
+        $('convFill').style.width = '100%'; $('convInfo').textContent = '完成！';
         setTimeout(() => {
-            progressSection.style.display = 'none';
-            resultSection.style.display = 'block';
-            
-            resultAudio.src = convertedAudioUrl;
-            convertedAudio.src = convertedAudioUrl;
-            
-            // Update download button
-            btnDownload.onclick = () => {
-                const a = document.createElement('a');
-                a.href = convertedAudioUrl;
-                a.download = 'converted_' + currentFile.name.replace(/\.[^.]+$/, '.wav');
-                a.click();
-            };
-            
-            btnConvert.disabled = false;
-        }, 1000);
-        
-    } catch (error) {
-        console.error('Conversion failed:', error);
-        progressInfo.textContent = `转换失败: ${error.message}`;
-        btnConvert.disabled = false;
+            $('convProgress').style.display = 'none';
+            $('resultSection').style.display = 'block';
+            $('resultAudio').src = convUrl;
+            $('btnDownload').onclick = () => { const a = document.createElement('a'); a.href = convUrl; a.download = 'converted_' + convFile.name.replace(/\.[^.]+$/, '.wav'); a.click(); };
+            $('btnConvert').disabled = false;
+        }, 600);
+    } catch (err) {
+        clearInterval(iv);
+        $('convInfo').textContent = '转换失败: ' + err.message;
+        $('btnConvert').disabled = false;
     }
 });
 
-// Compare handler
-btnCompare.addEventListener('click', () => {
-    compareSection.style.display = 'block';
-    
-    // Sync playback
-    const syncPlayback = () => {
-        convertedAudio.currentTime = originalAudio.currentTime;
-    };
-    
-    originalAudio.addEventListener('seeking', syncPlayback);
-    originalAudio.addEventListener('play', () => convertedAudio.play());
-    originalAudio.addEventListener('pause', () => convertedAudio.pause());
-});
+// initial
+loadVoices();
