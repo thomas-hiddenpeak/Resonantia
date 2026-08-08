@@ -147,9 +147,11 @@ Per Constitution v1.4.0 Spec Completion Criteria:
 | FR-010 vc_batch | ✅ 已实现+实测 | 一次载入模型循环转整目录(--recursive + 与 vc_convert 参数对齐);真实 2 文件端到端通过 | **✓ 完成** |
 | Edge >5min 分块推理 | ✅ 已实现+测试 | pipeline.convert_long:整段一次 F0(全局音高)→静音切点分块→按绝对位置拼接;短片段走原路径(e2e corr 保持 0.999716);test_long_audio_chunking 幅度谱对齐 spec_corr=0.986>0.98(波形相关因 NSF 相位重置无效,已用相位无关指标) | **✓ 完成** |
 | FR-004 FCPE F0 | ✅ 已实现+对齐 | 真实 FCPE(torchfcpe CFNaiveMelPE 全卷积端口)+ `--f0-method rmvpe|fcpe` 分发;对齐 torchfcpe:mel mean|Δ|5.7e-6、F0 V/UV 100% 一致、voiced medianΔ=1.5e-5Hz(远低于嬪法 0.5Hz);端到端 vc_convert --f0-method fcpe 真实转换通过 | **✓ 完成** |
-| FR-003 WavLM 编码器 | 桩 | 实现真实 WavLM-Base+ 内容编码器 + 数值对齐(超越 RVC 的 HuBERT/ContentVec) | P1 |
+| FR-003 WavLM 编码器 | ✅ 已实现+对齐 | 真实 WavLM-Base+ 内容编码器(共享 wav2vec2 前端 + **门控相对位置偏置**)+ `--content-encoder hubert|wavlm` 分发;对齐 microsoft/wavlm-base-plus:mean|Δ|4.8e-7、max|Δ|4.3e-5、**cos=1.0**;端到端管线路径通过。⚠️ 注:WavLM 特征空间≠ContentVec,需**WavLM 训练的合成器**方能高质量转换(stock RVC v2 合成器基于 ContentVec);编码器本身已对齐,可供训练/兼容模型使用 | **✓ 完成** |
 
-> 每项完成后勾选对应 FR；全部满足并通过集成测试后，001 方可标 Complete。
+> 所有 open MUST 均已满足并通过对齐/集成测试 → **001 推理引擎可标 Complete**。
+> 后续增强(不阻塞 Complete):FCPE/WavLM 前向当前在主机运行(正确但较慢),CUDA 化为性能项;
+> WebUI 暴露 f0-method/content-encoder 选择器为小项。
 > 「每环节多 SOTA 模型可选」属 spec 004 扩展(S7)；「实时流式」为全新功能，
 > 依 Sequential Completion 须在 001 完成后再建 spec。
 

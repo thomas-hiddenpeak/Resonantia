@@ -163,6 +163,15 @@ bool VoiceConversionPipeline::init(const VCConfig& config) {
     hubert_cfg_.half_precision = config.use_half_precision;
     hubert_encoder_.init(hubert_cfg_);
 
+    // Optional WavLM-Base+ content encoder (used when config.content_encoder == kWavlm).
+    wavlm_loaded_ = false;
+    if (!config.wavlm_model_path.empty()) {
+        wavlm_cfg_.model_path = config.wavlm_model_path;
+        wavlm_cfg_.output_dim = 768;
+        wavlm_cfg_.num_layers = 12;
+        wavlm_loaded_ = wavlm_encoder_.init(wavlm_cfg_);
+    }
+
     f0_cfg_.model_path = config.rmvpe_model_path;
     f0_extractor_.init(f0_cfg_);
 
@@ -198,6 +207,15 @@ std::vector<float> VoiceConversionPipeline::extract_f0(const float* audio, int n
     return f0_extractor_.infer(audio, num_samples);
 }
 
+// Dispatch content extraction. WavLM (768-D) falls back to HuBERT if it was not
+// loaded; WavLM only applies to the 768-D v2 path (dimension-compatible synth).
+std::vector<float> VoiceConversionPipeline::extract_content(const float* audio, int num_samples) {
+    if (config_.content_encoder == ContentEncoder::kWavlm && wavlm_loaded_ &&
+        config_.version == ModelVersion::kV2)
+        return wavlm_encoder_.extract(audio, num_samples);
+    return hubert_encoder_.extract(audio, num_samples);
+}
+
 
 // Mirrors the historical whole-clip path exactly (HuBERT -> index -> 2x-interp ->
 // protect -> coarse-pitch -> VITS), so callers own F0 computation and stitching.
@@ -209,7 +227,7 @@ AudioBuffer VoiceConversionPipeline::synth_segment(
 
     // HuBERT content features [T, 768]
     auto t0 = clock::now();
-    auto feats = hubert_encoder_.extract(seg16k, segn);
+    auto feats = extract_content(seg16k, segn);
     timing.hubert_ms += std::chrono::duration<double, std::milli>(clock::now() - t0).count();
     if (feats.empty()) return {};
     int T = static_cast<int>(feats.size()) / 768;

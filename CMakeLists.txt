@@ -239,6 +239,12 @@ if(VOXMUTATIO_BUILD_TESTS)
     target_include_directories(test_fcpe_alignment PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME test_fcpe_alignment COMMAND test_fcpe_alignment WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+    # Test: WavLM-Base+ content encoder aligned with transformers (spec 001 FR-003)
+    add_executable(test_wavlm_alignment tests/test_wavlm_alignment.cpp)
+    target_link_libraries(test_wavlm_alignment PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
+    target_include_directories(test_wavlm_alignment PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME test_wavlm_alignment COMMAND test_wavlm_alignment WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
     # Test: Feature index retrieval (RVC weighted k-NN)
     add_executable(test_index_retrieval tests/test_index_retrieval.cpp)
     target_link_libraries(test_index_retrieval PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)

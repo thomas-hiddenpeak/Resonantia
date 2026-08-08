@@ -53,6 +53,13 @@ enum class F0Method : std::uint8_t {
     kPm,     // Parselmouth (CPU fallback)
 };
 
+/// Content (SSL) encoder selection
+enum class ContentEncoder : std::uint8_t {
+    kHubert,  // HuBERT/ContentVec (default; stock RVC v1/v2 models)
+    kWavlm,   // WavLM-Base+ (requires a WavLM-trained synthesizer)
+};
+
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -65,12 +72,14 @@ struct VCConfig {
     std::string index_path;              // CUDA Flat Index file (optional)
     std::string rmvpe_model_path;        // RMVPE safetensors (optional)
     std::string fcpe_model_path;         // FCPE safetensors (optional, for f0_method=kFcpe)
+    std::string wavlm_model_path;        // WavLM-Base+ safetensors (optional, for content_encoder=kWavlm)
 
     // Inference parameters
     int f0_up_key = 0;                   // pitch shift in semitones
     double formant_shift = 0.0;          // formant shift in semitones
     double index_rate = 0.0;             // index retrieval blend [0.0, 1.0]
     F0Method f0_method = F0Method::kRmvpe;  // F0 extractor: kRmvpe (default) or kFcpe
+    ContentEncoder content_encoder = ContentEncoder::kHubert;  // content SSL encoder
     double rms_mix_rate = 0.5;           // source/target RMS energy blend [0.0, 1.0]
     double protect = 0.5;                // unvoiced protection strength [0.0, 1.0]
     int filter_radius = 0;               // F0 median-filter kernel (0=off; odd >=3 smooths)

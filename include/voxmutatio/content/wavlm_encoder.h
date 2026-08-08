@@ -30,7 +30,7 @@ public:
 private:
     int output_dim_ = 768;
     bool half_precision_ = false;
-    // Model weights and GPU buffers (implementation details in .cu)
+    WavlmConfig config_;
 };
 
 }  // namespace voxmutatio::content

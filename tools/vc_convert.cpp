@@ -30,6 +30,8 @@ void print_usage() {
         << "  --rmvpe <path>        RMVPE model safetensors (optional)\n"
         << "  --fcpe <path>         FCPE model safetensors (optional)\n"
         << "  --f0-method <name>    F0 extractor: rmvpe (default) or fcpe\n"
+        << "  --wavlm <path>        WavLM-Base+ safetensors (needs a WavLM-trained model)\n"
+        << "  --content-encoder <n> Content encoder: hubert (default) or wavlm\n"
         << "  --speaker <id>        Speaker ID (default: 0)\n"
         << "  --pitch <semitones>   Pitch shift in semitones (default: 0)\n"
         << "  --formant <semitones> Formant shift (default: 0)\n"
@@ -76,6 +78,12 @@ int main(int argc, char** argv) {
             std::string mth = argv[++i];
             config.f0_method = (mth == "fcpe") ? voxmutatio::F0Method::kFcpe
                                                 : voxmutatio::F0Method::kRmvpe;
+        }
+        else if (arg == "--wavlm" && i + 1 < argc) config.wavlm_model_path = argv[++i];
+        else if (arg == "--content-encoder" && i + 1 < argc) {
+            std::string ce = argv[++i];
+            config.content_encoder = (ce == "wavlm") ? voxmutatio::ContentEncoder::kWavlm
+                                                       : voxmutatio::ContentEncoder::kHubert;
         }
         else if (arg == "--speaker" && i + 1 < argc) speaker_id = std::atoi(argv[++i]);
         else if (arg == "--pitch" && i + 1 < argc) config.f0_up_key = std::atoi(argv[++i]);
