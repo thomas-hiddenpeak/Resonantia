@@ -290,6 +290,19 @@ struct Roformer::Impl {
   CudaBuffer d_num_bands_per_freq;   // float
   std::vector<int64_t> freq_indices, num_bands_per_freq;
 
+  // Reusable device scratch (avoids per-band/per-transformer cudaMalloc churn,
+  // the same fix that gave the training path ~40x). Grow-only via ensure().
+  struct Scratch {
+    CudaBuffer d_fi;                                      // freq_indices (int64->float), built once
+    CudaBuffer bin, bs_tmp, bs_lin;                       // band_split
+    CudaBuffer xn, qkv, q, k, v, scores, ao, mo, gates, att, fn, h1, h2, xo;  // transformer
+    CudaBuffer xt;                                        // blocks_forward transpose
+    CudaBuffer bandin, mlp_a, mlp_b;                      // mask_estimator MLP ping-pong
+    CudaBuffer sre, sim, ore, oim;                        // apply_mask
+  };
+  mutable Scratch sc;
+  static void ensure(CudaBuffer& b, std::size_t n) { if (b.size() < n) b.allocate(n); }
+
   static bool up(const io::SafetensorsLoader& L, const std::string& n, CudaBuffer& b, int expect = 0) {
     const auto* t = L.get_tensor(n);
     if (!t) { fprintf(stderr, "roformer: missing %s\n", n.c_str()); return false; }
@@ -406,91 +419,91 @@ struct Roformer::Impl {
     CK(cudaDeviceSynchronize());
   }
 
-  // STFT + gather + band split -> bandsplit_out [T, num_bands, dim] on device.
+  // Gather + fold PRECOMPUTED spectra -> band-split features out [T, num_bands, dim].
+  void band_split_from_spec(const CudaBuffer& d_re, const CudaBuffer& d_im, CudaBuffer& out, int T) const {
+    if (sc.d_fi.empty())
+      sc.d_fi.copy_from_host(reinterpret_cast<const float*>(freq_indices.data()), freq_indices.size() * 2);
+    ensure(sc.bin, static_cast<size_t>(T) * band_in);
+    k_gather_fold<<<grid(T * band_in), 256>>>(d_re.data(), d_im.data(),
+        reinterpret_cast<const int64_t*>(sc.d_fi.data()), sc.bin.data(), T, band_in, nfreq);
+    out.allocate(static_cast<size_t>(T) * num_bands * dim);
+    for (int b = 0; b < num_bands; ++b) {
+      int din = dim_in[b];
+      ensure(sc.bs_tmp, static_cast<size_t>(T) * din);
+      k_rmsnorm_slice<<<grid(T), 256>>>(sc.bin.data(), band_in, off_in[b], bs_gamma[b].data(),
+                                        sc.bs_tmp.data(), T, din);
+      ensure(sc.bs_lin, static_cast<size_t>(T) * dim);
+      gemm_rm(false, true, T, dim, din, 1.0f, sc.bs_tmp.data(), bs_w[b].data(), 0.0f, sc.bs_lin.data());
+      k_bias_scatter_band<<<grid(T * dim), 256>>>(sc.bs_lin.data(), bs_b[b].data(), out.data(), b, num_bands, T, dim);
+    }
+    CK(cudaDeviceSynchronize());
+  }
+
+  // STFT + gather + band split -> bandsplit_out [T, num_bands, dim] on device (debug/standalone).
   void band_split(const std::vector<float>& stereo, int L, CudaBuffer& out, int& T) const {
     CudaBuffer d_re, d_im;
     stft_stereo(stereo, L, d_re, d_im, T);
-    CudaBuffer d_fi;
-    d_fi.copy_from_host(reinterpret_cast<const float*>(freq_indices.data()),
-                        freq_indices.size() * 2);  // int64 -> 2 float slots each
-    CudaBuffer bin;
-    bin.allocate(static_cast<size_t>(T) * band_in);
-    k_gather_fold<<<grid(T * band_in), 256>>>(d_re.data(), d_im.data(),
-        reinterpret_cast<const int64_t*>(d_fi.data()), bin.data(), T, band_in, nfreq);
-
-    out.allocate(static_cast<size_t>(T) * num_bands * dim);
-    CudaBuffer tmp, lin;
-    for (int b = 0; b < num_bands; ++b) {
-      int din = dim_in[b];
-      tmp.allocate(static_cast<size_t>(T) * din);
-      k_rmsnorm_slice<<<grid(T), 256>>>(bin.data(), band_in, off_in[b], bs_gamma[b].data(),
-                                        tmp.data(), T, din);
-      lin.allocate(static_cast<size_t>(T) * dim);
-      gemm_rm(false, true, T, dim, din, 1.0f, tmp.data(), bs_w[b].data(), 0.0f, lin.data());
-      k_bias_scatter_band<<<grid(T * dim), 256>>>(lin.data(), bs_b[b].data(), out.data(), b, num_bands, T, dim);
-    }
-    CK(cudaDeviceSynchronize());
+    band_split_from_spec(d_re, d_im, out, T);
   }
 
   // One transformer (depth 1): attn residual + ffn residual + output RMSNorm.
   // x is [B*S, kDim] on device (B sequences of length S); modified in place.
   void transformer(CudaBuffer& x, int B, int S, const Block& bl) const {
     const int BS = B * S, D = dim, H = heads, DH = dim_head, IN = inner, FF = ff_hidden;
-    CudaBuffer xn; xn.allocate(static_cast<size_t>(BS) * D);
-    k_rmsnorm<<<grid(BS), 256>>>(x.data(), bl.attn.norm_gamma.data(), xn.data(), BS, D);
-    CudaBuffer qkv; qkv.allocate(static_cast<size_t>(BS) * 3 * IN);
-    gemm_rm(false, true, BS, 3 * IN, D, 1.0f, xn.data(), bl.attn.qkv_w.data(), 0.0f, qkv.data());
-    CudaBuffer q, k, v;
-    q.allocate(static_cast<size_t>(BS) * IN); k.allocate(q.size()); v.allocate(q.size());
-    k_split_heads<<<grid(BS * IN), 256>>>(qkv.data(), q.data(), k.data(), v.data(), B, S, H, DH);
+    ensure(sc.xn, static_cast<size_t>(BS) * D);
+    k_rmsnorm<<<grid(BS), 256>>>(x.data(), bl.attn.norm_gamma.data(), sc.xn.data(), BS, D);
+    ensure(sc.qkv, static_cast<size_t>(BS) * 3 * IN);
+    gemm_rm(false, true, BS, 3 * IN, D, 1.0f, sc.xn.data(), bl.attn.qkv_w.data(), 0.0f, sc.qkv.data());
+    ensure(sc.q, static_cast<size_t>(BS) * IN); ensure(sc.k, static_cast<size_t>(BS) * IN); ensure(sc.v, static_cast<size_t>(BS) * IN);
+    k_split_heads<<<grid(BS * IN), 256>>>(sc.qkv.data(), sc.q.data(), sc.k.data(), sc.v.data(), B, S, H, DH);
     int rope_n = B * H * S * (DH / 2);
-    k_rope<<<grid(rope_n), 256>>>(q.data(), bl.attn.rope_freqs.data(), B, H, S, DH);
-    k_rope<<<grid(rope_n), 256>>>(k.data(), bl.attn.rope_freqs.data(), B, H, S, DH);
+    k_rope<<<grid(rope_n), 256>>>(sc.q.data(), bl.attn.rope_freqs.data(), B, H, S, DH);
+    k_rope<<<grid(rope_n), 256>>>(sc.k.data(), bl.attn.rope_freqs.data(), B, H, S, DH);
     // Attention via batched GEMM: scores = softmax(Q K^T / sqrt(DH)); out = scores V.
-    CudaBuffer scores; scores.allocate(static_cast<size_t>(B) * H * S * S);
+    ensure(sc.scores, static_cast<size_t>(B) * H * S * S);
     gemm_batched(false, true, S, S, DH, 1.0f / sqrtf((float)DH),
-                 q.data(), (long)S * DH, k.data(), (long)S * DH, 0.0f,
-                 scores.data(), (long)S * S, B * H);
-    k_softmax_rows<<<grid(B * H * S), 256>>>(scores.data(), B * H * S, S);
-    CudaBuffer ao; ao.allocate(q.size());
-    gemm_batched(false, false, S, DH, S, 1.0f, scores.data(), (long)S * S,
-                 v.data(), (long)S * DH, 0.0f, ao.data(), (long)S * DH, B * H);
-    CudaBuffer mo; mo.allocate(q.size());
-    k_merge_heads<<<grid(BS * IN), 256>>>(ao.data(), mo.data(), B, S, H, DH);
-    CudaBuffer gates; gates.allocate(static_cast<size_t>(BS) * H);
-    gemm_rm(false, true, BS, H, D, 1.0f, xn.data(), bl.attn.gates_w.data(), 0.0f, gates.data());
-    k_add_rowbias<<<grid(BS * H), 256>>>(gates.data(), bl.attn.gates_b.data(), BS, H);
-    k_apply_gates<<<grid(BS * IN), 256>>>(mo.data(), gates.data(), BS, H, DH);
-    CudaBuffer att; att.allocate(static_cast<size_t>(BS) * D);
-    gemm_rm(false, true, BS, D, IN, 1.0f, mo.data(), bl.attn.out_w.data(), 0.0f, att.data());
-    k_add<<<grid(BS * D), 256>>>(x.data(), att.data(), BS * D);
+                 sc.q.data(), (long)S * DH, sc.k.data(), (long)S * DH, 0.0f,
+                 sc.scores.data(), (long)S * S, B * H);
+    k_softmax_rows<<<grid(B * H * S), 256>>>(sc.scores.data(), B * H * S, S);
+    ensure(sc.ao, static_cast<size_t>(BS) * IN);
+    gemm_batched(false, false, S, DH, S, 1.0f, sc.scores.data(), (long)S * S,
+                 sc.v.data(), (long)S * DH, 0.0f, sc.ao.data(), (long)S * DH, B * H);
+    ensure(sc.mo, static_cast<size_t>(BS) * IN);
+    k_merge_heads<<<grid(BS * IN), 256>>>(sc.ao.data(), sc.mo.data(), B, S, H, DH);
+    ensure(sc.gates, static_cast<size_t>(BS) * H);
+    gemm_rm(false, true, BS, H, D, 1.0f, sc.xn.data(), bl.attn.gates_w.data(), 0.0f, sc.gates.data());
+    k_add_rowbias<<<grid(BS * H), 256>>>(sc.gates.data(), bl.attn.gates_b.data(), BS, H);
+    k_apply_gates<<<grid(BS * IN), 256>>>(sc.mo.data(), sc.gates.data(), BS, H, DH);
+    ensure(sc.att, static_cast<size_t>(BS) * D);
+    gemm_rm(false, true, BS, D, IN, 1.0f, sc.mo.data(), bl.attn.out_w.data(), 0.0f, sc.att.data());
+    k_add<<<grid(BS * D), 256>>>(x.data(), sc.att.data(), BS * D);
 
-    CudaBuffer fn; fn.allocate(static_cast<size_t>(BS) * D);
-    k_rmsnorm<<<grid(BS), 256>>>(x.data(), bl.ffn.n0_gamma.data(), fn.data(), BS, D);
-    CudaBuffer h1; h1.allocate(static_cast<size_t>(BS) * FF);
-    gemm_rm(false, true, BS, FF, D, 1.0f, fn.data(), bl.ffn.w1.data(), 0.0f, h1.data());
-    k_add_rowbias<<<grid(BS * FF), 256>>>(h1.data(), bl.ffn.b1.data(), BS, FF);
-    k_gelu<<<grid(BS * FF), 256>>>(h1.data(), BS * FF);
-    CudaBuffer h2; h2.allocate(static_cast<size_t>(BS) * D);
-    gemm_rm(false, true, BS, D, FF, 1.0f, h1.data(), bl.ffn.w4.data(), 0.0f, h2.data());
-    k_add_rowbias<<<grid(BS * D), 256>>>(h2.data(), bl.ffn.b4.data(), BS, D);
-    k_add<<<grid(BS * D), 256>>>(x.data(), h2.data(), BS * D);
+    ensure(sc.fn, static_cast<size_t>(BS) * D);
+    k_rmsnorm<<<grid(BS), 256>>>(x.data(), bl.ffn.n0_gamma.data(), sc.fn.data(), BS, D);
+    ensure(sc.h1, static_cast<size_t>(BS) * FF);
+    gemm_rm(false, true, BS, FF, D, 1.0f, sc.fn.data(), bl.ffn.w1.data(), 0.0f, sc.h1.data());
+    k_add_rowbias<<<grid(BS * FF), 256>>>(sc.h1.data(), bl.ffn.b1.data(), BS, FF);
+    k_gelu<<<grid(BS * FF), 256>>>(sc.h1.data(), BS * FF);
+    ensure(sc.h2, static_cast<size_t>(BS) * D);
+    gemm_rm(false, true, BS, D, FF, 1.0f, sc.h1.data(), bl.ffn.w4.data(), 0.0f, sc.h2.data());
+    k_add_rowbias<<<grid(BS * D), 256>>>(sc.h2.data(), bl.ffn.b4.data(), BS, D);
+    k_add<<<grid(BS * D), 256>>>(x.data(), sc.h2.data(), BS * D);
 
-    CudaBuffer xo; xo.allocate(static_cast<size_t>(BS) * D);
-    k_rmsnorm<<<grid(BS), 256>>>(x.data(), bl.out_gamma.data(), xo.data(), BS, D);
-    x = std::move(xo);
+    ensure(sc.xo, static_cast<size_t>(BS) * D);
+    k_rmsnorm<<<grid(BS), 256>>>(x.data(), bl.out_gamma.data(), sc.xo.data(), BS, D);
+    x.copy_from_device(sc.xo.data(), static_cast<size_t>(BS) * D);
   }
 
   // 6 blocks: each = time transformer (over T per band) + freq transformer (over bands per t).
   // x is [T, num_bands, dim] in place.
   void blocks_forward(CudaBuffer& x, int T) const {
     const size_t n = static_cast<size_t>(T) * num_bands * dim;
+    ensure(sc.xt, n);
     for (int i = 0; i < depth; ++i) {
-      CudaBuffer xt; xt.allocate(n);
-      k_transpose12<<<grid(n), 256>>>(x.data(), xt.data(), T, num_bands, dim);  // [T,NB,D]->[NB,T,D]
-      transformer(xt, num_bands, T, blocks[i][0]);                             // time
-      k_transpose12<<<grid(n), 256>>>(xt.data(), x.data(), num_bands, T, dim);  // [NB,T,D]->[T,NB,D]
-      transformer(x, T, num_bands, blocks[i][1]);                              // freq
+      k_transpose12<<<grid(n), 256>>>(x.data(), sc.xt.data(), T, num_bands, dim);  // [T,NB,D]->[NB,T,D]
+      transformer(sc.xt, num_bands, T, blocks[i][0]);                              // time
+      k_transpose12<<<grid(n), 256>>>(sc.xt.data(), x.data(), num_bands, T, dim);  // [NB,T,D]->[T,NB,D]
+      transformer(x, T, num_bands, blocks[i][1]);                                  // freq
     }
     CK(cudaDeviceSynchronize());
   }
@@ -498,24 +511,24 @@ struct Roformer::Impl {
   // Mask estimator: per band MLP(dim->ff_hidden x mask_depth ->din*2, Tanh) + GLU -> mask [T, band_in].
   void mask_estimator(const CudaBuffer& blk, CudaBuffer& mask_out, int T) const {
     mask_out.allocate(static_cast<size_t>(T) * band_in);
-    CudaBuffer bandin, cur, nxt;
     for (int b = 0; b < num_bands; ++b) {
       int din = dim_in[b];
-      bandin.allocate(static_cast<size_t>(T) * dim);
-      k_extract_band<<<grid(T * dim), 256>>>(blk.data(), bandin.data(), b, num_bands, T, dim);
-      const float* in_ptr = bandin.data();
+      ensure(sc.bandin, static_cast<size_t>(T) * dim);
+      k_extract_band<<<grid(T * dim), 256>>>(blk.data(), sc.bandin.data(), b, num_bands, T, dim);
+      const float* in_ptr = sc.bandin.data();
       int in_d = dim;
       for (int l = 0; l <= mask_depth; ++l) {
         int out_d = (l == mask_depth) ? din * 2 : ff_hidden;
-        nxt.allocate(static_cast<size_t>(T) * out_d);
-        gemm_rm(false, true, T, out_d, in_d, 1.0f, in_ptr, mask[b].w[l].data(), 0.0f, nxt.data());
-        k_add_rowbias<<<grid(T * out_d), 256>>>(nxt.data(), mask[b].b[l].data(), T, out_d);
-        if (l != mask_depth) k_tanh<<<grid(T * out_d), 256>>>(nxt.data(), T * out_d);
-        cur = std::move(nxt);
-        in_ptr = cur.data();
+        CudaBuffer& dst = (l % 2 == 0) ? sc.mlp_a : sc.mlp_b;
+        ensure(dst, static_cast<size_t>(T) * out_d);
+        gemm_rm(false, true, T, out_d, in_d, 1.0f, in_ptr, mask[b].w[l].data(), 0.0f, dst.data());
+        k_add_rowbias<<<grid(T * out_d), 256>>>(dst.data(), mask[b].b[l].data(), T, out_d);
+        if (l != mask_depth) k_tanh<<<grid(T * out_d), 256>>>(dst.data(), T * out_d);
+        in_ptr = dst.data();
         in_d = out_d;
       }
-      k_glu_scatter<<<grid(T * din), 256>>>(cur.data(), mask_out.data(), off_in[b], din, T, band_in);
+      const float* last = (mask_depth % 2 == 0) ? sc.mlp_a.data() : sc.mlp_b.data();
+      k_glu_scatter<<<grid(T * din), 256>>>(last, mask_out.data(), off_in[b], din, T, band_in);
     }
     CK(cudaDeviceSynchronize());
   }
@@ -526,7 +539,7 @@ struct Roformer::Impl {
     CudaBuffer d_re, d_im;
     stft_stereo(stereo, L, d_re, d_im, T);
     CudaBuffer x;
-    band_split(stereo, L, x, T);
+    band_split_from_spec(d_re, d_im, x, T);  // reuse spectra (no second STFT)
     blocks_forward(x, T);
     CudaBuffer mask_out;
     mask_estimator(x, mask_out, T);
@@ -561,22 +574,21 @@ struct Roformer::Impl {
   // Stage 4: scatter-average complex mask, multiply STFT, zero DC, iSTFT per channel.
   std::vector<float> apply_mask(const CudaBuffer& mask_out, const CudaBuffer& d_re,
                                 const CudaBuffer& d_im, int T, int L) const {
-    CudaBuffer d_fi;
-    d_fi.copy_from_host(reinterpret_cast<const float*>(freq_indices.data()), freq_indices.size() * 2);
-    CudaBuffer sre, sim, ore, oim;
-    sre.allocate(static_cast<size_t>(merged) * T); sre.zero();
-    sim.allocate(static_cast<size_t>(merged) * T); sim.zero();
-    ore.allocate(static_cast<size_t>(2) * nfreq * T);
-    oim.allocate(static_cast<size_t>(2) * nfreq * T);
+    if (sc.d_fi.empty())
+      sc.d_fi.copy_from_host(reinterpret_cast<const float*>(freq_indices.data()), freq_indices.size() * 2);
+    ensure(sc.sre, static_cast<size_t>(merged) * T); sc.sre.zero();
+    ensure(sc.sim, static_cast<size_t>(merged) * T); sc.sim.zero();
+    ensure(sc.ore, static_cast<size_t>(2) * nfreq * T);
+    ensure(sc.oim, static_cast<size_t>(2) * nfreq * T);
     k_scatter_mask<<<grid(T * fi_len), 256>>>(mask_out.data(),
-        reinterpret_cast<const int64_t*>(d_fi.data()), sre.data(), sim.data(), T, fi_len, band_in);
-    k_apply_mask<<<grid(merged * T), 256>>>(d_re.data(), d_im.data(), sre.data(), sim.data(),
-        d_num_bands_per_freq.data(), ore.data(), oim.data(), T, merged, nfreq);
+        reinterpret_cast<const int64_t*>(sc.d_fi.data()), sc.sre.data(), sc.sim.data(), T, fi_len, band_in);
+    k_apply_mask<<<grid(merged * T), 256>>>(d_re.data(), d_im.data(), sc.sre.data(), sc.sim.data(),
+        d_num_bands_per_freq.data(), sc.ore.data(), sc.oim.data(), T, merged, nfreq);
     CK(cudaDeviceSynchronize());
 
     std::vector<float> hre(static_cast<size_t>(2) * nfreq * T), him(hre.size());
-    ore.copy_to_host(hre.data(), hre.size());
-    oim.copy_to_host(him.data(), him.size());
+    sc.ore.copy_to_host(hre.data(), hre.size());
+    sc.oim.copy_to_host(him.data(), him.size());
     std::vector<float> out(static_cast<size_t>(2) * L, 0.0f);
     for (int c = 0; c < 2; ++c) {
       std::vector<float> cre(hre.begin() + static_cast<size_t>(c) * nfreq * T,

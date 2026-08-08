@@ -249,11 +249,41 @@ function setConvFile(f) {
     $('convFileInfo').style.display = 'flex';
     convArea.style.display = 'none';
     $('btnConvert').disabled = false;
+    if ($('btnPpPreview')) $('btnPpPreview').disabled = false;
 }
 $('btnConvRemove').addEventListener('click', () => {
     convFile = null; $('convFileInput').value = '';
     $('convFileInfo').style.display = 'none'; convArea.style.display = 'block';
     $('btnConvert').disabled = true;
+    if ($('btnPpPreview')) $('btnPpPreview').disabled = true;
+});
+
+// ---------- Convert-input preprocessing (inference-stage) ----------
+const ppFlags = () => ({
+    pp_separate: $('ppSeparate') && $('ppSeparate').checked ? '1' : '0',
+    pp_deharmony: $('ppDeharmony') && $('ppDeharmony').checked ? '1' : '0',
+    pp_dereverb: $('ppDereverb') && $('ppDereverb').checked ? '1' : '0',
+    pp_denoise: $('ppDenoise') && $('ppDenoise').checked ? '1' : '0',
+});
+if ($('btnPpPreview')) $('btnPpPreview').addEventListener('click', async () => {
+    if (!convFile) return;
+    const btn = $('btnPpPreview'), a = $('ppPreviewAudio');
+    const fl = ppFlags();
+    if (fl.pp_separate + fl.pp_deharmony + fl.pp_dereverb + fl.pp_denoise === '0000') { alert('请先勾选至少一个预处理步骤'); return; }
+    btn.disabled = true; btn.textContent = '处理中…（分离/去混响较慢，请稍候）';
+    try {
+        const fd = new FormData();
+        fd.append('audio', convFile, convFile.name);
+        Object.entries(fl).forEach(([k, v]) => fd.append(k, v));
+        const r = await fetch(`${API}/preprocess`, { method: 'POST', body: fd });
+        if (!r.ok) throw new Error('服务器错误 ' + r.status);
+        const blob = await r.blob();
+        a.src = URL.createObjectURL(blob); a.style.display = 'block'; a.play().catch(() => {});
+        btn.textContent = '▶ 试听预处理后音频';
+    } catch (err) {
+        btn.textContent = '试听失败: ' + err.message;
+    }
+    btn.disabled = false;
 });
 
 const bind = (id, out, f) => { const el = $(id); el.addEventListener('input', () => $(out).textContent = f(el.value)); };
@@ -280,6 +310,7 @@ $('btnConvert').addEventListener('click', async () => {
         fd.append('rms_mix_rate', $('rmsMixRate').value / 100);
         fd.append('protect', $('protect').value / 100);
         fd.append('filter_radius', $('filterRadius').value);
+        Object.entries(ppFlags()).forEach(([k, v]) => fd.append(k, v));
         const r = await fetch(`${API}/convert`, { method: 'POST', body: fd });
         clearInterval(iv);
         if (!r.ok) throw new Error('服务器错误 ' + r.status);

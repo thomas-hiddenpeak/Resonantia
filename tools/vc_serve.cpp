@@ -13,7 +13,8 @@
  *   GET  /api/voices           -> {"voices":[...],"training":{...}}
  *   POST /api/train            -> multipart {files[], name, mode, steps, seg}
  *   GET  /api/train/status     -> {"stage","running","done","error","log"}
- *   POST /api/convert          -> multipart {audio, voice, f0_up_key, ...} -> WAV
+ *   POST /api/preprocess       -> multipart {audio, pp_*} -> cleaned WAV (preview)
+ *   POST /api/convert          -> multipart {audio, voice, f0_up_key, pp_*, ...} -> WAV
  *
  * Usage:
  *   vc_serve [--port 8080] [--webroot webui] [--repo <path>]
@@ -384,6 +385,45 @@ void handle_status(int fd, const Request& req) {
         ",\"error\":" + (error ? "true" : "false") + ",\"log\":\"" + json_escape(logtail) + "\"}");
 }
 
+// Apply selected SOTA input preprocessing (vocal/deharmony/dereverb/denoise) to
+// `in`, writing a cleaned full-length WAV path to `cleaned`. cleaned=in if none.
+bool preprocess_audio_file(const std::string& in, const std::string& tag, bool sep,
+                           bool deharm, bool derev, bool denoise, std::string& cleaned) {
+    if (!(sep || deharm || derev || denoise)) { cleaned = in; return true; }
+    std::string outdir = "/tmp/vcserve_pp_" + tag;
+    fs::remove_all(outdir); fs::create_directories(outdir);
+    std::string flags;
+    if (sep) flags += " --separate";
+    if (deharm) flags += " --deharmony";
+    if (derev) flags += " --dereverb";
+    if (denoise) flags += " --denoise";
+    std::string cmd = "'" + g.build + "/vc_preprocess' --input '" + in + "' --output-dir '" + outdir +
+        "' --sr 40000 --no-slice" + flags + " --sep-dir '" + g.models + "/separation'" +
+        " > /tmp/vcserve_pp.log 2>&1";
+    if (std::system(cmd.c_str()) != 0) return false;
+    for (auto& e : fs::directory_iterator(outdir))
+        if (e.path().extension() == ".wav") { cleaned = e.path().string(); return true; }
+    return false;
+}
+
+// POST /api/preprocess : multipart {audio, pp_*} -> cleaned WAV (preview, no conversion).
+void handle_preprocess(int fd, const Request& req) {
+    size_t b = req.content_type.find("boundary="); if (b == std::string::npos) { send_response(fd, 400, "Bad Request", "text/plain", "no boundary"); return; }
+    std::string boundary = req.content_type.substr(b + 9);
+    if (!boundary.empty() && boundary.front() == '"') boundary = boundary.substr(1, boundary.size() - 2);
+    auto parts = parse_multipart(req.body, boundary);
+    const Part* audio = nullptr;
+    for (auto& p : parts) if (!p.filename.empty()) { audio = &p; break; }
+    if (!audio) { send_response(fd, 400, "Bad Request", "text/plain", "no audio"); return; }
+    std::string in = "/tmp/vcserve_ppin.wav", cleaned;
+    { std::ofstream o(in, std::ios::binary); o.write(audio->data.data(), audio->data.size()); }
+    bool sep = field(parts, "pp_separate", "0") == "1", deharm = field(parts, "pp_deharmony", "0") == "1";
+    bool derev = field(parts, "pp_dereverb", "0") == "1", denoise = field(parts, "pp_denoise", "0") == "1";
+    if (!preprocess_audio_file(in, "preview", sep, deharm, derev, denoise, cleaned)) {
+        send_response(fd, 500, "Internal Server Error", "text/plain", "preprocessing failed"); return; }
+    send_response(fd, 200, "OK", "audio/wav", read_file(cleaned));
+}
+
 void handle_convert(int fd, const Request& req) {
     size_t b = req.content_type.find("boundary="); if (b == std::string::npos) { send_response(fd, 400, "Bad Request", "text/plain", "no boundary"); return; }
     std::string boundary = req.content_type.substr(b + 9);
@@ -399,6 +439,8 @@ void handle_convert(int fd, const Request& req) {
     double rms = std::atof(field(parts, "rms_mix_rate", "0.5").c_str());
     double protect = std::atof(field(parts, "protect", "0.5").c_str());
     int filter_radius = std::atoi(field(parts, "filter_radius", "3").c_str());
+    bool pp_sep = field(parts, "pp_separate", "0") == "1", pp_deharm = field(parts, "pp_deharmony", "0") == "1";
+    bool pp_derev = field(parts, "pp_dereverb", "0") == "1", pp_denoise = field(parts, "pp_denoise", "0") == "1";
 
     std::string model = g.gmodel, index;
     if (voice != "base" && voice != "base (pretrained)") {
@@ -409,10 +451,12 @@ void handle_convert(int fd, const Request& req) {
         if (fs::exists(vi)) index = vi;
     }
 
-    std::string in = "/tmp/vcserve_in.wav", out = "/tmp/vcserve_out.wav";
+    std::string in = "/tmp/vcserve_in.wav", out = "/tmp/vcserve_out.wav", conv_in;
     { std::ofstream o(in, std::ios::binary); o.write(audio->data.data(), audio->data.size()); }
+    if (!preprocess_audio_file(in, "conv", pp_sep, pp_deharm, pp_derev, pp_denoise, conv_in)) {
+        send_response(fd, 500, "Internal Server Error", "text/plain", "input preprocessing failed"); return; }
     std::string cmd = "'" + g.build + "/vc_convert' --hubert '" + g.hubert + "' --rmvpe '" + g.rmvpe +
-        "' --model '" + model + "' --input '" + in + "' --output '" + out +
+        "' --model '" + model + "' --input '" + conv_in + "' --output '" + out +
         "' --version v2 --speakers 109 --sr 40000 --pitch " + std::to_string(pitch) +
         " --rms-mix " + std::to_string(rms) + " --protect " + std::to_string(protect) +
         " --filter-radius " + std::to_string(filter_radius);
@@ -468,6 +512,7 @@ int main(int argc, char** argv) {
             else if (req.method == "POST" && req.path == "/api/material") handle_material(fd, req);
             else if (req.method == "POST" && req.path == "/api/step") handle_step(fd, req);
             else if (req.method == "GET" && req.path == "/api/preview") handle_preview(fd, req);
+            else if (req.method == "POST" && req.path == "/api/preprocess") handle_preprocess(fd, req);
             else if (req.method == "POST" && req.path == "/api/convert") handle_convert(fd, req);
             else if (req.method == "GET") serve_static(fd, req.path);
             else send_response(fd, 405, "Method Not Allowed", "text/plain", "no");

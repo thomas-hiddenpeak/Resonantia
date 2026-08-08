@@ -140,6 +140,21 @@
                     </div>
                 </section>
 
+                <section class="upload-section" id="convPreprocessSection">
+                    <h2>转换前预处理（可选，分步）</h2>
+                    <p class="hint">歌曲/带噪/带混响输入建议先清洗；勾选所需步骤，可先「试听」再转换。转换时会对输入自动应用同样的处理。</p>
+                    <div class="step-btns">
+                        <label class="check"><input type="checkbox" id="ppSeparate"> 🎤 分离人声</label>
+                        <label class="check"><input type="checkbox" id="ppDeharmony"> 🎶 去和声</label>
+                        <label class="check"><input type="checkbox" id="ppDereverb"> 🌊 去混响</label>
+                        <label class="check"><input type="checkbox" id="ppDenoise"> 🔇 去噪</label>
+                    </div>
+                    <div class="action-section" style="margin:8px 0 0">
+                        <button class="btn-secondary" id="btnPpPreview" disabled>▶ 试听预处理后音频</button>
+                    </div>
+                    <audio id="ppPreviewAudio" controls style="width:100%;margin-top:8px;display:none;"></audio>
+                </section>
+
                 <section class="params-section">
                     <h2>转换参数</h2>
                     <div class="param-group">
