@@ -101,9 +101,70 @@ function renderTrainFiles() {
 }
 function updateTrainBtn() {
     const name = $('voiceName').value.trim();
-    $('btnTrain').disabled = !(trainFiles.length > 0 && /^[A-Za-z0-9_-]+$/.test(name));
+    const ok = trainFiles.length > 0 && /^[A-Za-z0-9_-]+$/.test(name);
+    $('btnTrain').disabled = !ok;
+    if ($('btnUploadMaterial')) $('btnUploadMaterial').disabled = !ok;
 }
 $('voiceName').addEventListener('input', updateTrainBtn);
+
+// ---------- Per-step preprocessing ----------
+let appliedSteps = [];
+const STEP_NAMES = { separate: '分离人声', dereverb: '去混响', denoise: '去噪' };
+function renderChips() {
+    $('stepChips').textContent = appliedSteps.length ? appliedSteps.map((s) => STEP_NAMES[s]).join(' → ') : '（无）';
+}
+function setStepBusy(busy) {
+    document.querySelectorAll('.btn-step').forEach((b) => b.disabled = busy);
+    $('btnUploadMaterial').disabled = busy;
+    $('btnPreview').disabled = busy;
+}
+if ($('btnUploadMaterial')) $('btnUploadMaterial').addEventListener('click', async () => {
+    const name = $('voiceName').value.trim();
+    const fd = new FormData();
+    fd.append('name', name);
+    trainFiles.forEach((f) => fd.append('files', f, f.name));
+    $('btnUploadMaterial').disabled = true;
+    $('btnUploadMaterial').textContent = '上传中…';
+    try {
+        const r = await fetch(`${API}/material`, { method: 'POST', body: fd });
+        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error || r.status); }
+        appliedSteps = []; renderChips();
+        $('stepControls').style.display = 'block';
+        $('btnUploadMaterial').textContent = '✓ 素材已上传（可重新上传覆盖）';
+        $('btnUploadMaterial').disabled = false;
+    } catch (err) {
+        $('btnUploadMaterial').textContent = '① 上传素材（失败: ' + err.message + '）';
+        $('btnUploadMaterial').disabled = false;
+    }
+});
+document.querySelectorAll('.btn-step').forEach((btn) => btn.addEventListener('click', async () => {
+    const name = $('voiceName').value.trim(), step = btn.dataset.step;
+    const fd = new FormData(); fd.append('name', name); fd.append('step', step);
+    setStepBusy(true);
+    $('stepStatus').firstChild.textContent = `正在${STEP_NAMES[step]}… `;
+    try {
+        const r = await fetch(`${API}/step`, { method: 'POST', body: fd });
+        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error || r.status); }
+        await pollStep(name, step);
+    } catch (err) {
+        $('stepStatus').firstChild.textContent = '失败: ' + err.message + ' ';
+        setStepBusy(false);
+    }
+}));
+async function pollStep(name, step) {
+    const r = await fetch(`${API}/train/status?name=${encodeURIComponent(name)}`);
+    const s = await r.json();
+    if (s.running) { setTimeout(() => pollStep(name, step), 1200); return; }
+    setStepBusy(false);
+    if (s.error) { $('stepStatus').firstChild.textContent = STEP_NAMES[step] + '失败（见日志）'; return; }
+    appliedSteps.push(step); renderChips();
+    $('stepStatus').firstChild.textContent = '已应用：';
+}
+if ($('btnPreview')) $('btnPreview').addEventListener('click', () => {
+    const name = $('voiceName').value.trim(), a = $('previewAudio');
+    a.src = `${API}/preview?name=${encodeURIComponent(name)}&t=${Date.now()}`;
+    a.style.display = 'block'; a.play().catch(() => {});
+});
 
 $('btnTrain').addEventListener('click', async () => {
     const name = $('voiceName').value.trim();

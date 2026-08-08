@@ -63,6 +63,7 @@ void print_usage() {
         "  --dereverb         Remove reverb (MelBand-RoFormer) before slicing\n"
         "  --denoise          Remove noise (MelBand-RoFormer) before slicing\n"
         "  --sep-dir <path>   Separation model dir (default: models/separation)\n"
+        "  --no-slice         Apply separation only; write full-length files (no slicing)\n"
         "  --help             Show this help\n";
 }
 
@@ -73,6 +74,7 @@ int main(int argc, char** argv) {
     int sr = 40000;
     double seg_sec = 3.0, hop_sec = 0.0, min_rms = 0.010, trim_thresh = 0.020;
     bool trim = false, separate = false, dereverb = false, denoise = false;
+    bool no_slice = false;
     std::string sep_dir = "models/separation";
 
     for (int i = 1; i < argc; ++i) {
@@ -91,6 +93,7 @@ int main(int argc, char** argv) {
         else if (a == "--dereverb") dereverb = true;
         else if (a == "--denoise") denoise = true;
         else if (a == "--sep-dir") sep_dir = next();
+        else if (a == "--no-slice") no_slice = true;
         else { std::cerr << "Unknown argument: " << a << "\n"; return 1; }
     }
     if (input.empty() || output_dir.empty()) {
@@ -165,6 +168,17 @@ int main(int argc, char** argv) {
         }
         int n = static_cast<int>(a.size());
         std::string stem = fs::path(f).stem().string();
+        if (no_slice) {
+            char name[512];
+            std::snprintf(name, sizeof(name), "%s/%s.wav", output_dir.c_str(), stem.c_str());
+            if (!io::write_audio(name, a.data(), n, sr)) {
+                std::cerr << "error: write failed: " << name << "\n";
+                return 1;
+            }
+            ++total;
+            std::cout << "  " << fs::path(f).filename().string() << " -> processed\n";
+            continue;
+        }
         int idx = 0;
         for (int start = 0; start < n; start += hop) {
             int len = std::min(seg, n - start);

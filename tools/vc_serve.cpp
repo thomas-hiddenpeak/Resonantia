@@ -206,13 +206,19 @@ void run_training(std::string name, std::string mode, int steps, int seg, int ep
         << (epochs > 0 ? " epochs=" + std::to_string(epochs) : " steps=" + std::to_string(steps))
         << " seg=" << seg << (separate ? " +separate" : "") << "\n"; }
 
-    set_stage((separate || dereverb || denoise) ? "separating" : "preprocessing");
+    // If the material was preprocessed step-by-step (runs/<name>/work), slice that
+    // (separation already applied); otherwise slice raw and apply separation flags.
+    bool preprocessed = fs::exists(dir + "/work") && !fs::is_empty(dir + "/work");
+    std::string src = preprocessed ? dir + "/work" : dir + "/raw";
+    set_stage((!preprocessed && (separate || dereverb || denoise)) ? "separating" : "preprocessing");
     std::string sep_flags;
-    if (separate) sep_flags += " --separate";
-    if (dereverb) sep_flags += " --dereverb";
-    if (denoise) sep_flags += " --denoise";
-    if (!sep_flags.empty()) sep_flags += " --sep-dir '" + g.models + "/separation'";
-    int rc = sh("'" + g.build + "/vc_preprocess' --input '" + dir + "/raw' --output-dir '" + clips +
+    if (!preprocessed) {
+        if (separate) sep_flags += " --separate";
+        if (dereverb) sep_flags += " --dereverb";
+        if (denoise) sep_flags += " --denoise";
+        if (!sep_flags.empty()) sep_flags += " --sep-dir '" + g.models + "/separation'";
+    }
+    int rc = sh("'" + g.build + "/vc_preprocess' --input '" + src + "' --output-dir '" + clips +
                 "' --sr 40000 --seg-sec 3.0 --trim" + sep_flags +
                 " 2>&1 | grep --line-buffered -E 'clip|Wrote|error|skip|separation|reverb|noise|enabled'");
     if (rc != 0) { finish("error", true); return; }
@@ -251,6 +257,74 @@ std::string voices_json() {
       j += "],\"training\":{\"running\":" + std::string(g_job.running ? "true" : "false") +
            ",\"name\":\"" + json_escape(g_job.name) + "\",\"stage\":\"" + json_escape(g_job.stage) + "\"}}"; }
     return j;
+}
+
+// ---- per-step material preprocessing (apply each step individually, preview, then train) ----
+void run_step(std::string name, std::string step) {
+    std::string dir = g.runs + "/" + name, work = dir + "/work", tmp = dir + "/work_tmp", log = dir + "/train.log";
+    std::ofstream(log, std::ios::app) << "[serve] preprocess step '" << step << "' on '" << name << "'\n";
+    set_stage("step:" + step);
+    fs::remove_all(tmp); fs::create_directories(tmp);
+    std::string flag = step == "separate" ? "--separate" : step == "dereverb" ? "--dereverb" : "--denoise";
+    int rc = std::system(("{ '" + g.build + "/vc_preprocess' --input '" + work + "' --output-dir '" + tmp +
+        "' --sr 44100 --no-slice " + flag + " --sep-dir '" + g.models + "/separation' 2>&1 | " +
+        "grep --line-buffered -E 'processed|error|enabled' ; } >> '" + log + "' 2>&1").c_str());
+    if (rc != 0 || fs::is_empty(tmp)) { fs::remove_all(tmp); finish("error", true); return; }
+    fs::remove_all(work); fs::rename(tmp, work);
+    std::ofstream(dir + "/steps.txt", std::ios::app) << step << "\n";
+    finish("step-done", false);
+}
+
+// POST /api/material : multipart {name, files[]} -> store raw + init work set.
+void handle_material(int fd, const Request& req) {
+    size_t b = req.content_type.find("boundary="); if (b == std::string::npos) { send_response(fd, 400, "Bad Request", "text/plain", "no boundary"); return; }
+    std::string boundary = req.content_type.substr(b + 9);
+    if (!boundary.empty() && boundary.front() == '"') boundary = boundary.substr(1, boundary.size() - 2);
+    auto parts = parse_multipart(req.body, boundary);
+    std::string name = field(parts, "name", "");
+    if (!safe_name(name)) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"invalid name\"}"); return; }
+    std::string dir = g.runs + "/" + name, raw = dir + "/raw", work = dir + "/work";
+    fs::remove_all(work); fs::remove_all(raw); fs::create_directories(raw); fs::create_directories(work);
+    fs::remove(dir + "/steps.txt");
+    int nfiles = 0;
+    for (auto& p : parts)
+        if (!p.filename.empty() && !p.data.empty()) {
+            std::string fn = safe_filename(p.filename);
+            { std::ofstream o(raw + "/" + fn, std::ios::binary); o.write(p.data.data(), p.data.size()); }
+            fs::copy_file(raw + "/" + fn, work + "/" + fn, fs::copy_options::overwrite_existing);
+            ++nfiles;
+        }
+    if (nfiles == 0) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"no audio files\"}"); return; }
+    send_json(fd, "{\"name\":\"" + json_escape(name) + "\",\"files\":" + std::to_string(nfiles) + "}");
+}
+
+// POST /api/step : multipart {name, step} -> apply one separation step to the work set.
+void handle_step(int fd, const Request& req) {
+    if (g_job.running) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"busy\"}"); return; }
+    size_t b = req.content_type.find("boundary="); if (b == std::string::npos) { send_response(fd, 400, "Bad Request", "text/plain", "no boundary"); return; }
+    std::string boundary = req.content_type.substr(b + 9);
+    if (!boundary.empty() && boundary.front() == '"') boundary = boundary.substr(1, boundary.size() - 2);
+    auto parts = parse_multipart(req.body, boundary);
+    std::string name = field(parts, "name", ""), step = field(parts, "step", "");
+    if (!safe_name(name) || !fs::exists(g.runs + "/" + name + "/work")) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"upload material first\"}"); return; }
+    if (step != "separate" && step != "dereverb" && step != "denoise") { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown step\"}"); return; }
+    { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "step:" + step; g_job.done = false; g_job.error = false; }
+    g_job.running = true;
+    std::thread(run_step, name, step).detach();
+    send_json(fd, "{\"step\":\"" + json_escape(step) + "\"}");
+}
+
+// GET /api/preview?name=X : return the first work-set file as WAV for listening.
+void handle_preview(int fd, const Request& req) {
+    std::string name = query_get(req.query, "name");
+    if (!safe_name(name)) { send_response(fd, 400, "Bad Request", "text/plain", "bad name"); return; }
+    std::string work = g.runs + "/" + name + "/work";
+    if (!fs::exists(work)) { send_response(fd, 404, "Not Found", "text/plain", "no material"); return; }
+    std::string first;
+    for (auto& e : fs::directory_iterator(work)) { std::string ext = e.path().extension().string();
+        if (ext == ".wav" || ext == ".flac") { first = e.path().string(); break; } }
+    if (first.empty()) { send_response(fd, 404, "Not Found", "text/plain", "empty"); return; }
+    send_response(fd, 200, "OK", "audio/wav", read_file(first));
 }
 
 void handle_train(int fd, const Request& req) {
@@ -385,6 +459,9 @@ int main(int argc, char** argv) {
             if (req.method == "GET" && req.path == "/api/voices") send_json(fd, voices_json());
             else if (req.method == "GET" && req.path == "/api/train/status") handle_status(fd, req);
             else if (req.method == "POST" && req.path == "/api/train") handle_train(fd, req);
+            else if (req.method == "POST" && req.path == "/api/material") handle_material(fd, req);
+            else if (req.method == "POST" && req.path == "/api/step") handle_step(fd, req);
+            else if (req.method == "GET" && req.path == "/api/preview") handle_preview(fd, req);
             else if (req.method == "POST" && req.path == "/api/convert") handle_convert(fd, req);
             else if (req.method == "GET") serve_static(fd, req.path);
             else send_response(fd, 405, "Method Not Allowed", "text/plain", "no");

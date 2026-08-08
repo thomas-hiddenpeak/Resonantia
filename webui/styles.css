@@ -150,6 +150,33 @@ h2 {
     cursor: not-allowed;
 }
 
+.btn-secondary {
+    width: 100%;
+    padding: 0.7rem;
+    background: var(--panel-bg, #2a2a3a);
+    color: inherit;
+    border: 1px solid var(--primary-color);
+    border-radius: 8px;
+    font-size: 0.95rem;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.btn-secondary:hover:not(:disabled) { background: var(--primary-color); color: #fff; }
+.btn-secondary:disabled { opacity: 0.45; cursor: not-allowed; }
+.step-btns { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.btn-step {
+    flex: 1 1 auto;
+    padding: 0.6rem 0.8rem;
+    background: transparent;
+    color: inherit;
+    border: 1px solid var(--primary-color);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.btn-step:hover:not(:disabled) { background: var(--primary-color); color: #fff; }
+.btn-step:disabled { opacity: 0.45; cursor: not-allowed; }
+
 .btn-download, .btn-compare {
     padding: 0.75rem 1.5rem;
     background: var(--primary-color);

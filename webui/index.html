@@ -78,6 +78,29 @@
                     <p class="hint" id="trainDataHint">建议提供 ≥ 10 分钟 干净的单人录音（可多文件）。</p>
                 </section>
 
+                <section class="upload-section" id="preprocessSection">
+                    <h2>分步预处理素材（可选）</h2>
+                    <p class="hint">先上传素材，再逐步应用 SOTA 预处理（每步可试听）；满意后再训练。不使用此面板则按上面「录音内容」自动处理。</p>
+                    <div class="action-section" style="margin:0 0 10px">
+                        <button class="btn-secondary" id="btnUploadMaterial" disabled>① 上传素材以启用分步预处理</button>
+                    </div>
+                    <div id="stepControls" style="display:none;">
+                        <div class="param-group">
+                            <label>② 逐步处理（按需点击，可叠加）</label>
+                            <div class="step-btns">
+                                <button class="btn-step" data-step="separate">🎤 分离人声</button>
+                                <button class="btn-step" data-step="dereverb">🌊 去混响</button>
+                                <button class="btn-step" data-step="denoise">🔇 去噪</button>
+                            </div>
+                        </div>
+                        <p class="hint" id="stepStatus">已应用：<span id="stepChips">（无）</span></p>
+                        <div class="action-section" style="margin:0">
+                            <button class="btn-secondary" id="btnPreview">▶ 试听当前素材</button>
+                        </div>
+                        <audio id="previewAudio" controls style="width:100%;margin-top:8px;display:none;"></audio>
+                    </div>
+                </section>
+
                 <section class="action-section">
                     <button class="btn-convert" id="btnTrain" disabled>开始训练</button>
                 </section>
