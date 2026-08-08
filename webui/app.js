@@ -92,7 +92,7 @@ async function auditionSnapshot(name, audioEl) {
 }
 function Cascade(containerId, getName, resetBtnId) {
     const box = $(containerId);
-    const state = { ready: false, busy: false };
+    const state = { ready: false, busy: false, applied: [] };
     STAGES.forEach((s) => {
         const row = document.createElement('div'); row.className = 'stage'; row.dataset.step = s.step;
         const icon = document.createElement('span'); icon.className = 'stage-icon'; icon.textContent = s.icon;
@@ -104,6 +104,8 @@ function Cascade(containerId, getName, resetBtnId) {
         row.append(icon, nm, btn, st, au);
         box.appendChild(row);
     });
+    const orderEl = document.createElement('p'); orderEl.className = 'cascade-order'; box.appendChild(orderEl);
+    function updateOrder() { orderEl.textContent = state.applied.length ? '实际处理顺序：' + state.applied.join(' → ') : ''; }
     function setBusy(b) {
         state.busy = b;
         box.querySelectorAll('.btn-step').forEach((x) => { x.disabled = b || !state.ready; });
@@ -116,6 +118,7 @@ function Cascade(containerId, getName, resetBtnId) {
             r.querySelector('.stage-status').textContent = '';
             const a = r.querySelector('.stage-audio'); a.style.display = 'none'; a.removeAttribute('src');
         });
+        state.applied = []; updateOrder();
         setBusy(false);
     }
     async function apply(s, row, st, au) {
@@ -127,7 +130,9 @@ function Cascade(containerId, getName, resetBtnId) {
             if (!r.ok) throw new Error(await errText(r));
             const done = await pollJob(name);
             if (done.error) throw new Error('处理失败（见服务端日志）');
-            st.textContent = '已应用 ✓'; row.classList.add('applied');
+            state.applied.push(s.name);
+            st.textContent = state.applied.length + '. 已应用 ✓'; row.classList.add('applied');
+            updateOrder();
             await auditionSnapshot(name, au);
         } catch (e) { st.textContent = '失败: ' + e.message; }
         setBusy(false);

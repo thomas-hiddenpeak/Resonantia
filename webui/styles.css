@@ -427,6 +427,7 @@ details.advanced[open] summary { margin-bottom: 0.75rem; color: var(--text-color
 .stage.applied .stage-status { color: var(--success-color); }
 .stage .btn-step { flex: none; }
 .stage-audio { grid-column: 1 / -1; width: 100%; height: 34px; margin-top: 0.4rem; }
+.cascade-order { margin: 0.1rem 0 0.25rem; color: var(--primary-color); font-size: 0.85rem; font-weight: 600; }
 
 /* Audition players (original / result) */
 .audition {
