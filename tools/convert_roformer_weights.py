@@ -56,6 +56,10 @@ REGISTRY = {
     "denoise": ("denoise_roformer", "poiqazwsx/melband-roformer-denoise",
                 "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt",
                 "model_mel_band_roformer_denoise.yaml"),
+    # Removes echo AND reverb; outputs the dry stem (num_stems=1). CC-BY-NC-SA-4.0.
+    "deecho": ("deecho_roformer", "Sucial/Dereverb-Echo_Mel_Band_Roformer",
+               "dereverb_echo_mbr_v2_sdr_dry_13.4843.ckpt",
+               "config_dereverb_echo_mbr_v2.yaml"),
     # num_stems=2 (Vocals/Instrumental); output stem 0 (lead vocal) for de-harmony.
     "karaoke": ("karaoke_roformer", "becruily/mel-band-roformer-karaoke",
                 "mel_band_roformer_karaoke_becruily.ckpt", "config_karaoke_becruily.yaml", 0),

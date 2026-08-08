@@ -72,6 +72,9 @@ struct VCConfig {
     double rms_mix_rate = 0.5;           // source/target RMS energy blend [0.0, 1.0]
     double protect = 0.5;                // unvoiced protection strength [0.0, 1.0]
     int filter_radius = 0;               // F0 median-filter kernel (0=off; odd >=3 smooths)
+    double edge_pad_sec = 0.5;           // reflect-pad seconds each end (RVC x_pad; anti edge-artifact)
+    bool apply_highpass = true;          // RVC 48Hz Butterworth high-pass on 16k input
+    bool interp_unvoiced = true;         // interpolate F0 across unvoiced frames (smooth pitch)
 
     // I/O parameters
     int target_sample_rate = 0;          // 0 = keep model's native sample rate

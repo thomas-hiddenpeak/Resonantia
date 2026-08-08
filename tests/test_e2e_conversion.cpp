@@ -59,6 +59,11 @@ TEST_CASE("End-to-end voice conversion (real audio)", "[e2e][integration]") {
     cfg.num_speakers = 109;
     cfg.rms_mix_rate = 1.0;  // no RMS mixing (match reference)
     cfg.f0_up_key = 0;
+    // Reference-exact mode: the Python reference is a synth-only chain (raw F0,
+    // no high-pass, no reflect-pad), so disable the production front-end steps.
+    cfg.apply_highpass = false;
+    cfg.interp_unvoiced = false;
+    cfg.edge_pad_sec = 0.0;
 
     pipeline::VoiceConversionPipeline pipe;
     REQUIRE(pipe.init(cfg));

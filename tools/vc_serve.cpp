@@ -196,7 +196,7 @@ void finish(const std::string& stage, bool error) {
     g_job.stage = stage; g_job.error = error; g_job.done = true; g_job.running = false;
 }
 
-void run_training(std::string name, std::string mode, int steps, int seg, int epochs, bool separate, bool dereverb, bool denoise, bool deharmony, bool vad) {
+void run_training(std::string name, std::string mode, int steps, int seg, int epochs, bool separate, bool dereverb, bool deecho, bool denoise, bool deharmony, bool vad) {
     std::string dir = g.runs + "/" + name, log = dir + "/train.log";
     std::string clips = dir + "/clips", model = dir + "/model.safetensors", index = dir + "/model.index";
     auto sh = [&](const std::string& cmd) {
@@ -211,12 +211,13 @@ void run_training(std::string name, std::string mode, int steps, int seg, int ep
     // (separation already applied); otherwise slice raw and apply separation flags.
     bool preprocessed = fs::exists(dir + "/work") && !fs::is_empty(dir + "/work");
     std::string src = preprocessed ? dir + "/work" : dir + "/raw";
-    set_stage((!preprocessed && (separate || dereverb || denoise)) ? "separating" : "preprocessing");
+    set_stage((!preprocessed && (separate || dereverb || deecho || denoise)) ? "separating" : "preprocessing");
     std::string sep_flags;
     if (!preprocessed) {
         if (separate) sep_flags += " --separate";
         if (deharmony) sep_flags += " --deharmony";
         if (dereverb) sep_flags += " --dereverb";
+        if (deecho) sep_flags += " --deecho";
         if (denoise) sep_flags += " --denoise";
         if (!sep_flags.empty()) sep_flags += " --sep-dir '" + g.models + "/separation'";
     }
@@ -270,6 +271,7 @@ void run_step(std::string name, std::string step) {
     set_stage("step:" + step);
     fs::remove_all(tmp); fs::create_directories(tmp);
     std::string flag = step == "separate" ? "--separate" : step == "dereverb" ? "--dereverb"
+                     : step == "deecho" ? "--deecho"
                      : step == "deharmony" ? "--deharmony" : "--denoise";
     int rc = std::system(("{ '" + g.build + "/vc_preprocess' --input '" + work + "' --output-dir '" + tmp +
         "' --sr 44100 --no-slice " + flag + " --sep-dir '" + g.models + "/separation' 2>&1 | " +
@@ -312,7 +314,7 @@ void handle_step(int fd, const Request& req) {
     auto parts = parse_multipart(req.body, boundary);
     std::string name = field(parts, "name", ""), step = field(parts, "step", "");
     if (!safe_name(name) || !fs::exists(g.runs + "/" + name + "/work")) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"upload material first\"}"); return; }
-    if (step != "separate" && step != "dereverb" && step != "denoise" && step != "deharmony") { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown step\"}"); return; }
+    if (step != "separate" && step != "dereverb" && step != "deecho" && step != "denoise" && step != "deharmony") { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown step\"}"); return; }
     { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "step:" + step; g_job.done = false; g_job.error = false; }
     g_job.running = true;
     std::thread(run_step, name, step).detach();
@@ -345,6 +347,7 @@ void handle_train(int fd, const Request& req) {
     int epochs = std::atoi(field(parts, "epochs", "0").c_str());
     bool separate = field(parts, "separate", "0") == "1";
     bool dereverb = field(parts, "dereverb", "0") == "1";
+    bool deecho = field(parts, "deecho", "0") == "1";
     bool denoise = field(parts, "denoise", "0") == "1";
     bool deharmony = field(parts, "deharmony", "0") == "1";
     bool vad = field(parts, "vad", "0") == "1";
@@ -366,7 +369,7 @@ void handle_train(int fd, const Request& req) {
 
     { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "queued"; g_job.done = false; g_job.error = false; }
     g_job.running = true;
-    std::thread(run_training, name, mode, steps, seg, epochs, separate, dereverb, denoise, deharmony, vad).detach();
+    std::thread(run_training, name, mode, steps, seg, epochs, separate, dereverb, deecho, denoise, deharmony, vad).detach();
     send_json(fd, "{\"job\":\"" + json_escape(name) + "\",\"files\":" + std::to_string(nfiles) + "}");
 }
 
@@ -388,14 +391,15 @@ void handle_status(int fd, const Request& req) {
 // Apply selected SOTA input preprocessing (vocal/deharmony/dereverb/denoise) to
 // `in`, writing a cleaned full-length WAV path to `cleaned`. cleaned=in if none.
 bool preprocess_audio_file(const std::string& in, const std::string& tag, bool sep,
-                           bool deharm, bool derev, bool denoise, std::string& cleaned) {
-    if (!(sep || deharm || derev || denoise)) { cleaned = in; return true; }
+                           bool deharm, bool derev, bool deecho, bool denoise, std::string& cleaned) {
+    if (!(sep || deharm || derev || deecho || denoise)) { cleaned = in; return true; }
     std::string outdir = "/tmp/vcserve_pp_" + tag;
     fs::remove_all(outdir); fs::create_directories(outdir);
     std::string flags;
     if (sep) flags += " --separate";
     if (deharm) flags += " --deharmony";
     if (derev) flags += " --dereverb";
+    if (deecho) flags += " --deecho";
     if (denoise) flags += " --denoise";
     std::string cmd = "'" + g.build + "/vc_preprocess' --input '" + in + "' --output-dir '" + outdir +
         "' --sr 40000 --no-slice" + flags + " --sep-dir '" + g.models + "/separation'" +
@@ -419,7 +423,8 @@ void handle_preprocess(int fd, const Request& req) {
     { std::ofstream o(in, std::ios::binary); o.write(audio->data.data(), audio->data.size()); }
     bool sep = field(parts, "pp_separate", "0") == "1", deharm = field(parts, "pp_deharmony", "0") == "1";
     bool derev = field(parts, "pp_dereverb", "0") == "1", denoise = field(parts, "pp_denoise", "0") == "1";
-    if (!preprocess_audio_file(in, "preview", sep, deharm, derev, denoise, cleaned)) {
+    bool deecho = field(parts, "pp_deecho", "0") == "1";
+    if (!preprocess_audio_file(in, "preview", sep, deharm, derev, deecho, denoise, cleaned)) {
         send_response(fd, 500, "Internal Server Error", "text/plain", "preprocessing failed"); return; }
     send_response(fd, 200, "OK", "audio/wav", read_file(cleaned));
 }
@@ -441,6 +446,7 @@ void handle_convert(int fd, const Request& req) {
     int filter_radius = std::atoi(field(parts, "filter_radius", "3").c_str());
     bool pp_sep = field(parts, "pp_separate", "0") == "1", pp_deharm = field(parts, "pp_deharmony", "0") == "1";
     bool pp_derev = field(parts, "pp_dereverb", "0") == "1", pp_denoise = field(parts, "pp_denoise", "0") == "1";
+    bool pp_deecho = field(parts, "pp_deecho", "0") == "1";
 
     std::string model = g.gmodel, index;
     if (voice != "base" && voice != "base (pretrained)") {
@@ -453,7 +459,7 @@ void handle_convert(int fd, const Request& req) {
 
     std::string in = "/tmp/vcserve_in.wav", out = "/tmp/vcserve_out.wav", conv_in;
     { std::ofstream o(in, std::ios::binary); o.write(audio->data.data(), audio->data.size()); }
-    if (!preprocess_audio_file(in, "conv", pp_sep, pp_deharm, pp_derev, pp_denoise, conv_in)) {
+    if (!preprocess_audio_file(in, "conv", pp_sep, pp_deharm, pp_derev, pp_deecho, pp_denoise, conv_in)) {
         send_response(fd, 500, "Internal Server Error", "text/plain", "input preprocessing failed"); return; }
     std::string cmd = "'" + g.build + "/vc_convert' --hubert '" + g.hubert + "' --rmvpe '" + g.rmvpe +
         "' --model '" + model + "' --input '" + conv_in + "' --output '" + out +

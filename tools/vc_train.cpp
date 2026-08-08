@@ -100,6 +100,7 @@ int main(int argc, char** argv) {
     int speaker = 0, steps = 300, seg = 40, epochs = 0;
     unsigned seed = 0;
     float lr = 2e-4f;
+    float lr_decay = 0.999875f;  // RVC ExponentialLR gamma (per epoch)
     bool gan_mode = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -117,6 +118,7 @@ int main(int argc, char** argv) {
         else if (a == "--steps") steps = std::atoi(next("--steps"));
         else if (a == "--epochs") epochs = std::atoi(next("--epochs"));
         else if (a == "--lr") lr = std::atof(next("--lr"));
+        else if (a == "--lr-decay") lr_decay = std::atof(next("--lr-decay"));
         else if (a == "--seg") seg = std::atoi(next("--seg"));
         else if (a == "--seed") seed = static_cast<unsigned>(std::atoi(next("--seed")));
         else { std::cerr << "Unknown argument: " << a << "\n"; return 1; }
@@ -223,10 +225,10 @@ int main(int argc, char** argv) {
     if (clips.empty()) { std::cerr << "error: no usable clips\n"; return 1; }
 
     // Epoch = one pass over all segments; steps scale with the dataset size (RVC-style).
+    long long total_frames = 0;
+    for (const auto& c : clips) total_frames += c.T;
+    int per_epoch = std::max<int>(1, static_cast<int>(total_frames / seg));
     if (epochs > 0) {
-        long long total_frames = 0;
-        for (const auto& c : clips) total_frames += c.T;
-        int per_epoch = std::max<int>(1, static_cast<int>(total_frames / seg));
         steps = std::max(1, epochs * per_epoch);
         std::cout << "Epochs " << epochs << " x " << per_epoch << " seg/epoch ("
                   << total_frames << " frames) -> " << steps << " steps\n";
@@ -272,8 +274,10 @@ int main(int argc, char** argv) {
             if ((it + 1) % 10 == 0 || it == 0)
                 std::printf("  step %4d/%d  D=%.3f G=%.3f (mel=%.4f kl=%.4f fm=%.4f adv=%.4f)\n",
                             it + 1, steps, ls.d, ls.g, ls.mel, ls.kl, ls.fm, ls.adv);
+            // RVC ExponentialLR: decay LR once per epoch.
+            if (lr_decay < 1.0f && (it + 1) % per_epoch == 0) gan.decay_lr(lr_decay);
         }
-        std::printf("GAN fine-tune done: mel %.4f -> %.4f\n", first, last);
+        std::printf("GAN fine-tune done: mel %.4f -> %.4f (final lr=%.2e)\n", first, last, gan.g_lr());
         if (!gan.export_model(pretrained, out)) { std::cerr << "error: export failed\n"; return 1; }
         std::cout << "Exported fine-tuned model: " << out << "\n";
         return 0;

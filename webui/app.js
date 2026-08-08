@@ -109,7 +109,7 @@ $('voiceName').addEventListener('input', updateTrainBtn);
 
 // ---------- Per-step preprocessing ----------
 let appliedSteps = [];
-const STEP_NAMES = { separate: '分离人声', deharmony: '去和声', dereverb: '去混响', denoise: '去噪' };
+const STEP_NAMES = { separate: '分离人声', deharmony: '去和声', dereverb: '去混响', deecho: '去回声', denoise: '去噪' };
 function renderChips() {
     $('stepChips').textContent = appliedSteps.length ? appliedSteps.map((s) => STEP_NAMES[s]).join(' → ') : '（无）';
 }
@@ -176,6 +176,7 @@ $('btnTrain').addEventListener('click', async () => {
     fd.append('epochs', $('trainEpochs').value);
     fd.append('separate', $('recContent').value === 'song' ? '1' : '0');
     fd.append('dereverb', ($('recContent').value === 'song' || $('recReverb').checked) ? '1' : '0');
+    fd.append('deecho', $('recEcho') && $('recEcho').checked ? '1' : '0');
     fd.append('deharmony', $('recContent').value === 'song' ? '1' : '0');
     fd.append('denoise', $('recDenoise') && $('recDenoise').checked ? '1' : '0');
     fd.append('vad', $('recVad') && $('recVad').checked ? '1' : '0');
@@ -263,13 +264,14 @@ const ppFlags = () => ({
     pp_separate: $('ppSeparate') && $('ppSeparate').checked ? '1' : '0',
     pp_deharmony: $('ppDeharmony') && $('ppDeharmony').checked ? '1' : '0',
     pp_dereverb: $('ppDereverb') && $('ppDereverb').checked ? '1' : '0',
+    pp_deecho: $('ppDeecho') && $('ppDeecho').checked ? '1' : '0',
     pp_denoise: $('ppDenoise') && $('ppDenoise').checked ? '1' : '0',
 });
 if ($('btnPpPreview')) $('btnPpPreview').addEventListener('click', async () => {
     if (!convFile) return;
     const btn = $('btnPpPreview'), a = $('ppPreviewAudio');
     const fl = ppFlags();
-    if (fl.pp_separate + fl.pp_deharmony + fl.pp_dereverb + fl.pp_denoise === '0000') { alert('请先勾选至少一个预处理步骤'); return; }
+    if (fl.pp_separate + fl.pp_deharmony + fl.pp_dereverb + fl.pp_deecho + fl.pp_denoise === '00000') { alert('请先勾选至少一个预处理步骤'); return; }
     btn.disabled = true; btn.textContent = '处理中…（分离/去混响较慢，请稍候）';
     try {
         const fd = new FormData();

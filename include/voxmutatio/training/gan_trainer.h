@@ -44,6 +44,13 @@ class GANTrainer {
   }
   GeneratorTrainer& generator() { return gen_; }
 
+  /// RVC ExponentialLR: multiply both optimizers' LR by gamma (call per epoch).
+  void decay_lr(float gamma) {
+    if (g_opt_) g_opt_->set_lr(g_opt_->lr() * gamma);
+    if (d_opt_) d_opt_->set_lr(d_opt_->lr() * gamma);
+  }
+  [[nodiscard]] float g_lr() const { return g_opt_ ? g_opt_->lr() : 0.0f; }
+
  private:
   GeneratorTrainer gen_;
   PosteriorEncoder enc_q_;
