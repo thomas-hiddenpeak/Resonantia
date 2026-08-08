@@ -7,6 +7,7 @@
 #include "voxmutatio/core/types.h"
 #include "voxmutatio/content/hubert_encoder.h"
 #include "voxmutatio/f0/rmvpe.h"
+#include "voxmutatio/f0/fcpe.h"
 #include "voxmutatio/index/cuda_flat_index.h"
 #include "voxmutatio/synthesizer/synthesizer.h"
 
@@ -52,6 +53,9 @@ public:
     [[nodiscard]] int num_speakers() const;
 
 private:
+    /// Extract F0 with the configured method (RMVPE default, FCPE if selected+loaded).
+    std::vector<float> extract_f0(const float* audio, int num_samples);
+
     /// Content → synth for one 16k mono segment using a precomputed F0/UV slice
     /// (both at 100Hz / hop=160). Runs HuBERT → index → 2x-interp → protect →
     /// coarse-pitch → VITS. Timing is accumulated into `timing`.
@@ -72,6 +76,10 @@ private:
 
     f0::RmvpeExtractor f0_extractor_;
     f0::RmvpeConfig f0_cfg_;
+
+    f0::FcpeExtractor fcpe_extractor_;
+    f0::FcpeConfig fcpe_cfg_;
+    bool fcpe_loaded_ = false;
 
     index::CudaFlatIndex feature_index_;
 

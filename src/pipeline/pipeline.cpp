@@ -166,6 +166,13 @@ bool VoiceConversionPipeline::init(const VCConfig& config) {
     f0_cfg_.model_path = config.rmvpe_model_path;
     f0_extractor_.init(f0_cfg_);
 
+    // Optional FCPE F0 extractor (used when config.f0_method == kFcpe).
+    fcpe_loaded_ = false;
+    if (!config.fcpe_model_path.empty()) {
+        fcpe_cfg_.model_path = config.fcpe_model_path;
+        fcpe_loaded_ = fcpe_extractor_.init(fcpe_cfg_);
+    }
+
     synth_cfg_.model_path = config.synthesizer_model_path;
     synth_cfg_.version = config.version;
     synth_cfg_.has_f0 = config.has_f0;
@@ -183,7 +190,15 @@ bool VoiceConversionPipeline::init(const VCConfig& config) {
     return true;
 }
 
-// Content -> synth for one 16k segment, driven by a precomputed F0/UV slice (100Hz).
+// Dispatch F0 extraction to the configured method. FCPE falls back to RMVPE if
+// it was not loaded (no model path), so callers never silently get zero F0.
+std::vector<float> VoiceConversionPipeline::extract_f0(const float* audio, int num_samples) {
+    if (config_.f0_method == F0Method::kFcpe && fcpe_loaded_)
+        return fcpe_extractor_.infer(audio, num_samples);
+    return f0_extractor_.infer(audio, num_samples);
+}
+
+
 // Mirrors the historical whole-clip path exactly (HuBERT -> index -> 2x-interp ->
 // protect -> coarse-pitch -> VITS), so callers own F0 computation and stitching.
 AudioBuffer VoiceConversionPipeline::synth_segment(
@@ -273,7 +288,7 @@ VCResult VoiceConversionPipeline::convert_long(std::vector<float>& audio16k, int
 
     // F0 once on the whole padded clip -> globally consistent pitch (RVC does this).
     auto t0 = clock::now();
-    auto f0 = f0_extractor_.infer(apad.data(), np);
+    auto f0 = extract_f0(apad.data(), np);
     std::vector<std::uint8_t> uv(f0.size());
     for (size_t i = 0; i < f0.size(); ++i) uv[i] = (f0[i] <= 0.0f) ? 1 : 0;
     if (config_.interp_unvoiced) interp_unvoiced_f0(f0);
@@ -388,9 +403,9 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
     audio16k = reflect_pad(audio16k, pad16k);
     int n16k = static_cast<int>(audio16k.size());
 
-    // 2. RMVPE F0 [Tr]; pre-interp voicing mask drives consonant protection.
+    // 2. F0 (RMVPE or FCPE); pre-interp voicing mask drives consonant protection.
     auto t0 = clock::now();
-    auto f0 = f0_extractor_.infer(audio16k.data(), n16k);
+    auto f0 = extract_f0(audio16k.data(), n16k);
     std::vector<uint8_t> uv(f0.size());
     for (size_t i = 0; i < f0.size(); ++i) uv[i] = (f0[i] <= 0.0f) ? 1 : 0;
     if (config_.interp_unvoiced) interp_unvoiced_f0(f0);

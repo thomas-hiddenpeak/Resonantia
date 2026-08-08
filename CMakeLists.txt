@@ -233,6 +233,12 @@ if(VOXMUTATIO_BUILD_TESTS)
     target_include_directories(test_long_audio_chunking PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME test_long_audio_chunking COMMAND test_long_audio_chunking WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+    # Test: FCPE F0 extractor aligned with torchfcpe (spec 001 FR-004)
+    add_executable(test_fcpe_alignment tests/test_fcpe_alignment.cpp)
+    target_link_libraries(test_fcpe_alignment PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
+    target_include_directories(test_fcpe_alignment PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME test_fcpe_alignment COMMAND test_fcpe_alignment WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
     # Test: Feature index retrieval (RVC weighted k-NN)
     add_executable(test_index_retrieval tests/test_index_retrieval.cpp)
     target_link_libraries(test_index_retrieval PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)

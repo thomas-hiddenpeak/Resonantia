@@ -27,7 +27,7 @@
 | **WebUI (可运行)** | ✅ 可用 | `vc_serve`(纯 C++ HTTP,静态 + `/api/convert`),curl 验证前端可用 |
 | 长音频 (>5min) 分块推理 | ✅ 可用 | pipeline.convert_long:整段一次 F0(全局音高)→静音切点分块(chunk_pad 上下文)→按绝对输出位置拼接;短片段走原路径(e2e corr 保持 0.999716);test_long_audio_chunking 幅度谱对齐 spec_corr=0.986(NSF 相位重置使波形相关无效,改用相位无关幅度谱指标) |
 | WavLM 内容编码 | ⚠️ 桩 | 文件存在,未接入/未验证 → 计划实现真实 WavLM-Base+(超越 RVC 的 HuBERT) |
-| FCPE 实时 F0 | ⚠️ 桩 | 未实现 → 计划端口 torchfcpe conformer + `--f0-method` 可选 |
+| FCPE 实时 F0 | ✅ 可用(已对齐) | 真实 torchfcpe CFNaiveMelPE 端口(log-mel→input_stack→6×卷积 conformer→weight-norm→sigmoid→local-argmax cent 解码);对齐 torchfcpe:mel mean|Δ|5.7e-6、F0 V/UV 100%、medianΔ=1.5e-5Hz;`--f0-method rmvpe\|fcpe` 分发,端到端转换通过。（当前主机 FFT/卷积,F0~6.8s;CUDA 化为后续性能项） |
 | 声源分离 (separation/) | ✅ 可用(5 任务) | MelBand-RoFormer 配置驱动 runner(band-split+RoPE 门控注意力+批量 GEMM+显存池,去混响 2.9×);人声/去和声/去混响/去回声/去噪 5 个 SOTA 权重全部转换对齐(band-split 3.3e-6、transformer 4.9e-7、mask 1.35e-6);Silero VAD v5 纯 C++/CUDA 智能切分(对齐 2.5e-7);接入 `vc_preprocess` + WebUI 级联。**每任务仍为单一硬编码模型,多模型可选见 spec 005** |
 | CLI: vc_batch / vc_probe | ✅ vc_batch 可用 / ⚠️ vc_probe 骨架 | vc_batch:一次载入模型循环转整目录(--recursive + 与 vc_convert 参数对齐),真实 2 文件端到端验证 |
 

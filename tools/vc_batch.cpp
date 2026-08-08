@@ -32,6 +32,8 @@ void print_usage() {
         << "  --model <path>        VITS synthesizer safetensors path\n"
         << "  --index <path>        CUDA Flat Index file (optional)\n"
         << "  --rmvpe <path>        RMVPE model safetensors (optional)\n"
+        << "  --fcpe <path>         FCPE model safetensors (optional)\n"
+        << "  --f0-method <name>    F0 extractor: rmvpe (default) or fcpe\n"
         << "  --speaker <id>        Speaker ID (default: 0)\n"
         << "  --pitch <semitones>   Pitch shift in semitones (default: 0)\n"
         << "  --index-rate <0-1>    Index blend rate (default: 0.0)\n"
@@ -75,6 +77,12 @@ int main(int argc, char** argv) {
         else if (arg == "--model" && i + 1 < argc) config.synthesizer_model_path = argv[++i];
         else if (arg == "--index" && i + 1 < argc) config.index_path = argv[++i];
         else if (arg == "--rmvpe" && i + 1 < argc) config.rmvpe_model_path = argv[++i];
+        else if (arg == "--fcpe" && i + 1 < argc) config.fcpe_model_path = argv[++i];
+        else if (arg == "--f0-method" && i + 1 < argc) {
+            std::string mth = argv[++i];
+            config.f0_method = (mth == "fcpe") ? voxmutatio::F0Method::kFcpe
+                                                : voxmutatio::F0Method::kRmvpe;
+        }
         else if (arg == "--speaker" && i + 1 < argc) speaker_id = std::atoi(argv[++i]);
         else if (arg == "--pitch" && i + 1 < argc) config.f0_up_key = std::atoi(argv[++i]);
         else if (arg == "--index-rate" && i + 1 < argc) config.index_rate = std::atof(argv[++i]);
