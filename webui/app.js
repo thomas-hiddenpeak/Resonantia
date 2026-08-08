@@ -316,8 +316,10 @@ $('btnConvert').addEventListener('click', async () => {
     $('btnConvert').disabled = true;
     $('convProgress').style.display = 'block';
     $('resultSection').style.display = 'none';
-    let p = 0;
-    const iv = setInterval(() => { p = Math.min(90, p + Math.random() * 12); $('convFill').style.width = p + '%'; $('convInfo').textContent = `转换中… ${Math.round(p)}%`; }, 500);
+    // Single blocking request -> honest indeterminate bar + elapsed time (no fake %).
+    $('convFill').classList.add('indeterminate');
+    const t0 = Date.now();
+    const iv = setInterval(() => { $('convInfo').textContent = `转换中… 已用 ${Math.round((Date.now() - t0) / 1000)}s`; }, 500);
     try {
         const fd = new FormData();
         fd.append('audio', convFile, convFile.name);
@@ -334,7 +336,7 @@ $('btnConvert').addEventListener('click', async () => {
         const blob = await r.blob();
         if (convUrl) URL.revokeObjectURL(convUrl);
         convUrl = URL.createObjectURL(blob);
-        $('convFill').style.width = '100%'; $('convInfo').textContent = '完成！';
+        $('convFill').classList.remove('indeterminate'); $('convFill').style.width = '100%'; $('convInfo').textContent = '完成！';
         setTimeout(() => {
             $('convProgress').style.display = 'none';
             $('resultSection').style.display = 'block';
@@ -344,6 +346,7 @@ $('btnConvert').addEventListener('click', async () => {
         }, 600);
     } catch (err) {
         clearInterval(iv);
+        $('convFill').classList.remove('indeterminate'); $('convFill').style.width = '0%';
         $('convInfo').textContent = '转换失败: ' + err.message;
         $('btnConvert').disabled = false;
     }

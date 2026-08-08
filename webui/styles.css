@@ -22,6 +22,7 @@ body {
     color: var(--text-color);
     min-height: 100vh;
     padding: 2rem;
+    accent-color: var(--primary-color);
 }
 
 .container {
@@ -213,6 +214,17 @@ h2 {
     transition: width 0.3s;
 }
 
+/* Honest indeterminate bar for the single-shot convert request (no server %). */
+.progress-fill.indeterminate {
+    width: 40%;
+    transition: none;
+    animation: indet 1.2s infinite ease-in-out;
+}
+@keyframes indet {
+    0% { margin-left: -40%; }
+    100% { margin-left: 100%; }
+}
+
 .progress-info {
     color: var(--text-muted);
     font-size: 0.9rem;
@@ -387,3 +399,14 @@ details.advanced summary {
     user-select: none;
 }
 details.advanced[open] summary { margin-bottom: 0.75rem; color: var(--text-color); }
+
+/* Small screens (phones/tablets) */
+@media (max-width: 640px) {
+    body { padding: 1rem; }
+    header { margin-bottom: 1.5rem; }
+    header h1 { font-size: 1.9rem; }
+    section { padding: 1rem; }
+    .upload-area { padding: 1.5rem; }
+    .upload-icon { font-size: 2.2rem; }
+    .tab-btn { font-size: 0.9rem; padding: 0.7rem 0.5rem; }
+}
