@@ -28,7 +28,7 @@
 | WavLM 内容编码 | ⚠️ 桩 | 文件存在,未接入/未验证 |
 | FCPE 实时 F0 | ⚠️ 桩 | 未实现 |
 | 声源分离 (separation/) | ✅ 可用(5 任务) | MelBand-RoFormer 配置驱动 runner(band-split+RoPE 门控注意力+批量 GEMM+显存池,去混响 2.9×);人声/去和声/去混响/去回声/去噪 5 个 SOTA 权重全部转换对齐(band-split 3.3e-6、transformer 4.9e-7、mask 1.35e-6);Silero VAD v5 纯 C++/CUDA 智能切分(对齐 2.5e-7);接入 `vc_preprocess` + WebUI 级联。**每任务仍为单一硬编码模型,多模型可选见 spec 005** |
-| CLI: vc_batch / vc_probe | ⚠️ 骨架 | 存在但未随对齐更新验证 |
+| CLI: vc_batch / vc_probe | ✅ vc_batch 可用 / ⚠️ vc_probe 骨架 | vc_batch:一次载入模型循环转整目录(--recursive + 与 vc_convert 参数对齐),真实 2 文件端到端验证 |
 
 ---
 
@@ -39,8 +39,8 @@
 | 001-voice-conversion-engine | 推理引擎(内容/F0/检索/合成/pipeline) | 核心管线 Complete,但**部分 MUST 未满足**:FR-003 WavLM=桩、FR-004 FCPE=桩(仅 RMVPE 可用)、FR-010 vc_batch=骨架、>5min 分块未做 → 归入 **spec 005** |
 | 002-voice-training | 训练/微调:纯 C++/CUDA autograd(方案 A) · 40k | Complete(解码器 + 完整 GAN)— A0-A2 autograd/AdamW/可微 mel;解码器对齐 0.9997、fine-tune -70%、导出往返 corr 1.0;完整 VITS GAN:exp/conv2d/flip_rows 梯度检查、enc_q 重建 corr 0.956、flow 逆 9e-7、MPD-V2 判别器、KL/fm/adv,`vc_train --gan` 端到端 |
 | 003-webui | 面向普通用户的 WebUI:`vc_serve` 后端 + 前端 | Complete(基础)— 纯 C++ HTTP 服务静态前端 + /api/convert,curl 验证 |
-| 004-source-separation | 音频前处理:人声分离/去和声/去混响/去回声/去噪(纯 C++/CUDA) | Runners Complete — S0–S6 全部完成(5 个 MelBand-RoFormer + VAD,接入预处理+WebUI)。剩:每任务多模型可选(spec 005) |
-| 005-option-parity | 选项对齐/可选 SOTA 模型/长音频分块/批量/实时 | Draft(规划)— 汇总审计缺口:真实 FCPE+F0 可选、每环节多模型可选、长音频分块、批量、formant/重采样、实时流式 |
+| 004-source-separation | 音频前处理:人声分离/去和声/去混响/去回声/去噪(纯 C++/CUDA) | Runners Complete — S0–S6 全部完成(5 个 MelBand-RoFormer + VAD,接入预处理+WebUI)。S7(每任务多模型可选)待做 |
+| ~~005-option-parity~~ | (已撤销) | ❌ **违反宪法 Sequential Completion + Necessity Audit 已删除**;条目归位:FCPE/WavLM/批量/分块→001 完成计划、多模型可选→004 S7、实时→待 001 完成后再建 spec |
 
 > 注:`001` 的 spec.md 已标 Complete 并附验证清单;其 `plan.md` 覆盖范围原本包含训练/WebUI(P6),但这两项实际未完成,已在下方"已知偏差"记录,并将拆分为独立 spec 002/003。
 

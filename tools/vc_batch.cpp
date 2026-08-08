@@ -5,6 +5,7 @@
  * Usage:
  *   vc_batch --input-dir <dir> --output-dir <dir> [options]
  */
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -35,6 +36,12 @@ void print_usage() {
         << "  --pitch <semitones>   Pitch shift in semitones (default: 0)\n"
         << "  --index-rate <0-1>    Index blend rate (default: 0.0)\n"
         << "  --rms-mix <0-1>       RMS energy mix rate (default: 0.5)\n"
+        << "  --protect <0-1>       Unvoiced protection (default: 0.5)\n"
+        << "  --filter-radius <n>   F0 median filter radius (default: 3)\n"
+        << "  --version <v1|v2>     Model version (default: v1)\n"
+        << "  --speakers <n>        Speaker embedding count (default: 1)\n"
+        << "  --sr <hz>             Model output sample rate (default: 40000)\n"
+        << "  --recursive           Recurse into subdirectories\n"
         << "  --half                Use FP16 inference\n"
         << "  --device <cuda|cpu>   Compute device (default: cuda)\n"
         << "  --help                Show this help\n";
@@ -58,6 +65,7 @@ int main(int argc, char** argv) {
     voxmutatio::VCConfig config;
     std::string input_dir, output_dir;
     int speaker_id = 0;
+    bool recursive = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -71,6 +79,15 @@ int main(int argc, char** argv) {
         else if (arg == "--pitch" && i + 1 < argc) config.f0_up_key = std::atoi(argv[++i]);
         else if (arg == "--index-rate" && i + 1 < argc) config.index_rate = std::atof(argv[++i]);
         else if (arg == "--rms-mix" && i + 1 < argc) config.rms_mix_rate = std::atof(argv[++i]);
+        else if (arg == "--protect" && i + 1 < argc) config.protect = std::atof(argv[++i]);
+        else if (arg == "--filter-radius" && i + 1 < argc) config.filter_radius = std::atoi(argv[++i]);
+        else if (arg == "--version" && i + 1 < argc) {
+            std::string v = argv[++i];
+            config.version = (v == "v2") ? voxmutatio::ModelVersion::kV2 : voxmutatio::ModelVersion::kV1;
+        }
+        else if (arg == "--speakers" && i + 1 < argc) config.num_speakers = std::atoi(argv[++i]);
+        else if (arg == "--sr" && i + 1 < argc) config.model_sample_rate = std::atoi(argv[++i]);
+        else if (arg == "--recursive") recursive = true;
         else if (arg == "--half") config.use_half_precision = true;
         else if (arg == "--device" && i + 1 < argc) config.device = argv[++i];
         else {
@@ -110,32 +127,37 @@ int main(int argc, char** argv) {
     // Create output directory
     fs::create_directories(output_dir);
 
-    // Collect audio files
+    // Collect audio files (optionally recursive), deterministic order.
     std::vector<std::string> audio_files;
-    for (const auto& entry : fs::directory_iterator(input_dir)) {
-        std::string ext = entry.path().extension().string();
-        if (ext == ".wav" || ext == ".flac") {
-            audio_files.push_back(entry.path().string());
+    auto collect = [&](auto it) {
+        for (const auto& entry : it) {
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext == ".wav" || ext == ".flac") audio_files.push_back(entry.path().string());
         }
-    }
+    };
+    if (recursive) collect(fs::recursive_directory_iterator(input_dir));
+    else collect(fs::directory_iterator(input_dir));
+    std::sort(audio_files.begin(), audio_files.end());
 
     std::cout << "Found " << audio_files.size() << " audio files\n";
     
     int success_count = 0;
     int fail_count = 0;
+    int idx = 0;
 
     for (const auto& input_path : audio_files) {
+        ++idx;
         std::string output_path = output_dir + "/" + fs::path(input_path).stem().string() + ".wav";
-        
-        std::cout << "Converting: " << fs::path(input_path).filename().string() << "\r\033[K";
-        
+        std::cout << "[" << idx << "/" << audio_files.size() << "] "
+                  << fs::path(input_path).filename().string() << " ... " << std::flush;
         auto result = pipeline.convert_file(input_path, output_path, speaker_id);
-        
         if (result.success) {
-            success_count++;
+            ++success_count;
+            std::cout << "ok (" << static_cast<long>(result.total_ms) << " ms)\n";
         } else {
-            fail_count++;
-            std::cerr << "\nFailed: " << input_path << " - " << result.error_message << "\n";
+            ++fail_count;
+            std::cout << "FAILED: " << result.error_message << "\n";
         }
     }
 

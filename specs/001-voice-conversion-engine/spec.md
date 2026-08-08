@@ -136,3 +136,19 @@ Per Constitution v1.4.0 Spec Completion Criteria:
 - 用户已使用 Python 转换工具将 `.pth` 权重转换为 `.safetensors`
 - 输入音频为 WAV 或 FLAC 格式
 - 模型的说话人数量在权重中已固定（不支持动态添加）
+
+## Completion Plan (open items — audited 2026-08-09)
+
+本 spec 曾被当作 “Complete(推理部分)”，经代码实测属**过早**。以下 MUST 未满足，
+依宪法 *Sequential Completion* 在**本 spec 内**推进（不另建 spec）：
+
+| 项 | 现状 | 决策 | 优先级 |
+|---|---|---|---|
+| FR-010 vc_batch | ✅ 已实现+实测 | 一次载入模型循环转整目录(--recursive + 与 vc_convert 参数对齐);真实 2 文件端到端通过 | **✓ 完成** |
+| Edge >5min 分块推理 | 未做 | pipeline 加静音切点分块+交叉浡化（短片段恒等，保 e2e corr>0.99） | P0 |
+| FR-004 FCPE F0 | 桩(返回 0) | 实现真实 FCPE + `--f0-method` 可选 | P1 |
+| FR-003 WavLM 编码器 | 桩 | **建议按原则 VII(YAGNI)降为可选/暂缓**(HuBERT/ContentVec 已满足 v2 标准)；需维护者批准后升版修订 | 待批准 |
+
+> 每项完成后勾选对应 FR；全部满足并通过集成测试后，001 方可标 Complete。
+> 「每环节多 SOTA 模型可选」属 spec 004 扩展(S7)；「实时流式」为全新功能，
+> 依 Sequential Completion 须在 001 完成后再建 spec。
