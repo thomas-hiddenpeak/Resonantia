@@ -2,6 +2,18 @@
 const API = '/api';
 const $ = (id) => document.getElementById(id);
 
+// Extract a human-readable message from a non-OK response (JSON {error} or text).
+async function errText(r) {
+    const t = await r.text().catch(() => '');
+    let m = t;
+    if (t) { try { m = JSON.parse(t).error || t; } catch (e) { m = t; } }
+    m = (m || ('服务器错误 ' + r.status)).trim();
+    return m.length > 300 ? m.slice(-300) : m;
+}
+function setConn(online) {
+    const b = $('connBanner'); if (b) b.style.display = online ? 'none' : 'block';
+}
+
 // ---------- Tabs ----------
 document.querySelectorAll('.tab-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -92,8 +104,10 @@ function renderTrainFiles() {
     const ul = $('trainFileList'); ul.innerHTML = '';
     trainFiles.forEach((f, i) => {
         const li = document.createElement('li');
-        li.innerHTML = `<span>${f.name}</span> <button data-i="${i}">✕</button>`;
-        li.querySelector('button').onclick = () => { trainFiles.splice(i, 1); renderTrainFiles(); };
+        const span = document.createElement('span'); span.textContent = f.name;
+        const btn = document.createElement('button'); btn.textContent = '✕';
+        btn.onclick = () => { trainFiles.splice(i, 1); renderTrainFiles(); };
+        li.append(span, ' ', btn);
         ul.appendChild(li);
     });
     updateDataHint();
@@ -220,6 +234,7 @@ async function pollTrain(name) {
 async function loadVoices() {
     try {
         const d = await (await fetch(`${API}/voices`)).json();
+        setConn(true);
         const sel = $('voiceSelect'), cur = sel.value, voices = d.voices || [];
         sel.innerHTML = '';
         if (voices.length === 0) {
@@ -230,7 +245,7 @@ async function loadVoices() {
             voices.forEach((v) => { const o = document.createElement('option'); o.value = v; o.textContent = v; sel.appendChild(o); });
             if (cur && voices.includes(cur)) sel.value = cur;
         }
-    } catch (e) { /* backend offline */ }
+    } catch (e) { setConn(false); }
 }
 $('btnRefreshVoices').addEventListener('click', loadVoices);
 
@@ -278,7 +293,7 @@ if ($('btnPpPreview')) $('btnPpPreview').addEventListener('click', async () => {
         fd.append('audio', convFile, convFile.name);
         Object.entries(fl).forEach(([k, v]) => fd.append(k, v));
         const r = await fetch(`${API}/preprocess`, { method: 'POST', body: fd });
-        if (!r.ok) throw new Error('服务器错误 ' + r.status);
+        if (!r.ok) throw new Error(await errText(r));
         const blob = await r.blob();
         a.src = URL.createObjectURL(blob); a.style.display = 'block'; a.play().catch(() => {});
         btn.textContent = '▶ 试听预处理后音频';
@@ -315,7 +330,7 @@ $('btnConvert').addEventListener('click', async () => {
         Object.entries(ppFlags()).forEach(([k, v]) => fd.append(k, v));
         const r = await fetch(`${API}/convert`, { method: 'POST', body: fd });
         clearInterval(iv);
-        if (!r.ok) throw new Error('服务器错误 ' + r.status);
+        if (!r.ok) throw new Error(await errText(r));
         const blob = await r.blob();
         if (convUrl) URL.revokeObjectURL(convUrl);
         convUrl = URL.createObjectURL(blob);

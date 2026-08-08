@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -56,6 +57,10 @@ struct Job {
     std::atomic<bool> running{false};
     bool done = false, error = false;
 } g_job;
+
+// Serialises every GPU subprocess (train/step/convert/preprocess) so overlapping
+// requests never contend for the single GPU. Interactive ops try_lock -> 409.
+std::mutex g_gpu_mu;
 
 std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -118,9 +123,10 @@ bool read_request(int fd, Request& req) {
         auto c = line.find(':'); if (c == std::string::npos) continue;
         std::string k = lower(line.substr(0, c)), v = line.substr(c + 1);
         while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
-        if (k == "content-length") clen = std::stoul(v);
+        if (k == "content-length") { try { clen = std::stoul(v); } catch (...) { clen = 0; } }
         else if (k == "content-type") req.content_type = v;
     }
+    if (clen > (512u << 20)) return false;  // cap body at 512 MB
     while (body.size() < clen) { ssize_t n = recv(fd, tmp, sizeof(tmp), 0); if (n <= 0) break; body.append(tmp, n); }
     req.body = std::move(body);
     return true;
@@ -165,6 +171,10 @@ std::string read_file(const std::string& p) {
     std::ifstream f(p, std::ios::binary); if (!f) return "";
     std::ostringstream ss; ss << f.rdbuf(); return ss.str();
 }
+std::string log_tail(const std::string& p, size_t n = 600) {
+    std::string s = read_file(p);
+    return s.size() > n ? s.substr(s.size() - n) : s;
+}
 std::string mime_for(const std::string& p) {
     if (p.size() >= 5 && p.substr(p.size() - 5) == ".html") return "text/html; charset=utf-8";
     if (p.size() >= 3 && p.substr(p.size() - 3) == ".js") return "application/javascript";
@@ -197,6 +207,7 @@ void finish(const std::string& stage, bool error) {
 }
 
 void run_training(std::string name, std::string mode, int steps, int seg, int epochs, bool separate, bool dereverb, bool deecho, bool denoise, bool deharmony, bool vad) {
+    std::lock_guard<std::mutex> gpu_lk(g_gpu_mu);  // serialise GPU use
     std::string dir = g.runs + "/" + name, log = dir + "/train.log";
     std::string clips = dir + "/clips", model = dir + "/model.safetensors", index = dir + "/model.index";
     auto sh = [&](const std::string& cmd) {
@@ -266,6 +277,7 @@ std::string voices_json() {
 
 // ---- per-step material preprocessing (apply each step individually, preview, then train) ----
 void run_step(std::string name, std::string step) {
+    std::lock_guard<std::mutex> gpu_lk(g_gpu_mu);  // serialise GPU use
     std::string dir = g.runs + "/" + name, work = dir + "/work", tmp = dir + "/work_tmp", log = dir + "/train.log";
     std::ofstream(log, std::ios::app) << "[serve] preprocess step '" << step << "' on '" << name << "'\n";
     set_stage("step:" + step);
@@ -315,8 +327,9 @@ void handle_step(int fd, const Request& req) {
     std::string name = field(parts, "name", ""), step = field(parts, "step", "");
     if (!safe_name(name) || !fs::exists(g.runs + "/" + name + "/work")) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"upload material first\"}"); return; }
     if (step != "separate" && step != "dereverb" && step != "deecho" && step != "denoise" && step != "deharmony") { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown step\"}"); return; }
+    bool expected = false;
+    if (!g_job.running.compare_exchange_strong(expected, true)) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"busy\"}"); return; }
     { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "step:" + step; g_job.done = false; g_job.error = false; }
-    g_job.running = true;
     std::thread(run_step, name, step).detach();
     send_json(fd, "{\"step\":\"" + json_escape(step) + "\"}");
 }
@@ -367,8 +380,10 @@ void handle_train(int fd, const Request& req) {
         }
     if (nfiles == 0) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"no audio files uploaded\"}"); return; }
 
+    bool expected = false;
+    if (!g_job.running.compare_exchange_strong(expected, true)) {
+        send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"a training job is already running\"}"); return; }
     { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "queued"; g_job.done = false; g_job.error = false; }
-    g_job.running = true;
     std::thread(run_training, name, mode, steps, seg, epochs, separate, dereverb, deecho, denoise, deharmony, vad).detach();
     send_json(fd, "{\"job\":\"" + json_escape(name) + "\",\"files\":" + std::to_string(nfiles) + "}");
 }
@@ -419,13 +434,15 @@ void handle_preprocess(int fd, const Request& req) {
     const Part* audio = nullptr;
     for (auto& p : parts) if (!p.filename.empty()) { audio = &p; break; }
     if (!audio) { send_response(fd, 400, "Bad Request", "text/plain", "no audio"); return; }
+    std::unique_lock<std::mutex> gpu_lk(g_gpu_mu, std::try_to_lock);
+    if (!gpu_lk.owns_lock()) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"GPU 忙（正在训练或转换），请稍候重试\"}"); return; }
     std::string in = "/tmp/vcserve_ppin.wav", cleaned;
     { std::ofstream o(in, std::ios::binary); o.write(audio->data.data(), audio->data.size()); }
     bool sep = field(parts, "pp_separate", "0") == "1", deharm = field(parts, "pp_deharmony", "0") == "1";
     bool derev = field(parts, "pp_dereverb", "0") == "1", denoise = field(parts, "pp_denoise", "0") == "1";
     bool deecho = field(parts, "pp_deecho", "0") == "1";
     if (!preprocess_audio_file(in, "preview", sep, deharm, derev, deecho, denoise, cleaned)) {
-        send_response(fd, 500, "Internal Server Error", "text/plain", "preprocessing failed"); return; }
+        send_response(fd, 500, "Internal Server Error", "text/plain", "预处理失败：" + log_tail("/tmp/vcserve_pp.log")); return; }
     send_response(fd, 200, "OK", "audio/wav", read_file(cleaned));
 }
 
@@ -437,6 +454,8 @@ void handle_convert(int fd, const Request& req) {
     const Part* audio = nullptr;
     for (auto& p : parts) if (!p.filename.empty()) { audio = &p; break; }
     if (!audio) { send_response(fd, 400, "Bad Request", "text/plain", "no audio"); return; }
+    std::unique_lock<std::mutex> gpu_lk(g_gpu_mu, std::try_to_lock);
+    if (!gpu_lk.owns_lock()) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"GPU 忙（正在训练或转换），请稍候重试\"}"); return; }
 
     std::string voice = field(parts, "voice", "base");
     int pitch = std::atoi(field(parts, "f0_up_key", "0").c_str());
@@ -460,7 +479,7 @@ void handle_convert(int fd, const Request& req) {
     std::string in = "/tmp/vcserve_in.wav", out = "/tmp/vcserve_out.wav", conv_in;
     { std::ofstream o(in, std::ios::binary); o.write(audio->data.data(), audio->data.size()); }
     if (!preprocess_audio_file(in, "conv", pp_sep, pp_deharm, pp_derev, pp_deecho, pp_denoise, conv_in)) {
-        send_response(fd, 500, "Internal Server Error", "text/plain", "input preprocessing failed"); return; }
+        send_response(fd, 500, "Internal Server Error", "text/plain", "输入预处理失败：" + log_tail("/tmp/vcserve_pp.log")); return; }
     std::string cmd = "'" + g.build + "/vc_convert' --hubert '" + g.hubert + "' --rmvpe '" + g.rmvpe +
         "' --model '" + model + "' --input '" + conv_in + "' --output '" + out +
         "' --version v2 --speakers 109 --sr 40000 --pitch " + std::to_string(pitch) +
@@ -470,9 +489,31 @@ void handle_convert(int fd, const Request& req) {
     cmd += " > /tmp/vcserve_convert.log 2>&1";
     int rc = std::system(cmd.c_str());
     std::string wav = read_file(out);
-    if (rc != 0 || wav.empty()) { send_response(fd, 500, "Internal Server Error", "text/plain", "conversion failed"); return; }
+    if (rc != 0 || wav.empty()) { send_response(fd, 500, "Internal Server Error", "text/plain", "转换失败：" + log_tail("/tmp/vcserve_convert.log")); return; }
     printf("[vc_serve] convert voice=%s -> %zu bytes\n", voice.c_str(), wav.size());
     send_response(fd, 200, "OK", "audio/wav", wav);
+}
+
+// One worker thread per connection: light requests (static/voices/status) stay
+// responsive while a heavy GPU op runs; a recv timeout frees stalled clients.
+void handle_connection(int fd) {
+    timeval tv{60, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    Request req;
+    if (read_request(fd, req)) {
+        if (req.method == "GET" && req.path == "/api/voices") send_json(fd, voices_json());
+        else if (req.method == "GET" && req.path == "/api/train/status") handle_status(fd, req);
+        else if (req.method == "POST" && req.path == "/api/train") handle_train(fd, req);
+        else if (req.method == "POST" && req.path == "/api/material") handle_material(fd, req);
+        else if (req.method == "POST" && req.path == "/api/step") handle_step(fd, req);
+        else if (req.method == "GET" && req.path == "/api/preview") handle_preview(fd, req);
+        else if (req.method == "POST" && req.path == "/api/preprocess") handle_preprocess(fd, req);
+        else if (req.method == "POST" && req.path == "/api/convert") handle_convert(fd, req);
+        else if (req.method == "GET") serve_static(fd, req.path);
+        else send_response(fd, 405, "Method Not Allowed", "text/plain", "no");
+    }
+    close(fd);
 }
 
 }  // namespace
@@ -510,20 +551,7 @@ int main(int argc, char** argv) {
     for (;;) {
         int fd = accept(srv, nullptr, nullptr);
         if (fd < 0) continue;
-        Request req;
-        if (read_request(fd, req)) {
-            if (req.method == "GET" && req.path == "/api/voices") send_json(fd, voices_json());
-            else if (req.method == "GET" && req.path == "/api/train/status") handle_status(fd, req);
-            else if (req.method == "POST" && req.path == "/api/train") handle_train(fd, req);
-            else if (req.method == "POST" && req.path == "/api/material") handle_material(fd, req);
-            else if (req.method == "POST" && req.path == "/api/step") handle_step(fd, req);
-            else if (req.method == "GET" && req.path == "/api/preview") handle_preview(fd, req);
-            else if (req.method == "POST" && req.path == "/api/preprocess") handle_preprocess(fd, req);
-            else if (req.method == "POST" && req.path == "/api/convert") handle_convert(fd, req);
-            else if (req.method == "GET") serve_static(fd, req.path);
-            else send_response(fd, 405, "Method Not Allowed", "text/plain", "no");
-        }
-        close(fd);
+        std::thread(handle_connection, fd).detach();
     }
     return 0;
 }
