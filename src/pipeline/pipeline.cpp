@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace voxmutatio::pipeline {
@@ -182,6 +183,176 @@ bool VoiceConversionPipeline::init(const VCConfig& config) {
     return true;
 }
 
+// Content -> synth for one 16k segment, driven by a precomputed F0/UV slice (100Hz).
+// Mirrors the historical whole-clip path exactly (HuBERT -> index -> 2x-interp ->
+// protect -> coarse-pitch -> VITS), so callers own F0 computation and stitching.
+AudioBuffer VoiceConversionPipeline::synth_segment(
+        const float* seg16k, int segn,
+        const float* f0_slice, const std::uint8_t* uv_slice, int f0_len,
+        int speaker_id, VCResult& timing) {
+    using clock = std::chrono::high_resolution_clock;
+
+    // HuBERT content features [T, 768]
+    auto t0 = clock::now();
+    auto feats = hubert_encoder_.extract(seg16k, segn);
+    timing.hubert_ms += std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    if (feats.empty()) return {};
+    int T = static_cast<int>(feats.size()) / 768;
+
+    // Keep pre-index features for consonant/breath protection.
+    const bool do_protect = config_.protect < 0.5;
+    std::vector<float> feats0;
+    if (do_protect) feats0 = feats;
+
+    // Feature retrieval blending (RVC index_rate)
+    t0 = clock::now();
+    if (index_loaded_ && config_.index_rate > 0.0 && feature_index_.dim() == 768) {
+        auto retrieved = feature_index_.retrieve_weighted(feats.data(), T, 8, 768);
+        if (!retrieved.empty()) {
+            index::blend_features(feats.data(), feats.data(), retrieved.data(),
+                                  T, 768, config_.index_rate);
+        }
+    }
+    timing.index_ms += std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+
+    // Interpolate features 2x (50Hz -> 100Hz)
+    auto feats_up = interpolate_2x(feats, T, 768);
+    std::vector<float> feats0_up;
+    if (do_protect) feats0_up = interpolate_2x(feats0, T, 768);
+    int Tf = 2 * T;
+
+    // Align lengths to the provided F0 slice.
+    int p_len = std::min(Tf, f0_len);
+    if (p_len <= 0) return {};
+    feats_up.resize(static_cast<size_t>(p_len) * 768);
+    std::vector<float> f0(f0_slice, f0_slice + p_len);
+
+    // Consonant protection: unvoiced frames keep original (pre-index) features.
+    if (do_protect) {
+        feats0_up.resize(static_cast<size_t>(p_len) * 768);
+        const float pr = static_cast<float>(config_.protect);
+        for (int t = 0; t < p_len; ++t) {
+            float w = uv_slice[t] ? pr : 1.0f;  // RVC pitchff
+            if (w >= 1.0f) continue;
+            float* f = &feats_up[static_cast<size_t>(t) * 768];
+            const float* g = &feats0_up[static_cast<size_t>(t) * 768];
+            for (int d = 0; d < 768; ++d) f[d] = f[d] * w + g[d] * (1.0f - w);
+        }
+    }
+
+    // Coarse pitch
+    std::vector<float> pitch_coarse(p_len);
+    for (int i = 0; i < p_len; ++i)
+        pitch_coarse[i] = static_cast<float>(f0_to_coarse(f0[i]));
+
+    // VITS synthesis
+    t0 = clock::now();
+    auto synth_audio = synth_.infer(feats_up.data(), p_len,
+                                    pitch_coarse.data(), f0.data(), speaker_id);
+    timing.synth_ms += std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    return synth_audio;
+}
+
+VCResult VoiceConversionPipeline::convert_long(std::vector<float>& audio16k, int speaker_id) {
+    using clock = std::chrono::high_resolution_clock;
+    VCResult result;
+    auto t_start = clock::now();
+
+    // High-pass the whole clip (same front-end as the short path).
+    if (config_.apply_highpass) highpass_filtfilt(audio16k);
+    std::vector<float> src_hp = audio16k;  // unpadded, for the final change_rms
+    int n = static_cast<int>(audio16k.size());
+    if (n < 2) { result.error_message = "audio too short"; return result; }
+
+    // Reflect-pad the whole clip once so every chunk gets real context on both sides.
+    const int hop = 160;
+    int pad = std::max(hop, static_cast<int>(config_.chunk_pad_sec * 16000));
+    pad = std::min(pad, n - 1);
+    std::vector<float> apad = reflect_pad(audio16k, pad);
+    int np = static_cast<int>(apad.size());
+
+    // F0 once on the whole padded clip -> globally consistent pitch (RVC does this).
+    auto t0 = clock::now();
+    auto f0 = f0_extractor_.infer(apad.data(), np);
+    std::vector<std::uint8_t> uv(f0.size());
+    for (size_t i = 0; i < f0.size(); ++i) uv[i] = (f0[i] <= 0.0f) ? 1 : 0;
+    if (config_.interp_unvoiced) interp_unvoiced_f0(f0);
+    if (config_.filter_radius >= 3) f0 = median_filter(f0, config_.filter_radius | 1);
+    if (config_.f0_up_key != 0) {
+        float factor = std::pow(2.0f, config_.f0_up_key / 12.0f);
+        for (auto& v : f0) if (v > 0) v *= factor;
+    }
+    result.f0_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    int f0n = static_cast<int>(f0.size());
+
+    // Per-frame absolute energy over the ORIGINAL (unpadded) clip for cut selection.
+    int nf = n / hop;
+    std::vector<float> energy(std::max(0, nf), 0.0f);
+    for (int f = 0; f < nf; ++f) {
+        double acc = 0.0;
+        int base = f * hop;
+        for (int k = 0; k < hop; ++k) acc += std::fabs(audio16k[base + k]);
+        energy[f] = static_cast<float>(acc);
+    }
+
+    // Cut points near every max_chunk_sec, snapped to the quietest frame within query.
+    int chunk = std::max(hop, static_cast<int>(config_.max_chunk_sec * 16000));
+    int query = std::max(hop, static_cast<int>(config_.chunk_query_sec * 16000));
+    std::vector<int> bounds{0};
+    for (int target = chunk; target < n; target += chunk) {
+        int lo = std::max(1, target - query), hi = std::min(n - 1, target + query);
+        int lof = lo / hop, hif = std::min(nf - 1, hi / hop);
+        int best = lof;
+        float bestE = std::numeric_limits<float>::max();
+        for (int f = lof; f <= hif; ++f)
+            if (energy[f] < bestE) { bestE = energy[f]; best = f; }
+        int pos = best * hop;
+        if (pos > bounds.back() && pos < n) bounds.push_back(pos);
+    }
+    bounds.push_back(n);
+
+    // Convert each chunk with its context pad, trim the pad, and stitch.
+    // Cores are placed at their ABSOLUTE output positions (not by trimming both
+    // ends) so per-chunk frame-count jitter cannot accumulate into time drift.
+    const long msr = synth_cfg_.sample_rate;
+    auto to_out = [msr](long s16k) { return s16k * msr / 16000; };
+    const int left_tgt = static_cast<int>(to_out(pad));  // context to drop at chunk start
+    std::vector<float> out;
+    for (size_t i = 0; i + 1 < bounds.size(); ++i) {
+        int s = bounds[i], e = bounds[i + 1];
+        int a = s;                                 // padded-index start (left context)
+        int b = std::min(np, e + 2 * pad + hop);   // +hop so HuBERT covers the core tail
+        int segn = b - a;
+        int fs = a / hop, fe = std::min(f0n, b / hop);
+        int f0_len = fe - fs;
+        if (segn <= 0 || f0_len <= 0) continue;
+        auto piece = synth_segment(apad.data() + a, segn, f0.data() + fs, uv.data() + fs,
+                                   f0_len, speaker_id, result);
+        if (piece.data.empty()) {
+            result.error_message = "chunk synthesis failed";
+            return result;
+        }
+        // Absolute output span for this chunk's core [s, e).
+        int core_len = static_cast<int>(to_out(e) - to_out(s));
+        const auto& d = piece.data;
+        int avail = static_cast<int>(d.size()) - left_tgt;
+        int take = std::clamp(avail, 0, core_len);
+        if (take > 0) out.insert(out.end(), d.begin() + left_tgt, d.begin() + left_tgt + take);
+        out.insert(out.end(), static_cast<size_t>(core_len - take), 0.0f);  // keep absolute align
+    }
+    if (out.empty()) { result.error_message = "long-audio synthesis produced no output"; return result; }
+
+    // Match the source's per-frame RMS envelope over the whole output (RVC change_rms).
+    if (config_.rms_mix_rate < 1.0)
+        change_rms_envelope(src_hp, 16000, out, config_.rms_mix_rate);
+
+    result.audio.data = std::move(out);
+    result.audio.sample_rate = synth_cfg_.sample_rate;
+    result.success = true;
+    result.total_ms = std::chrono::duration<double, std::milli>(clock::now() - t_start).count();
+    return result;
+}
+
 VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
                                                  int speaker_id) {
     using clock = std::chrono::high_resolution_clock;
@@ -202,6 +373,13 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
     } else {
         audio16k = input.data;
     }
+
+    // Long clips: split at silence and convert per-chunk (bounded memory).
+    if (config_.max_chunk_sec > 0.0 &&
+        static_cast<double>(audio16k.size()) > config_.max_chunk_sec * 16000.0) {
+        return convert_long(audio16k, speaker_id);
+    }
+
     // 1b. RVC input high-pass (drop sub-48Hz rumble), zero-phase.
     if (config_.apply_highpass) highpass_filtfilt(audio16k);
     // 1c. Reflect-pad both ends to avoid edge artifacts (trimmed after synthesis).
@@ -210,84 +388,28 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
     audio16k = reflect_pad(audio16k, pad16k);
     int n16k = static_cast<int>(audio16k.size());
 
-    // 2. HuBERT content features [T, 768]
+    // 2. RMVPE F0 [Tr]; pre-interp voicing mask drives consonant protection.
     auto t0 = clock::now();
-    auto feats = hubert_encoder_.extract(audio16k.data(), n16k);
-    result.hubert_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-    if (feats.empty()) {
-        result.error_message = "HuBERT extraction failed";
-        return result;
-    }
-    int T = static_cast<int>(feats.size()) / 768;
-
-    // 2b. Keep pre-index features for consonant/breath protection.
-    const bool do_protect = config_.protect < 0.5;
-    std::vector<float> feats0;
-    if (do_protect) feats0 = feats;
-
-    // 2c. Feature retrieval blending (RVC index_rate)
-    t0 = clock::now();
-    if (index_loaded_ && config_.index_rate > 0.0 &&
-        feature_index_.dim() == 768) {
-        auto retrieved = feature_index_.retrieve_weighted(feats.data(), T, 8, 768);
-        if (!retrieved.empty()) {
-            index::blend_features(feats.data(), feats.data(), retrieved.data(),
-                                  T, 768, config_.index_rate);
-        }
-    }
-    result.index_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-
-    // 3. Interpolate features 2x (50Hz -> 100Hz)
-    auto feats_up = interpolate_2x(feats, T, 768);
-    std::vector<float> feats0_up;
-    if (do_protect) feats0_up = interpolate_2x(feats0, T, 768);
-    int Tf = 2 * T;
-
-    // 4. RMVPE F0 [Tr]
-    t0 = clock::now();
     auto f0 = f0_extractor_.infer(audio16k.data(), n16k);
-    // 4b. Voicing mask (pre-interp) drives protect; then interp unvoiced for smooth pitch.
     std::vector<uint8_t> uv(f0.size());
     for (size_t i = 0; i < f0.size(); ++i) uv[i] = (f0[i] <= 0.0f) ? 1 : 0;
     if (config_.interp_unvoiced) interp_unvoiced_f0(f0);
     if (config_.filter_radius >= 3) f0 = median_filter(f0, config_.filter_radius | 1);
     result.f0_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
 
-    // 5. Pitch shift
+    // 3. Pitch shift
     if (config_.f0_up_key != 0) {
         float factor = std::pow(2.0f, config_.f0_up_key / 12.0f);
         for (auto& v : f0) if (v > 0) v *= factor;
     }
 
-    // 6. Align lengths
-    int p_len = std::min(Tf, static_cast<int>(f0.size()));
-    feats_up.resize(static_cast<size_t>(p_len) * 768);
-    f0.resize(p_len);
-    uv.resize(p_len);
-
-    // 6b. Consonant protection: unvoiced frames keep original (pre-index) features.
-    if (do_protect) {
-        feats0_up.resize(static_cast<size_t>(p_len) * 768);
-        const float pr = static_cast<float>(config_.protect);
-        for (int t = 0; t < p_len; ++t) {
-            float w = uv[t] ? pr : 1.0f;  // RVC pitchff
-            if (w >= 1.0f) continue;
-            float* f = &feats_up[static_cast<size_t>(t) * 768];
-            const float* g = &feats0_up[static_cast<size_t>(t) * 768];
-            for (int d = 0; d < 768; ++d) f[d] = f[d] * w + g[d] * (1.0f - w);
-        }
+    // 4. HuBERT -> index -> 2x-interp -> protect -> coarse-pitch -> VITS synthesis.
+    auto synth_audio = synth_segment(audio16k.data(), n16k, f0.data(), uv.data(),
+                                     static_cast<int>(f0.size()), speaker_id, result);
+    if (synth_audio.data.empty()) {
+        result.error_message = "segment synthesis failed";
+        return result;
     }
-
-    // 7. Coarse pitch
-    std::vector<float> pitch_coarse(p_len);
-    for (int i = 0; i < p_len; ++i)
-        pitch_coarse[i] = static_cast<float>(f0_to_coarse(f0[i]));
-
-    // 8. VITS synthesis
-    t0 = clock::now();
-    auto synth_audio = synth_.infer(feats_up.data(), p_len,
-                                    pitch_coarse.data(), f0.data(), speaker_id);
-    result.synth_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
 
     // 9. Trim the reflect-pad region (map 16k pad -> model-sr pad).
     if (pad16k > 0 && !synth_audio.data.empty()) {

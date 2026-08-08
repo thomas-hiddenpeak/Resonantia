@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,18 @@ public:
     [[nodiscard]] int num_speakers() const;
 
 private:
+    /// Content → synth for one 16k mono segment using a precomputed F0/UV slice
+    /// (both at 100Hz / hop=160). Runs HuBERT → index → 2x-interp → protect →
+    /// coarse-pitch → VITS. Timing is accumulated into `timing`.
+    AudioBuffer synth_segment(const float* seg16k, int segn,
+                              const float* f0_slice, const std::uint8_t* uv_slice,
+                              int f0_len, int speaker_id, VCResult& timing);
+
+    /// Long-audio path: high-pass + reflect-pad the whole clip, compute F0 once
+    /// (global pitch consistency), split at silence minima, convert each chunk via
+    /// synth_segment, trim the context pad, and stitch. Bounded memory per chunk.
+    VCResult convert_long(std::vector<float>& audio16k, int speaker_id);
+
     VCConfig config_;
 
     // Sub-modules (initialized on demand)

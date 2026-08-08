@@ -76,6 +76,12 @@ struct VCConfig {
     bool apply_highpass = true;          // RVC 48Hz Butterworth high-pass on 16k input
     bool interp_unvoiced = true;         // interpolate F0 across unvoiced frames (smooth pitch)
 
+    // Long-audio handling: clips longer than max_chunk_sec are split at silence and
+    // converted per-chunk, then stitched (bounded memory for arbitrarily long audio).
+    double max_chunk_sec = 30.0;         // >0: split audio longer than this (0 = never chunk)
+    double chunk_pad_sec = 2.0;          // context padding each side of a chunk (trimmed after synth)
+    double chunk_query_sec = 1.0;        // search radius to snap each cut to the quietest point
+
     // I/O parameters
     int target_sample_rate = 0;          // 0 = keep model's native sample rate
     std::string output_format = "wav";   // wav, flac

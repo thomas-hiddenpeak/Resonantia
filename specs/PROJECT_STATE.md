@@ -25,8 +25,9 @@
 | 端到端使用工作流 (scripts/) | ✅ 可用 | `train_voice.sh` + `convert_voice.sh`:切片→微调→建索→转换全链路跑通 |
 | **训练 / 微调(解码器 + 完整 GAN)** | ✅ 可用 | 解码器 fine-tune(mel -70%,导出往返 corr 1.0)+ 完整 VITS GAN(enc_q/flow/KL/MPD-V2/adv/fm),真实音频损失有限收敛 |
 | **WebUI (可运行)** | ✅ 可用 | `vc_serve`(纯 C++ HTTP,静态 + `/api/convert`),curl 验证前端可用 |
-| WavLM 内容编码 | ⚠️ 桩 | 文件存在,未接入/未验证 |
-| FCPE 实时 F0 | ⚠️ 桩 | 未实现 |
+| 长音频 (>5min) 分块推理 | ✅ 可用 | pipeline.convert_long:整段一次 F0(全局音高)→静音切点分块(chunk_pad 上下文)→按绝对输出位置拼接;短片段走原路径(e2e corr 保持 0.999716);test_long_audio_chunking 幅度谱对齐 spec_corr=0.986(NSF 相位重置使波形相关无效,改用相位无关幅度谱指标) |
+| WavLM 内容编码 | ⚠️ 桩 | 文件存在,未接入/未验证 → 计划实现真实 WavLM-Base+(超越 RVC 的 HuBERT) |
+| FCPE 实时 F0 | ⚠️ 桩 | 未实现 → 计划端口 torchfcpe conformer + `--f0-method` 可选 |
 | 声源分离 (separation/) | ✅ 可用(5 任务) | MelBand-RoFormer 配置驱动 runner(band-split+RoPE 门控注意力+批量 GEMM+显存池,去混响 2.9×);人声/去和声/去混响/去回声/去噪 5 个 SOTA 权重全部转换对齐(band-split 3.3e-6、transformer 4.9e-7、mask 1.35e-6);Silero VAD v5 纯 C++/CUDA 智能切分(对齐 2.5e-7);接入 `vc_preprocess` + WebUI 级联。**每任务仍为单一硬编码模型,多模型可选见 spec 005** |
 | CLI: vc_batch / vc_probe | ✅ vc_batch 可用 / ⚠️ vc_probe 骨架 | vc_batch:一次载入模型循环转整目录(--recursive + 与 vc_convert 参数对齐),真实 2 文件端到端验证 |
 
@@ -36,7 +37,7 @@
 
 | Spec | 主题 | 状态 |
 |------|------|------|
-| 001-voice-conversion-engine | 推理引擎(内容/F0/检索/合成/pipeline) | 核心管线 Complete,但**部分 MUST 未满足**:FR-003 WavLM=桩、FR-004 FCPE=桩(仅 RMVPE 可用)、FR-010 vc_batch=骨架、>5min 分块未做 → 归入 **spec 005** |
+| 001-voice-conversion-engine | 推理引擎(内容/F0/检索/合成/pipeline) | 核心管线 Complete,**在本 spec 内推进剩余 MUST**(见 spec 001 Completion Plan):✅ FR-010 vc_batch、✅ >5min 分块推理已实现+测试;仍缺 FR-004 FCPE=桩、FR-003 WavLM=桩(均列 P1,实现真实模型以超越 RVC) |
 | 002-voice-training | 训练/微调:纯 C++/CUDA autograd(方案 A) · 40k | Complete(解码器 + 完整 GAN)— A0-A2 autograd/AdamW/可微 mel;解码器对齐 0.9997、fine-tune -70%、导出往返 corr 1.0;完整 VITS GAN:exp/conv2d/flip_rows 梯度检查、enc_q 重建 corr 0.956、flow 逆 9e-7、MPD-V2 判别器、KL/fm/adv,`vc_train --gan` 端到端 |
 | 003-webui | 面向普通用户的 WebUI:`vc_serve` 后端 + 前端 | Complete(基础)— 纯 C++ HTTP 服务静态前端 + /api/convert,curl 验证 |
 | 004-source-separation | 音频前处理:人声分离/去和声/去混响/去回声/去噪(纯 C++/CUDA) | Runners Complete — S0–S6 全部完成(5 个 MelBand-RoFormer + VAD,接入预处理+WebUI)。S7(每任务多模型可选)待做 |
