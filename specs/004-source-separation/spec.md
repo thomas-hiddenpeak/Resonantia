@@ -1,6 +1,6 @@
-# Spec 004 — Source Separation (vocal / de-reverb / de-harmony)
+# Spec 004 — Source Separation (vocal / de-reverb / de-harmony / de-echo / de-noise)
 
-**Status**: In Progress (foundation) · **Date**: 2026-08-07
+**Status**: Runners Complete · **Date**: 2026-08-09 (was In Progress 2026-08-07)
 **Constitution**: pure C++/CUDA, **zero Python at runtime** (Principle V/XI). Python
 only in `tools/` (uv) for one-time weight conversion + offline numerical alignment.
 
@@ -60,11 +60,20 @@ share the runner**. So the module is: STFT → model → mask → apply → iSTF
       weights.py` converts the checkpoint to F32 safetensors + dumps a staged
       reference. **Aligned vs PyTorch: model 1.6e-6, STFT 1.6e-7, end-to-end 1.5e-6.**
       (Chosen over MDX-TDF first: torch-loadable, deterministic, fully alignable.)
-- [ ] S3: chunked overlap-add for very long audio (whole-sequence LSTM already OK
-      for typical clips; matches Open-Unmix full-track behaviour).
-- [ ] S4: de-reverb + de-harmony weights (MelBand-RoFormer runner, S6) on same front-end.
-- [ ] S5: wire into vc_preprocess + WebUI chain; real-audio validation.
-- [ ] S6 (SOTA): MelBand-RoFormer runner (band-split + rotary attention).
+- [x] S3: chunked overlap-add for very long audio — 50% Hann overlap, normalise by
+      window sum (`Roformer::forward_chunked`, `chunk_size` from config).
+- [x] S4: de-reverb + de-harmony + **de-echo + de-noise** weights (MelBand-RoFormer)
+      on the same front-end — 5 SOTA runners converted + aligned (band-split 3.3e-6,
+      transformer 4.9e-7, mask 1.35e-6). Registry in `tools/convert_roformer_weights.py`.
+- [x] S5: wired into `vc_preprocess` (`--separate/--deharmony/--dereverb/--deecho/`
+      `--denoise/--vad`) + WebUI cascade; real-audio validated.
+- [x] S6 (SOTA): config-driven MelBand-RoFormer runner (band-split + RoPE gated
+      attention), batched-GEMM attention, scratch-pool reuse (de-reverb 2.9x). Silero
+      VAD v5 pure C++/CUDA smart slicing added (aligned 2.5e-7).
+
+> **Not in this spec (deferred to spec 005):** offering **multiple SOTA models per
+> task** as a user-selectable option (currently one hard-coded model per stage in
+> `tools/vc_preprocess.cpp`).
 
 ## Gates
 Real audio only for functional tests. STFT round-trip < 1e-4. Each model runner
