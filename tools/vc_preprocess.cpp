@@ -60,6 +60,7 @@ void print_usage() {
         "  --trim             Trim leading/trailing silence before slicing\n"
         "  --trim-thresh <f>  Amplitude threshold for --trim (default: 0.020)\n"
         "  --separate         Extract vocals (MelBand-RoFormer) before slicing\n"
+        "  --deharmony        Remove backing/harmony vocals (karaoke RoFormer)\n"
         "  --dereverb         Remove reverb (MelBand-RoFormer) before slicing\n"
         "  --denoise          Remove noise (MelBand-RoFormer) before slicing\n"
         "  --sep-dir <path>   Separation model dir (default: models/separation)\n"
@@ -74,6 +75,7 @@ int main(int argc, char** argv) {
     int sr = 40000;
     double seg_sec = 3.0, hop_sec = 0.0, min_rms = 0.010, trim_thresh = 0.020;
     bool trim = false, separate = false, dereverb = false, denoise = false;
+    bool deharmony = false;
     bool no_slice = false;
     std::string sep_dir = "models/separation";
 
@@ -90,6 +92,7 @@ int main(int argc, char** argv) {
         else if (a == "--trim") trim = true;
         else if (a == "--trim-thresh") trim_thresh = std::atof(next());
         else if (a == "--separate") separate = true;
+        else if (a == "--deharmony") deharmony = true;
         else if (a == "--dereverb") dereverb = true;
         else if (a == "--denoise") denoise = true;
         else if (a == "--sep-dir") sep_dir = next();
@@ -124,6 +127,15 @@ int main(int argc, char** argv) {
         }
         std::cout << "Vocal separation enabled (MelBand-RoFormer)\n";
     }
+    std::unique_ptr<voxmutatio::separation::Roformer> deharm;
+    if (deharmony) {
+        deharm = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, "karaoke_roformer");
+        if (!deharm->valid()) {
+            std::cerr << "error: could not load de-harmony model in: " << sep_dir << "\n";
+            return 1;
+        }
+        std::cout << "De-harmony enabled (karaoke MelBand-RoFormer)\n";
+    }
     std::unique_ptr<voxmutatio::separation::Roformer> derev;
     if (dereverb) {
         derev = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, "dereverb_roformer");
@@ -155,6 +167,9 @@ int main(int argc, char** argv) {
         std::vector<float> a = std::move(opt->data);
         if (voc) {
             a = voc->separate_mono(a.data(), static_cast<int>(a.size()), sr);
+        }
+        if (deharm) {
+            a = deharm->separate_mono(a.data(), static_cast<int>(a.size()), sr);
         }
         if (derev) {
             a = derev->separate_mono(a.data(), static_cast<int>(a.size()), sr);

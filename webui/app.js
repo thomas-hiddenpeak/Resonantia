@@ -109,7 +109,7 @@ $('voiceName').addEventListener('input', updateTrainBtn);
 
 // ---------- Per-step preprocessing ----------
 let appliedSteps = [];
-const STEP_NAMES = { separate: '分离人声', dereverb: '去混响', denoise: '去噪' };
+const STEP_NAMES = { separate: '分离人声', deharmony: '去和声', dereverb: '去混响', denoise: '去噪' };
 function renderChips() {
     $('stepChips').textContent = appliedSteps.length ? appliedSteps.map((s) => STEP_NAMES[s]).join(' → ') : '（无）';
 }
@@ -176,6 +176,7 @@ $('btnTrain').addEventListener('click', async () => {
     fd.append('epochs', $('trainEpochs').value);
     fd.append('separate', $('recContent').value === 'song' ? '1' : '0');
     fd.append('dereverb', ($('recContent').value === 'song' || $('recReverb').checked) ? '1' : '0');
+    fd.append('deharmony', $('recContent').value === 'song' ? '1' : '0');
     fd.append('denoise', $('recDenoise') && $('recDenoise').checked ? '1' : '0');
     trainFiles.forEach((f) => fd.append('files', f, f.name));
 

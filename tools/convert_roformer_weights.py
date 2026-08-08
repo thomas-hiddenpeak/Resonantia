@@ -56,6 +56,9 @@ REGISTRY = {
     "denoise": ("denoise_roformer", "poiqazwsx/melband-roformer-denoise",
                 "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt",
                 "model_mel_band_roformer_denoise.yaml"),
+    # num_stems=2 (Vocals/Instrumental); output stem 0 (lead vocal) for de-harmony.
+    "karaoke": ("karaoke_roformer", "becruily/mel-band-roformer-karaoke",
+                "mel_band_roformer_karaoke_becruily.ckpt", "config_karaoke_becruily.yaml", 0),
 }
 VALID = {
     "dim", "depth", "stereo", "num_stems", "time_transformer_depth",
@@ -76,7 +79,9 @@ def main():
     key = sys.argv[1] if len(sys.argv) > 1 else "dereverb"
     if key not in REGISTRY:
         raise SystemExit(f"unknown model '{key}'; known: {list(REGISTRY)}")
-    name, REPO, CKPT, YAML = REGISTRY[key]
+    entry = REGISTRY[key]
+    name, REPO, CKPT, YAML = entry[:4]
+    target_stem = entry[4] if len(entry) > 4 else 0  # which stem to output (multi-stem)
     is_ref = key == "dereverb"  # only the anvuew dereverb model backs the alignment test
     cfg = yaml.load(open(hf_hub_download(REPO, YAML)), Loader=yaml.FullLoader)
     mcfg = {k: v for k, v in cfg["model"].items() if k in VALID}
@@ -112,13 +117,13 @@ def main():
     fi.tofile(os.path.join(MODELS, f"{name}_freq_indices.i64"))
     nbpf.tofile(os.path.join(MODELS, f"{name}_num_bands_per_freq.i64"))
     np.asarray(dim_inputs, dtype=np.int64).tofile(os.path.join(MODELS, f"{name}_dim_inputs.i64"))
-    # Runtime config for the C++ runner: [nfft,hop,dim,depth,num_bands,heads,dim_head,mask_depth,ff_mult,sr,chunk_size]
+    # Runtime config for the C++ runner: [nfft,hop,dim,depth,num_bands,heads,dim_head,mask_depth,ff_mult,sr,chunk_size,target_stem]
     ff_mult = int(cfg["model"].get("mlp_expansion_factor", 4))
     chunk_size = int(cfg.get("audio", {}).get("chunk_size", mcfg["sample_rate"] * 8))
     cfg_i64 = np.asarray([mcfg["stft_n_fft"], mcfg["stft_hop_length"], mcfg["dim"],
                           mcfg["depth"], mcfg["num_bands"], mcfg["heads"], mcfg["dim_head"],
                           mcfg["mask_estimator_depth"], ff_mult, mcfg["sample_rate"],
-                          chunk_size], dtype=np.int64)
+                          chunk_size, target_stem], dtype=np.int64)
     cfg_i64.tofile(os.path.join(MODELS, f"{name}_config.i64"))
     print(f"band map: freq_indices={fi.size}, bands={len(dim_inputs)}, "
           f"sum dim_inputs={sum(dim_inputs)}")

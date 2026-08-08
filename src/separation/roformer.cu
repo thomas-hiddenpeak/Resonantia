@@ -277,6 +277,7 @@ struct Roformer::Impl {
   int dim = 256, depth = 6, num_bands = 60, heads = 8, dim_head = 64, inner = 512;
   int ff_hidden = 1024, mask_depth = 2, sr = 44100, fi_len = 0, band_in = 0;
   int chunk_size = 0;  // long-audio chunk (samples); 0 -> process whole input
+  int target_stem = 0;  // which mask_estimator (stem) to output (multi-stem models)
   std::unique_ptr<Stft> stft;
   // band split
   std::vector<CudaBuffer> bs_gamma, bs_w, bs_b;
@@ -307,6 +308,7 @@ struct Roformer::Impl {
     mask_depth = (int)cfg[7]; ff_hidden = dim * (int)cfg[8];
     sr = cfg.size() > 9 ? (int)cfg[9] : 44100;
     chunk_size = cfg.size() > 10 ? (int)cfg[10] : 0;
+    target_stem = cfg.size() > 11 ? (int)cfg[11] : 0;
     nfreq = nfft / 2 + 1; merged = nfreq * 2; inner = heads * dim_head;
     if (dim_head > kMaxDhead) { fprintf(stderr, "roformer: dim_head %d > %d unsupported\n", dim_head, kMaxDhead); return; }
     stft = std::make_unique<Stft>(nfft, hop);
@@ -364,7 +366,7 @@ struct Roformer::Impl {
         int in_d = (l == 0) ? dim : ff_hidden;
         int out_d = (l == mask_depth) ? din * 2 : ff_hidden;
         mask[b].w.emplace_back(); mask[b].b.emplace_back();
-        std::string p = "mask_estimators.0.to_freqs." + std::to_string(b) + ".0." + std::to_string(2 * l) + ".";
+        std::string p = "mask_estimators." + std::to_string(target_stem) + ".to_freqs." + std::to_string(b) + ".0." + std::to_string(2 * l) + ".";
         g &= up(L, p + "weight", mask[b].w[l], out_d * in_d);
         g &= up(L, p + "bias", mask[b].b[l], out_d);
       }

@@ -195,7 +195,7 @@ void finish(const std::string& stage, bool error) {
     g_job.stage = stage; g_job.error = error; g_job.done = true; g_job.running = false;
 }
 
-void run_training(std::string name, std::string mode, int steps, int seg, int epochs, bool separate, bool dereverb, bool denoise) {
+void run_training(std::string name, std::string mode, int steps, int seg, int epochs, bool separate, bool dereverb, bool denoise, bool deharmony) {
     std::string dir = g.runs + "/" + name, log = dir + "/train.log";
     std::string clips = dir + "/clips", model = dir + "/model.safetensors", index = dir + "/model.index";
     auto sh = [&](const std::string& cmd) {
@@ -214,6 +214,7 @@ void run_training(std::string name, std::string mode, int steps, int seg, int ep
     std::string sep_flags;
     if (!preprocessed) {
         if (separate) sep_flags += " --separate";
+        if (deharmony) sep_flags += " --deharmony";
         if (dereverb) sep_flags += " --dereverb";
         if (denoise) sep_flags += " --denoise";
         if (!sep_flags.empty()) sep_flags += " --sep-dir '" + g.models + "/separation'";
@@ -265,7 +266,8 @@ void run_step(std::string name, std::string step) {
     std::ofstream(log, std::ios::app) << "[serve] preprocess step '" << step << "' on '" << name << "'\n";
     set_stage("step:" + step);
     fs::remove_all(tmp); fs::create_directories(tmp);
-    std::string flag = step == "separate" ? "--separate" : step == "dereverb" ? "--dereverb" : "--denoise";
+    std::string flag = step == "separate" ? "--separate" : step == "dereverb" ? "--dereverb"
+                     : step == "deharmony" ? "--deharmony" : "--denoise";
     int rc = std::system(("{ '" + g.build + "/vc_preprocess' --input '" + work + "' --output-dir '" + tmp +
         "' --sr 44100 --no-slice " + flag + " --sep-dir '" + g.models + "/separation' 2>&1 | " +
         "grep --line-buffered -E 'processed|error|enabled' ; } >> '" + log + "' 2>&1").c_str());
@@ -307,7 +309,7 @@ void handle_step(int fd, const Request& req) {
     auto parts = parse_multipart(req.body, boundary);
     std::string name = field(parts, "name", ""), step = field(parts, "step", "");
     if (!safe_name(name) || !fs::exists(g.runs + "/" + name + "/work")) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"upload material first\"}"); return; }
-    if (step != "separate" && step != "dereverb" && step != "denoise") { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown step\"}"); return; }
+    if (step != "separate" && step != "dereverb" && step != "denoise" && step != "deharmony") { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown step\"}"); return; }
     { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "step:" + step; g_job.done = false; g_job.error = false; }
     g_job.running = true;
     std::thread(run_step, name, step).detach();
@@ -341,6 +343,7 @@ void handle_train(int fd, const Request& req) {
     bool separate = field(parts, "separate", "0") == "1";
     bool dereverb = field(parts, "dereverb", "0") == "1";
     bool denoise = field(parts, "denoise", "0") == "1";
+    bool deharmony = field(parts, "deharmony", "0") == "1";
     if (!safe_name(name)) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"invalid voice name (letters, digits, _ or - only)\"}"); return; }
     if (mode != "decoder" && mode != "gan") mode = "decoder";
     steps = std::max(1, std::min(steps, 100000));
@@ -359,7 +362,7 @@ void handle_train(int fd, const Request& req) {
 
     { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "queued"; g_job.done = false; g_job.error = false; }
     g_job.running = true;
-    std::thread(run_training, name, mode, steps, seg, epochs, separate, dereverb, denoise).detach();
+    std::thread(run_training, name, mode, steps, seg, epochs, separate, dereverb, denoise, deharmony).detach();
     send_json(fd, "{\"job\":\"" + json_escape(name) + "\",\"files\":" + std::to_string(nfiles) + "}");
 }
 
