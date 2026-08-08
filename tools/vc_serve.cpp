@@ -195,7 +195,7 @@ void finish(const std::string& stage, bool error) {
     g_job.stage = stage; g_job.error = error; g_job.done = true; g_job.running = false;
 }
 
-void run_training(std::string name, std::string mode, int steps, int seg, int epochs, bool separate, bool dereverb, bool denoise, bool deharmony) {
+void run_training(std::string name, std::string mode, int steps, int seg, int epochs, bool separate, bool dereverb, bool denoise, bool deharmony, bool vad) {
     std::string dir = g.runs + "/" + name, log = dir + "/train.log";
     std::string clips = dir + "/clips", model = dir + "/model.safetensors", index = dir + "/model.index";
     auto sh = [&](const std::string& cmd) {
@@ -219,9 +219,11 @@ void run_training(std::string name, std::string mode, int steps, int seg, int ep
         if (denoise) sep_flags += " --denoise";
         if (!sep_flags.empty()) sep_flags += " --sep-dir '" + g.models + "/separation'";
     }
+    // Smart slicing (Silero VAD) supersedes RMS --trim when enabled.
+    std::string slice_flags = vad ? " --vad --vad-dir '" + g.models + "/vad'" : " --trim";
     int rc = sh("'" + g.build + "/vc_preprocess' --input '" + src + "' --output-dir '" + clips +
-                "' --sr 40000 --seg-sec 3.0 --trim" + sep_flags +
-                " 2>&1 | grep --line-buffered -E 'clip|Wrote|error|skip|separation|reverb|noise|enabled'");
+                "' --sr 40000 --seg-sec 3.0" + slice_flags + sep_flags +
+                " 2>&1 | grep --line-buffered -E 'clip|Wrote|error|skip|separation|reverb|noise|speech|enabled'");
     if (rc != 0) { finish("error", true); return; }
 
     set_stage("training");
@@ -344,6 +346,7 @@ void handle_train(int fd, const Request& req) {
     bool dereverb = field(parts, "dereverb", "0") == "1";
     bool denoise = field(parts, "denoise", "0") == "1";
     bool deharmony = field(parts, "deharmony", "0") == "1";
+    bool vad = field(parts, "vad", "0") == "1";
     if (!safe_name(name)) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"invalid voice name (letters, digits, _ or - only)\"}"); return; }
     if (mode != "decoder" && mode != "gan") mode = "decoder";
     steps = std::max(1, std::min(steps, 100000));
@@ -362,7 +365,7 @@ void handle_train(int fd, const Request& req) {
 
     { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "queued"; g_job.done = false; g_job.error = false; }
     g_job.running = true;
-    std::thread(run_training, name, mode, steps, seg, epochs, separate, dereverb, denoise, deharmony).detach();
+    std::thread(run_training, name, mode, steps, seg, epochs, separate, dereverb, denoise, deharmony, vad).detach();
     send_json(fd, "{\"job\":\"" + json_escape(name) + "\",\"files\":" + std::to_string(nfiles) + "}");
 }
 

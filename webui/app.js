@@ -178,6 +178,7 @@ $('btnTrain').addEventListener('click', async () => {
     fd.append('dereverb', ($('recContent').value === 'song' || $('recReverb').checked) ? '1' : '0');
     fd.append('deharmony', $('recContent').value === 'song' ? '1' : '0');
     fd.append('denoise', $('recDenoise') && $('recDenoise').checked ? '1' : '0');
+    fd.append('vad', $('recVad') && $('recVad').checked ? '1' : '0');
     trainFiles.forEach((f) => fd.append('files', f, f.name));
 
     $('btnTrain').disabled = true;

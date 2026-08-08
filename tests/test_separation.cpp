@@ -14,6 +14,7 @@
 #include "voxmutatio/separation/roformer.h"
 #include "voxmutatio/separation/separator.h"
 #include "voxmutatio/separation/stft.h"
+#include "voxmutatio/separation/vad.h"
 #include "voxmutatio/training/posterior_encoder.h"
 
 namespace {
@@ -250,4 +251,33 @@ TEST_CASE("MelBand-RoFormer band-split aligns with reference", "[separation][rof
       }
     std::printf("[roformer] end-to-end de-reverb rel error = %.3e (Lout=%d)\n", std::sqrt(n/(d+1e-12)), Lout);
   }
+}
+
+TEST_CASE("Silero VAD runner aligns with reference", "[separation][vad]") {
+  using namespace voxmutatio;
+  const std::string dir = "../models/vad";
+  const std::string fix = "../tests/fixtures/vad/";
+  if (!file_exists(dir + "/silero_vad.safetensors") || !file_exists(fix + "vad_probs.bin")) {
+    WARN("VAD weights/reference absent (run tools/convert_vad_weights.py); skipping");
+    return;
+  }
+  separation::Vad vad(dir);
+  REQUIRE(vad.valid());
+  std::vector<float> input = read_bin(fix + "vad_input.bin");
+  std::vector<float> ref = read_bin(fix + "vad_probs.bin");
+  REQUIRE(!input.empty());
+  REQUIRE(!ref.empty());
+
+  std::vector<float> got = vad.probs(input.data(), static_cast<int>(input.size()));
+  REQUIRE(got.size() == ref.size());
+  double n = 0, d = 0, maxabs = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    double e = got[i] - ref[i];
+    n += e * e; d += (double)ref[i] * ref[i];
+    maxabs = std::max(maxabs, std::abs(e));
+  }
+  double rel = std::sqrt(n / (d + 1e-12));
+  std::printf("[vad] rel error = %.3e, max abs = %.3e (%zu chunks)\n", rel, maxabs, ref.size());
+  REQUIRE(rel < 1e-3);
+  REQUIRE(maxabs < 1e-2);
 }
