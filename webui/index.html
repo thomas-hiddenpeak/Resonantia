@@ -22,8 +22,8 @@
         <main>
             <!-- ============ 训练声线 ============ -->
             <div class="tab-panel active" id="panel-train">
-                <section class="params-section">
-                    <h2>设定目标声线</h2>
+                <section class="step">
+                    <div class="step-head"><span class="step-no">1</span><h2>目标声线</h2></div>
                     <div class="param-group">
                         <label for="voiceName">声线名称</label>
                         <input type="text" id="voiceName" placeholder="例如 alice（字母/数字/_/-）">
@@ -57,84 +57,55 @@
                     </details>
                 </section>
 
-                <section class="upload-section">
-                    <h2>目标声线录音（可多选）</h2>
-                    <div class="param-group">
-                        <label for="recContent">录音内容</label>
-                        <select id="recContent">
-                            <option value="vocal">纯人声</option>
-                            <option value="song">带伴奏的歌曲</option>
-                        </select>
-                    </div>
-                    <div class="param-group" id="reverbGroup">
-                        <label class="check"><input type="checkbox" id="recReverb"> 含混响/回声（需去混响）</label>
-                        <label class="check"><input type="checkbox" id="recEcho"> 含明显回声/延迟（需去回声）</label>
-                    </div>
-                    <div class="param-group" id="denoiseGroup">
-                        <label class="check"><input type="checkbox" id="recDenoise"> 含背景噪声（需去噪）</label>
-                    </div>
-                    <div class="param-group" id="vadGroup">
-                        <label class="check"><input type="checkbox" id="recVad" checked> 智能切分（Silero VAD 按语音切片）</label>
-                    </div>
-                    <p class="hint" id="recTypeHint"></p>
+                <section class="step">
+                    <div class="step-head"><span class="step-no">2</span><h2>上传目标录音</h2></div>
+                    <p class="hint">建议 ≥ 10 分钟干净单人录音（可多文件 .wav/.flac）。填好①声线名称后上传即自动进入预处理。</p>
                     <div class="upload-area" id="trainUploadArea">
                         <div class="upload-icon">🎵</div>
-                        <p>拖拽目标说话人音频到此，或点击选择（.wav/.flac，建议数分钟）</p>
+                        <p>拖拽目标说话人音频到此，或点击选择</p>
                         <input type="file" id="trainFileInput" accept=".wav,.flac" multiple hidden>
                     </div>
                     <ul class="file-list" id="trainFileList"></ul>
                     <p class="hint" id="trainDataHint">建议提供 ≥ 10 分钟 干净的单人录音（可多文件）。</p>
-                </section>
-
-                <section class="upload-section" id="preprocessSection">
-                    <h2>分步预处理素材（可选）</h2>
-                    <p class="hint">先上传素材，再逐步应用 SOTA 预处理（每步可试听）；满意后再训练。不使用此面板则按上面「录音内容」自动处理。</p>
-                    <div class="action-section" style="margin:0 0 10px">
-                        <button class="btn-secondary" id="btnUploadMaterial" disabled>① 上传素材以启用分步预处理</button>
-                    </div>
-                    <div id="stepControls" style="display:none;">
-                        <div class="param-group">
-                            <label>② 逐步处理（按需点击，可叠加）</label>
-                            <div class="step-btns">
-                                <button class="btn-step" data-step="separate">🎤 分离人声</button>
-                                <button class="btn-step" data-step="deharmony">🎶 去和声</button>
-                                <button class="btn-step" data-step="dereverb">🌊 去混响</button>
-                                <button class="btn-step" data-step="deecho">🔊 去回声</button>
-                                <button class="btn-step" data-step="denoise">🔇 去噪</button>
-                            </div>
-                        </div>
-                        <p class="hint" id="stepStatus">已应用：<span id="stepChips">（无）</span></p>
-                        <div class="action-section" style="margin:0">
-                            <button class="btn-secondary" id="btnPreview">▶ 试听当前素材</button>
-                        </div>
-                        <audio id="previewAudio" controls style="width:100%;margin-top:8px;display:none;"></audio>
+                    <div class="audition" id="trainOrigAudition" style="display:none;">
+                        <span class="audition-label">🎧 原始素材（首个文件）</span>
+                        <audio controls id="trainOrigAudio"></audio>
                     </div>
                 </section>
 
-                <section class="action-section">
+                <section class="step">
+                    <div class="step-head"><span class="step-no">3</span><h2>级联预处理 · 每步可听审</h2></div>
+                    <p class="hint">上传后按顺序按需应用；每步完成后在该行试听结果，满意再继续。纯净人声可全部跳过。</p>
+                    <div class="cascade" id="trainCascade"></div>
+                    <div class="param-group check-inline">
+                        <label class="check"><input type="checkbox" id="recVad" checked> 训练时智能切分（Silero VAD 按语音切片）</label>
+                    </div>
+                    <button class="btn-secondary" id="trainResetPre" disabled>↺ 重置预处理（恢复到原始素材）</button>
+                </section>
+
+                <section class="step">
+                    <div class="step-head"><span class="step-no">4</span><h2>开始训练</h2></div>
                     <button class="btn-convert" id="btnTrain" disabled>开始训练</button>
-                </section>
-
-                <section class="progress-section" id="trainProgress" style="display:none;">
-                    <h2>训练进度 — <span id="trainStage">…</span></h2>
-                    <div class="progress-bar"><div class="progress-fill" id="trainFill"></div></div>
-                    <pre class="log-box" id="trainLog"></pre>
+                    <div class="progress-section" id="trainProgress" style="display:none;">
+                        <h3>训练进度 — <span id="trainStage">…</span></h3>
+                        <div class="progress-bar"><div class="progress-fill" id="trainFill"></div></div>
+                        <pre class="log-box" id="trainLog"></pre>
+                    </div>
                 </section>
             </div>
 
             <!-- ============ 语音转换 ============ -->
             <div class="tab-panel" id="panel-convert">
-                <section class="params-section">
-                    <h2>选择声线</h2>
-                    <div class="param-group">
-                        <label for="voiceSelect">目标声线</label>
+                <section class="step">
+                    <div class="step-head"><span class="step-no">1</span><h2>选择目标声线</h2></div>
+                    <div class="param-group inline">
                         <select id="voiceSelect"></select>
                         <button class="btn-small" id="btnRefreshVoices">刷新</button>
                     </div>
                 </section>
 
-                <section class="upload-section">
-                    <h2>待转换音频</h2>
+                <section class="step">
+                    <div class="step-head"><span class="step-no">2</span><h2>上传待转换音频</h2></div>
                     <div class="upload-area" id="convUploadArea">
                         <div class="upload-icon">📁</div>
                         <p>拖拽音频到此处，或点击选择文件</p>
@@ -144,26 +115,21 @@
                         <span class="file-name"></span>
                         <button class="btn-remove" id="btnConvRemove">✕</button>
                     </div>
+                    <div class="audition" id="convOrigAudition" style="display:none;">
+                        <span class="audition-label">🎧 原始输入</span>
+                        <audio controls id="convOrigAudio"></audio>
+                    </div>
                 </section>
 
-                <section class="upload-section" id="convPreprocessSection">
-                    <h2>转换前预处理（可选，分步）</h2>
-                    <p class="hint">歌曲/带噪/带混响输入建议先清洗；勾选所需步骤，可先「试听」再转换。转换时会对输入自动应用同样的处理。</p>
-                    <div class="step-btns">
-                        <label class="check"><input type="checkbox" id="ppSeparate"> 🎤 分离人声</label>
-                        <label class="check"><input type="checkbox" id="ppDeharmony"> 🎶 去和声</label>
-                        <label class="check"><input type="checkbox" id="ppDereverb"> 🌊 去混响</label>
-                        <label class="check"><input type="checkbox" id="ppDeecho"> 🔊 去回声</label>
-                        <label class="check"><input type="checkbox" id="ppDenoise"> 🔇 去噪</label>
-                    </div>
-                    <div class="action-section" style="margin:8px 0 0">
-                        <button class="btn-secondary" id="btnPpPreview" disabled>▶ 试听预处理后音频</button>
-                    </div>
-                    <audio id="ppPreviewAudio" controls style="width:100%;margin-top:8px;display:none;"></audio>
+                <section class="step">
+                    <div class="step-head"><span class="step-no">3</span><h2>级联预处理 · 每步可听审</h2></div>
+                    <p class="hint">歌曲/带噪/带混响输入建议先清洗；逐步应用并试听，满意后再转换。纯净人声可全部跳过。</p>
+                    <div class="cascade" id="convCascade"></div>
+                    <button class="btn-secondary" id="convResetPre" disabled>↺ 重置预处理（恢复到原始输入）</button>
                 </section>
 
-                <section class="params-section">
-                    <h2>转换参数</h2>
+                <section class="step">
+                    <div class="step-head"><span class="step-no">4</span><h2>转换参数与执行</h2></div>
                     <div class="param-group">
                         <label for="convPreset">效果档位</label>
                         <select id="convPreset"></select>
@@ -198,23 +164,17 @@
                             <span class="param-value" id="filterRadiusValue">3</span>
                         </div>
                     </details>
-                </section>
-
-                <section class="action-section">
                     <button class="btn-convert" id="btnConvert" disabled>开始转换</button>
-                </section>
-
-                <section class="progress-section" id="convProgress" style="display:none;">
-                    <h2>转换进度</h2>
-                    <div class="progress-bar"><div class="progress-fill" id="convFill"></div></div>
-                    <div class="progress-info" id="convInfo">准备中…</div>
-                </section>
-
-                <section class="result-section" id="resultSection" style="display:none;">
-                    <h2>转换结果</h2>
-                    <div class="audio-player"><audio controls id="resultAudio"></audio></div>
-                    <div class="result-actions">
-                        <button class="btn-download" id="btnDownload">下载 WAV</button>
+                    <div class="progress-section" id="convProgress" style="display:none;">
+                        <div class="progress-bar"><div class="progress-fill" id="convFill"></div></div>
+                        <div class="progress-info" id="convInfo">准备中…</div>
+                    </div>
+                    <div class="result-section" id="resultSection" style="display:none;">
+                        <h3>转换结果</h3>
+                        <div class="audio-player"><audio controls id="resultAudio"></audio></div>
+                        <div class="result-actions">
+                            <button class="btn-download" id="btnDownload">下载 WAV</button>
+                        </div>
                     </div>
                 </section>
             </div>

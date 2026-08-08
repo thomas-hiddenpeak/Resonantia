@@ -378,7 +378,8 @@ void handle_train(int fd, const Request& req) {
             std::ofstream o(raw + "/" + safe_filename(p.filename), std::ios::binary);
             o.write(p.data.data(), p.data.size()); ++nfiles;
         }
-    if (nfiles == 0) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"no audio files uploaded\"}"); return; }
+    bool has_work = fs::exists(g.runs + "/" + name + "/work") && !fs::is_empty(g.runs + "/" + name + "/work");
+    if (nfiles == 0 && !has_work) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"no audio files uploaded\"}"); return; }
 
     bool expected = false;
     if (!g_job.running.compare_exchange_strong(expected, true)) {
@@ -453,7 +454,19 @@ void handle_convert(int fd, const Request& req) {
     auto parts = parse_multipart(req.body, boundary);
     const Part* audio = nullptr;
     for (auto& p : parts) if (!p.filename.empty()) { audio = &p; break; }
-    if (!audio) { send_response(fd, 400, "Bad Request", "text/plain", "no audio"); return; }
+
+    // Preprocessed input may come from a cascade work-set (session) instead of a fresh upload.
+    std::string session = field(parts, "session", "");
+    std::string conv_in;
+    if (!session.empty() && safe_name(session)) {
+        std::string work = g.runs + "/" + session + "/work";
+        if (fs::exists(work))
+            for (auto& e : fs::directory_iterator(work)) {
+                std::string ext = e.path().extension().string();
+                if (ext == ".wav" || ext == ".flac") { conv_in = e.path().string(); break; }
+            }
+    }
+    if (conv_in.empty() && !audio) { send_response(fd, 400, "Bad Request", "text/plain", "no audio"); return; }
     std::unique_lock<std::mutex> gpu_lk(g_gpu_mu, std::try_to_lock);
     if (!gpu_lk.owns_lock()) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"GPU 忙（正在训练或转换），请稍候重试\"}"); return; }
 
@@ -476,10 +489,12 @@ void handle_convert(int fd, const Request& req) {
         if (fs::exists(vi)) index = vi;
     }
 
-    std::string in = "/tmp/vcserve_in.wav", out = "/tmp/vcserve_out.wav", conv_in;
-    { std::ofstream o(in, std::ios::binary); o.write(audio->data.data(), audio->data.size()); }
-    if (!preprocess_audio_file(in, "conv", pp_sep, pp_deharm, pp_derev, pp_deecho, pp_denoise, conv_in)) {
-        send_response(fd, 500, "Internal Server Error", "text/plain", "输入预处理失败：" + log_tail("/tmp/vcserve_pp.log")); return; }
+    std::string in = "/tmp/vcserve_in.wav", out = "/tmp/vcserve_out.wav";
+    if (conv_in.empty()) {
+        { std::ofstream o(in, std::ios::binary); o.write(audio->data.data(), audio->data.size()); }
+        if (!preprocess_audio_file(in, "conv", pp_sep, pp_deharm, pp_derev, pp_deecho, pp_denoise, conv_in)) {
+            send_response(fd, 500, "Internal Server Error", "text/plain", "输入预处理失败：" + log_tail("/tmp/vcserve_pp.log")); return; }
+    }
     std::string cmd = "'" + g.build + "/vc_convert' --hubert '" + g.hubert + "' --rmvpe '" + g.rmvpe +
         "' --model '" + model + "' --input '" + conv_in + "' --output '" + out +
         "' --version v2 --speakers 109 --sr 40000 --pitch " + std::to_string(pitch) +

@@ -56,20 +56,86 @@ function applyPreset(id) {
         `当前参数 → F0:${p.f0method} · 检索:${p.index_rate.toFixed(2)} · 保护:${p.protect.toFixed(2)}` +
         ` · RMS:${p.rms_mix_rate.toFixed(2)} · 平滑:${p.filter_radius} · 变调:${p.f0_up_key}`;
 }
-const REC_CHAINS = {
-    songDefault: '带伴奏歌曲 → 预处理链:分离人声(MelBand-RoFormer) → 去混响(MelBand-RoFormer) → 切片 → 训练。✓ 均 SOTA 内置自动。 ✓ 去和声(卡拉OK)已内置。',
-    vocalReverb: '纯人声(含混响) → 预处理链:去混响(MelBand-RoFormer,内置) → 切片 → 训练。✓',
-    vocalClean: '纯人声(干净) → 预处理链:切片 → 训练。✓ 当前即可直接训练。'
-};
-function updateRecHint() {
-    const isSong = $('recContent').value === 'song';
-    $('reverbGroup').style.display = isSong ? 'none' : '';  // song implies reverb+harmony
-    $('recTypeHint').textContent = isSong
-        ? REC_CHAINS.songDefault
-        : ($('recReverb').checked ? REC_CHAINS.vocalReverb : REC_CHAINS.vocalClean);
+const CONV_SESSION = '__convert__';
+
+// ---------- Shared cascade preprocessing (upload -> apply stages, per-step audition) ----------
+const STAGES = [
+    { step: 'separate', icon: '🎤', name: '分离人声' },
+    { step: 'deharmony', icon: '🎶', name: '去和声' },
+    { step: 'dereverb', icon: '🌊', name: '去混响' },
+    { step: 'deecho', icon: '🔊', name: '去回声' },
+    { step: 'denoise', icon: '🔇', name: '去噪' },
+];
+function pollJob(name) {
+    return new Promise((resolve) => {
+        const tick = async () => {
+            try {
+                const s = await (await fetch(`${API}/train/status?name=${encodeURIComponent(name)}`)).json();
+                setConn(true);
+                if (s.running) setTimeout(tick, 1000); else resolve(s);
+            } catch (e) { setConn(false); setTimeout(tick, 1500); }
+        };
+        tick();
+    });
 }
-$('recContent').addEventListener('change', updateRecHint);
-$('recReverb').addEventListener('change', updateRecHint);
+// Fetch the current work-set audio as a frozen blob snapshot for per-stage audition.
+async function auditionSnapshot(name, audioEl) {
+    try {
+        const r = await fetch(`${API}/preview?name=${encodeURIComponent(name)}&t=${Date.now()}`);
+        if (!r.ok) return false;
+        const blob = await r.blob();
+        if (audioEl._url) URL.revokeObjectURL(audioEl._url);
+        audioEl._url = URL.createObjectURL(blob);
+        audioEl.src = audioEl._url; audioEl.style.display = 'block';
+        return true;
+    } catch (e) { return false; }
+}
+function Cascade(containerId, getName, resetBtnId) {
+    const box = $(containerId);
+    const state = { ready: false, busy: false };
+    STAGES.forEach((s) => {
+        const row = document.createElement('div'); row.className = 'stage'; row.dataset.step = s.step;
+        const icon = document.createElement('span'); icon.className = 'stage-icon'; icon.textContent = s.icon;
+        const nm = document.createElement('span'); nm.className = 'stage-name'; nm.textContent = s.name;
+        const btn = document.createElement('button'); btn.className = 'btn-step'; btn.textContent = '应用'; btn.disabled = true;
+        const st = document.createElement('span'); st.className = 'stage-status';
+        const au = document.createElement('audio'); au.className = 'stage-audio'; au.controls = true; au.style.display = 'none';
+        btn.onclick = () => apply(s, row, st, au);
+        row.append(icon, nm, btn, st, au);
+        box.appendChild(row);
+    });
+    function setBusy(b) {
+        state.busy = b;
+        box.querySelectorAll('.btn-step').forEach((x) => { x.disabled = b || !state.ready; });
+        const rb = $(resetBtnId); if (rb) rb.disabled = b || !state.ready;
+    }
+    function enable() {
+        state.ready = true;
+        box.querySelectorAll('.stage').forEach((r) => {
+            r.classList.remove('applied');
+            r.querySelector('.stage-status').textContent = '';
+            const a = r.querySelector('.stage-audio'); a.style.display = 'none'; a.removeAttribute('src');
+        });
+        setBusy(false);
+    }
+    async function apply(s, row, st, au) {
+        const name = getName(); if (!name) { alert('请先完成上传'); return; }
+        setBusy(true); st.textContent = `正在${s.name}…`;
+        try {
+            const fd = new FormData(); fd.append('name', name); fd.append('step', s.step);
+            const r = await fetch(`${API}/step`, { method: 'POST', body: fd });
+            if (!r.ok) throw new Error(await errText(r));
+            const done = await pollJob(name);
+            if (done.error) throw new Error('处理失败（见服务端日志）');
+            st.textContent = '已应用 ✓'; row.classList.add('applied');
+            await auditionSnapshot(name, au);
+        } catch (e) { st.textContent = '失败: ' + e.message; }
+        setBusy(false);
+    }
+    return { enable, setBusy, state };
+}
+const trainCascade = Cascade('trainCascade', () => $('voiceName').value.trim(), 'trainResetPre');
+const convCascade = Cascade('convCascade', () => CONV_SESSION, 'convResetPre');
 
 // ---------- Training ----------
 let trainFiles = [];
@@ -86,6 +152,7 @@ $('trainFileInput').addEventListener('change', (e) => addTrainFiles(e.target.fil
 function addTrainFiles(list) {
     for (const f of list) if (f.name.match(/\.(wav|flac)$/i)) { trainFiles.push(f); estimateDuration(f); }
     renderTrainFiles();
+    ensureTrainMaterial();
 }
 async function estimateDuration(f) {
     try {
@@ -106,7 +173,7 @@ function renderTrainFiles() {
         const li = document.createElement('li');
         const span = document.createElement('span'); span.textContent = f.name;
         const btn = document.createElement('button'); btn.textContent = '✕';
-        btn.onclick = () => { trainFiles.splice(i, 1); renderTrainFiles(); };
+        btn.onclick = () => { trainFiles.splice(i, 1); renderTrainFiles(); ensureTrainMaterial(); };
         li.append(span, ' ', btn);
         ul.appendChild(li);
     });
@@ -115,94 +182,48 @@ function renderTrainFiles() {
 }
 function updateTrainBtn() {
     const name = $('voiceName').value.trim();
-    const ok = trainFiles.length > 0 && /^[A-Za-z0-9_-]+$/.test(name);
-    $('btnTrain').disabled = !ok;
-    if ($('btnUploadMaterial')) $('btnUploadMaterial').disabled = !ok;
+    $('btnTrain').disabled = !(trainCascade.state.ready && /^[A-Za-z0-9_-]+$/.test(name));
 }
-$('voiceName').addEventListener('input', updateTrainBtn);
+$('voiceName').addEventListener('input', () => { updateTrainBtn(); ensureTrainMaterial(); });
 
-// ---------- Per-step preprocessing ----------
-let appliedSteps = [];
-const STEP_NAMES = { separate: '分离人声', deharmony: '去和声', dereverb: '去混响', deecho: '去回声', denoise: '去噪' };
-function renderChips() {
-    $('stepChips').textContent = appliedSteps.length ? appliedSteps.map((s) => STEP_NAMES[s]).join(' → ') : '（无）';
-}
-function setStepBusy(busy) {
-    document.querySelectorAll('.btn-step').forEach((b) => b.disabled = busy);
-    $('btnUploadMaterial').disabled = busy;
-    $('btnPreview').disabled = busy;
-}
-if ($('btnUploadMaterial')) $('btnUploadMaterial').addEventListener('click', async () => {
+// Create/refresh the training work-set (raw+work) so the cascade can operate.
+let trainMatSig = '';
+async function ensureTrainMaterial() {
     const name = $('voiceName').value.trim();
-    const fd = new FormData();
-    fd.append('name', name);
+    if (!/^[A-Za-z0-9_-]+$/.test(name) || trainFiles.length === 0) return;
+    const sig = name + '|' + trainFiles.map((f) => f.name + f.size).join(',');
+    if (sig === trainMatSig && trainCascade.state.ready) return;
+    trainMatSig = sig;
+    const fd = new FormData(); fd.append('name', name);
     trainFiles.forEach((f) => fd.append('files', f, f.name));
-    $('btnUploadMaterial').disabled = true;
-    $('btnUploadMaterial').textContent = '上传中…';
     try {
         const r = await fetch(`${API}/material`, { method: 'POST', body: fd });
-        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error || r.status); }
-        appliedSteps = []; renderChips();
-        $('stepControls').style.display = 'block';
-        $('btnUploadMaterial').textContent = '✓ 素材已上传（可重新上传覆盖）';
-        $('btnUploadMaterial').disabled = false;
-    } catch (err) {
-        $('btnUploadMaterial').textContent = '① 上传素材（失败: ' + err.message + '）';
-        $('btnUploadMaterial').disabled = false;
-    }
-});
-document.querySelectorAll('.btn-step').forEach((btn) => btn.addEventListener('click', async () => {
-    const name = $('voiceName').value.trim(), step = btn.dataset.step;
-    const fd = new FormData(); fd.append('name', name); fd.append('step', step);
-    setStepBusy(true);
-    $('stepStatus').firstChild.textContent = `正在${STEP_NAMES[step]}… `;
-    try {
-        const r = await fetch(`${API}/step`, { method: 'POST', body: fd });
-        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error || r.status); }
-        await pollStep(name, step);
-    } catch (err) {
-        $('stepStatus').firstChild.textContent = '失败: ' + err.message + ' ';
-        setStepBusy(false);
-    }
-}));
-async function pollStep(name, step) {
-    const r = await fetch(`${API}/train/status?name=${encodeURIComponent(name)}`);
-    const s = await r.json();
-    if (s.running) { setTimeout(() => pollStep(name, step), 1200); return; }
-    setStepBusy(false);
-    if (s.error) { $('stepStatus').firstChild.textContent = STEP_NAMES[step] + '失败（见日志）'; return; }
-    appliedSteps.push(step); renderChips();
-    $('stepStatus').firstChild.textContent = '已应用：';
+        if (!r.ok) throw new Error(await errText(r));
+        setConn(true);
+        trainCascade.enable();
+        await auditionSnapshot(name, $('trainOrigAudio')); $('trainOrigAudition').style.display = 'flex';
+        updateDataHint(); updateTrainBtn();
+    } catch (e) { setConn(false); $('trainDataHint').textContent = '上传失败: ' + e.message; }
 }
-if ($('btnPreview')) $('btnPreview').addEventListener('click', () => {
-    const name = $('voiceName').value.trim(), a = $('previewAudio');
-    a.src = `${API}/preview?name=${encodeURIComponent(name)}&t=${Date.now()}`;
-    a.style.display = 'block'; a.play().catch(() => {});
-});
+$('trainResetPre').onclick = () => { trainMatSig = ''; ensureTrainMaterial(); };
 
 $('btnTrain').addEventListener('click', async () => {
     const name = $('voiceName').value.trim();
+    // Files were uploaded as the work-set in step 2; the cascade cleaned it.
     const fd = new FormData();
     fd.append('name', name);
     fd.append('mode', $('trainMode').value);
     fd.append('steps', $('trainSteps').value);
     fd.append('seg', $('trainSeg').value);
     fd.append('epochs', $('trainEpochs').value);
-    fd.append('separate', $('recContent').value === 'song' ? '1' : '0');
-    fd.append('dereverb', ($('recContent').value === 'song' || $('recReverb').checked) ? '1' : '0');
-    fd.append('deecho', $('recEcho') && $('recEcho').checked ? '1' : '0');
-    fd.append('deharmony', $('recContent').value === 'song' ? '1' : '0');
-    fd.append('denoise', $('recDenoise') && $('recDenoise').checked ? '1' : '0');
-    fd.append('vad', $('recVad') && $('recVad').checked ? '1' : '0');
-    trainFiles.forEach((f) => fd.append('files', f, f.name));
-
+    fd.append('vad', $('recVad').checked ? '1' : '0');
     $('btnTrain').disabled = true;
     $('trainProgress').style.display = 'block';
     $('trainStage').textContent = '提交中…';
     $('trainFill').style.width = '5%';
     try {
         const r = await fetch(`${API}/train`, { method: 'POST', body: fd });
-        if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error || r.status); }
+        if (!r.ok) throw new Error(await errText(r));
         pollTrain(name);
     } catch (err) {
         $('trainStage').textContent = '失败: ' + err.message;
@@ -210,13 +231,13 @@ $('btnTrain').addEventListener('click', async () => {
     }
 });
 
-const STAGES = { queued: 10, preprocessing: 25, training: 55, indexing: 90, done: 100, error: 100 };
+const STAGES_PCT = { queued: 10, preprocessing: 25, separating: 30, training: 55, indexing: 90, done: 100, error: 100 };
 async function pollTrain(name) {
     try {
         const r = await fetch(`${API}/train/status?name=${encodeURIComponent(name)}`);
         const s = await r.json();
         $('trainStage').textContent = s.stage;
-        $('trainFill').style.width = (STAGES[s.stage] || 50) + '%';
+        $('trainFill').style.width = (STAGES_PCT[s.stage] || 50) + '%';
         $('trainLog').textContent = s.log || '';
         $('trainLog').scrollTop = $('trainLog').scrollHeight;
         if (s.running || (!s.done && s.stage !== 'idle')) {
@@ -264,44 +285,29 @@ function setConvFile(f) {
     $('convFileInfo').querySelector('.file-name').textContent = f.name;
     $('convFileInfo').style.display = 'flex';
     convArea.style.display = 'none';
-    $('btnConvert').disabled = false;
-    if ($('btnPpPreview')) $('btnPpPreview').disabled = false;
+    ensureConvMaterial();
 }
 $('btnConvRemove').addEventListener('click', () => {
     convFile = null; $('convFileInput').value = '';
     $('convFileInfo').style.display = 'none'; convArea.style.display = 'block';
+    $('convOrigAudition').style.display = 'none';
+    convCascade.state.ready = false; convCascade.setBusy(false);
     $('btnConvert').disabled = true;
-    if ($('btnPpPreview')) $('btnPpPreview').disabled = true;
 });
-
-// ---------- Convert-input preprocessing (inference-stage) ----------
-const ppFlags = () => ({
-    pp_separate: $('ppSeparate') && $('ppSeparate').checked ? '1' : '0',
-    pp_deharmony: $('ppDeharmony') && $('ppDeharmony').checked ? '1' : '0',
-    pp_dereverb: $('ppDereverb') && $('ppDereverb').checked ? '1' : '0',
-    pp_deecho: $('ppDeecho') && $('ppDeecho').checked ? '1' : '0',
-    pp_denoise: $('ppDenoise') && $('ppDenoise').checked ? '1' : '0',
-});
-if ($('btnPpPreview')) $('btnPpPreview').addEventListener('click', async () => {
+// Upload the input as a work-set (session) so the cascade + audition can operate.
+async function ensureConvMaterial() {
     if (!convFile) return;
-    const btn = $('btnPpPreview'), a = $('ppPreviewAudio');
-    const fl = ppFlags();
-    if (fl.pp_separate + fl.pp_deharmony + fl.pp_dereverb + fl.pp_deecho + fl.pp_denoise === '00000') { alert('请先勾选至少一个预处理步骤'); return; }
-    btn.disabled = true; btn.textContent = '处理中…（分离/去混响较慢，请稍候）';
+    const fd = new FormData(); fd.append('name', CONV_SESSION); fd.append('files', convFile, convFile.name);
     try {
-        const fd = new FormData();
-        fd.append('audio', convFile, convFile.name);
-        Object.entries(fl).forEach(([k, v]) => fd.append(k, v));
-        const r = await fetch(`${API}/preprocess`, { method: 'POST', body: fd });
+        const r = await fetch(`${API}/material`, { method: 'POST', body: fd });
         if (!r.ok) throw new Error(await errText(r));
-        const blob = await r.blob();
-        a.src = URL.createObjectURL(blob); a.style.display = 'block'; a.play().catch(() => {});
-        btn.textContent = '▶ 试听预处理后音频';
-    } catch (err) {
-        btn.textContent = '试听失败: ' + err.message;
-    }
-    btn.disabled = false;
-});
+        setConn(true);
+        convCascade.enable();
+        await auditionSnapshot(CONV_SESSION, $('convOrigAudio')); $('convOrigAudition').style.display = 'flex';
+        $('btnConvert').disabled = false;
+    } catch (e) { setConn(false); alert('上传失败: ' + e.message); }
+}
+$('convResetPre').onclick = () => ensureConvMaterial();
 
 const bind = (id, out, f) => { const el = $(id); el.addEventListener('input', () => $(out).textContent = f(el.value)); };
 bind('pitchShift', 'pitchShiftValue', (v) => v);
@@ -311,7 +317,7 @@ bind('protect', 'protectValue', (v) => (v / 100).toFixed(2));
 bind('filterRadius', 'filterRadiusValue', (v) => v);
 
 $('btnConvert').addEventListener('click', async () => {
-    if (!convFile) return;
+    if (!convCascade.state.ready) { alert('请先上传待转换音频'); return; }
     if (!$('voiceSelect').value) { alert('请先在①训练声线创建目标声线'); return; }
     $('btnConvert').disabled = true;
     $('convProgress').style.display = 'block';
@@ -322,14 +328,13 @@ $('btnConvert').addEventListener('click', async () => {
     const iv = setInterval(() => { $('convInfo').textContent = `转换中… 已用 ${Math.round((Date.now() - t0) / 1000)}s`; }, 500);
     try {
         const fd = new FormData();
-        fd.append('audio', convFile, convFile.name);
+        fd.append('session', CONV_SESSION);
         fd.append('voice', $('voiceSelect').value || 'base');
         fd.append('f0_up_key', $('pitchShift').value);
         fd.append('index_rate', $('indexRate').value / 100);
         fd.append('rms_mix_rate', $('rmsMixRate').value / 100);
         fd.append('protect', $('protect').value / 100);
         fd.append('filter_radius', $('filterRadius').value);
-        Object.entries(ppFlags()).forEach(([k, v]) => fd.append(k, v));
         const r = await fetch(`${API}/convert`, { method: 'POST', body: fd });
         clearInterval(iv);
         if (!r.ok) throw new Error(await errText(r));
@@ -355,4 +360,3 @@ $('btnConvert').addEventListener('click', async () => {
 // initial
 loadPresets();
 loadVoices();
-updateRecHint();
