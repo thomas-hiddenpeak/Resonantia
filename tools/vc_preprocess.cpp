@@ -24,6 +24,7 @@
 
 #include "voxmutatio/io/audio_io.h"
 #include "voxmutatio/separation/roformer.h"
+#include "voxmutatio/separation/sep_registry.h"
 #include "voxmutatio/separation/vad.h"
 
 namespace fs = std::filesystem;
@@ -66,6 +67,11 @@ void print_usage() {
         "  --deecho           Remove echo + reverb (MelBand-RoFormer) before slicing\n"
         "  --denoise          Remove noise (MelBand-RoFormer) before slicing\n"
         "  --sep-dir <path>   Separation model dir (default: models/separation)\n"
+        "  --separate-model <n>  Vocal model name (default: vocal_roformer)\n"
+        "  --deharmony-model <n> De-harmony model name (default: karaoke_roformer)\n"
+        "  --dereverb-model <n>  De-reverb model name (default: dereverb_roformer)\n"
+        "  --deecho-model <n>    De-echo model name (default: deecho_roformer)\n"
+        "  --denoise-model <n>   De-noise model name (default: denoise_roformer)\n"
         "  --no-slice         Apply separation only; write full-length files (no slicing)\n"
         "  --vad              Slice on Silero-VAD speech regions (smart slicing)\n"
         "  --vad-thresh <f>   VAD speech probability threshold (default: 0.5)\n"
@@ -87,6 +93,7 @@ int main(int argc, char** argv) {
     double vad_thresh = 0.5;
     std::string sep_dir = "models/separation";
     std::string vad_dir = "models/vad";
+    std::string m_separate, m_deharmony, m_dereverb, m_deecho, m_denoise;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -106,6 +113,11 @@ int main(int argc, char** argv) {
         else if (a == "--deecho") deecho = true;
         else if (a == "--denoise") denoise = true;
         else if (a == "--sep-dir") sep_dir = next();
+        else if (a == "--separate-model") m_separate = next();
+        else if (a == "--deharmony-model") m_deharmony = next();
+        else if (a == "--dereverb-model") m_dereverb = next();
+        else if (a == "--deecho-model") m_deecho = next();
+        else if (a == "--denoise-model") m_denoise = next();
         else if (a == "--no-slice") no_slice = true;
         else if (a == "--vad") vad = true;
         else if (a == "--vad-thresh") vad_thresh = std::atof(next());
@@ -131,50 +143,66 @@ int main(int argc, char** argv) {
     }
     if (files.empty()) { std::cerr << "error: no audio under " << input << "\n"; return 1; }
 
+    // Resolve a per-stage model name (flag override, else canonical default).
+    namespace sep = voxmutatio::separation;
+    auto resolve_model = [&](const std::string& task, const std::string& chosen,
+                             const char* canonical) -> std::string {
+        if (chosen.empty()) return canonical;
+        if (!sep::sep_model_available(sep_dir, task, chosen))
+            std::cerr << "warning: '" << chosen << "' not registered for '" << task
+                      << "'; using it anyway\n";
+        return chosen;
+    };
+
     std::unique_ptr<voxmutatio::separation::Roformer> voc;
     if (separate) {
-        voc = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, "vocal_roformer");
+        std::string m = resolve_model("separate", m_separate, "vocal_roformer");
+        voc = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, m);
         if (!voc->valid()) {
-            std::cerr << "error: could not load vocal model in: " << sep_dir << "\n";
+            std::cerr << "error: could not load vocal model '" << m << "' in: " << sep_dir << "\n";
             return 1;
         }
-        std::cout << "Vocal separation enabled (MelBand-RoFormer)\n";
+        std::cout << "Vocal separation enabled (" << m << ")\n";
     }
     std::unique_ptr<voxmutatio::separation::Roformer> deharm;
     if (deharmony) {
-        deharm = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, "karaoke_roformer");
+        std::string m = resolve_model("deharmony", m_deharmony, "karaoke_roformer");
+        deharm = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, m);
         if (!deharm->valid()) {
-            std::cerr << "error: could not load de-harmony model in: " << sep_dir << "\n";
+            std::cerr << "error: could not load de-harmony model '" << m << "' in: " << sep_dir << "\n";
             return 1;
         }
-        std::cout << "De-harmony enabled (karaoke MelBand-RoFormer)\n";
+        std::cout << "De-harmony enabled (" << m << ")\n";
     }
     std::unique_ptr<voxmutatio::separation::Roformer> derev;
     if (dereverb) {
-        derev = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, "dereverb_roformer");
+        std::string m = resolve_model("dereverb", m_dereverb, "dereverb_roformer");
+        derev = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, m);
         if (!derev->valid()) {
-            std::cerr << "error: could not load de-reverb model in: " << sep_dir << "\n";
+            std::cerr << "error: could not load de-reverb model '" << m << "' in: " << sep_dir << "\n";
             return 1;
         }
-        std::cout << "De-reverb enabled (MelBand-RoFormer)\n";
+        std::cout << "De-reverb enabled (" << m << ")\n";
     }
     std::unique_ptr<voxmutatio::separation::Roformer> deechoer;
     if (deecho) {
-        deechoer = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, "deecho_roformer");
+        std::string m = resolve_model("deecho", m_deecho, "deecho_roformer");
+        deechoer = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, m);
         if (!deechoer->valid()) {
-            std::cerr << "error: could not load de-echo model in: " << sep_dir << "\n";
+            std::cerr << "error: could not load de-echo model '" << m << "' in: " << sep_dir << "\n";
             return 1;
         }
-        std::cout << "De-echo enabled (MelBand-RoFormer)\n";
+        std::cout << "De-echo enabled (" << m << ")\n";
     }
     std::unique_ptr<voxmutatio::separation::Roformer> denoiser;
     if (denoise) {
-        denoiser = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, "denoise_roformer");
+        std::string m = resolve_model("denoise", m_denoise, "denoise_roformer");
+        denoiser = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, m);
         if (!denoiser->valid()) {
-            std::cerr << "error: could not load de-noise model in: " << sep_dir << "\n";
+            std::cerr << "error: could not load de-noise model '" << m << "' in: " << sep_dir << "\n";
             return 1;
         }
-        std::cout << "De-noise enabled (MelBand-RoFormer)\n";
+        std::cout << "De-noise enabled (" << m << ")\n";
     }
 
     std::unique_ptr<voxmutatio::separation::Vad> vadder;

@@ -66,6 +66,27 @@ const STAGES = [
     { step: 'deecho', icon: '🔊', name: '去回声' },
     { step: 'denoise', icon: '🔇', name: '去噪' },
 ];
+// Installed models per stage (from /api/sep-models); drives the per-stage picker.
+let SEP_MODELS = {};
+function populateModelSelects() {
+    document.querySelectorAll('.stage-model').forEach((sel) => {
+        const opts = SEP_MODELS[sel.dataset.step] || [];
+        const prev = sel.value;
+        sel.innerHTML = '';
+        opts.forEach((o) => {
+            const op = document.createElement('option');
+            op.value = o.name; op.textContent = o.label; sel.appendChild(op);
+        });
+        if (prev) sel.value = prev;
+        sel.style.display = opts.length > 1 ? '' : 'none';  // only show when there's a choice
+    });
+}
+async function loadSepModels() {
+    try {
+        const r = await fetch(`${API}/sep-models`);
+        if (r.ok) { SEP_MODELS = await r.json(); populateModelSelects(); }
+    } catch (e) { /* offline: pickers stay hidden, server uses defaults */ }
+}
 function pollJob(name) {
     return new Promise((resolve) => {
         const tick = async () => {
@@ -99,9 +120,10 @@ function Cascade(containerId, getName, resetBtnId) {
         const nm = document.createElement('span'); nm.className = 'stage-name'; nm.textContent = s.name;
         const btn = document.createElement('button'); btn.className = 'btn-step'; btn.textContent = '应用'; btn.disabled = true;
         const st = document.createElement('span'); st.className = 'stage-status';
+        const sel = document.createElement('select'); sel.className = 'stage-model'; sel.dataset.step = s.step; sel.style.display = 'none'; sel.title = '选择模型';
         const au = document.createElement('audio'); au.className = 'stage-audio'; au.controls = true; au.style.display = 'none';
         btn.onclick = () => apply(s, row, st, au);
-        row.append(icon, nm, btn, st, au);
+        row.append(icon, nm, btn, st, sel, au);
         box.appendChild(row);
     });
     const orderEl = document.createElement('p'); orderEl.className = 'cascade-order'; box.appendChild(orderEl);
@@ -126,6 +148,7 @@ function Cascade(containerId, getName, resetBtnId) {
         setBusy(true); st.textContent = `正在${s.name}…`;
         try {
             const fd = new FormData(); fd.append('name', name); fd.append('step', s.step);
+            const sel = row.querySelector('.stage-model'); if (sel && sel.value) fd.append('model', sel.value);
             const r = await fetch(`${API}/step`, { method: 'POST', body: fd });
             if (!r.ok) throw new Error(await errText(r));
             const done = await pollJob(name);
@@ -141,6 +164,7 @@ function Cascade(containerId, getName, resetBtnId) {
 }
 const trainCascade = Cascade('trainCascade', () => $('voiceName').value.trim(), 'trainResetPre');
 const convCascade = Cascade('convCascade', () => CONV_SESSION, 'convResetPre');
+loadSepModels();  // populate per-stage model pickers from installed models
 
 // ---------- Training ----------
 let trainFiles = [];

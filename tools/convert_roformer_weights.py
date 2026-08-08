@@ -64,6 +64,15 @@ REGISTRY = {
     "karaoke": ("karaoke_roformer", "becruily/mel-band-roformer-karaoke",
                 "mel_band_roformer_karaoke_becruily.ckpt", "config_karaoke_becruily.yaml", 0),
 }
+# Registry key -> (pipeline stage/task, human label). Written into <name>.json so
+# the C++ SepModelRegistry (spec 004 S7) can offer the model as a per-stage choice.
+TASK_INFO = {
+    "vocals": ("separate", "人声分离 · MelBand-RoFormer"),
+    "karaoke": ("deharmony", "去和声 · Karaoke RoFormer"),
+    "dereverb": ("dereverb", "去混响 · MelBand-RoFormer"),
+    "deecho": ("deecho", "去回声 · MelBand-RoFormer"),
+    "denoise": ("denoise", "去噪 · MelBand-RoFormer"),
+}
 VALID = {
     "dim", "depth", "stereo", "num_stems", "time_transformer_depth",
     "freq_transformer_depth", "linear_transformer_depth", "num_bands", "dim_head",
@@ -116,6 +125,8 @@ def main():
         "dim_head": mcfg["dim_head"], "heads": mcfg["heads"], "stereo": mcfg["stereo"],
         "nb_output_bins": mcfg["dim_freqs_in"], "mask_estimator_depth": mcfg["mask_estimator_depth"],
         "freq_indices_len": int(fi.size), "dim_inputs": dim_inputs,
+        "task": TASK_INFO.get(key, ("", ""))[0],
+        "label": TASK_INFO.get(key, ("", name))[1] or name,
     }
     json.dump(hp, open(os.path.join(MODELS, f"{name}.json"), "w"), indent=2)
     fi.tofile(os.path.join(MODELS, f"{name}_freq_indices.i64"))

@@ -70,10 +70,13 @@ share the runner**. So the module is: STFT → model → mask → apply → iSTF
 - [x] S6 (SOTA): config-driven MelBand-RoFormer runner (band-split + RoPE gated
       attention), batched-GEMM attention, scratch-pool reuse (de-reverb 2.9x). Silero
       VAD v5 pure C++/CUDA smart slicing added (aligned 2.5e-7).
-- [ ] S7 (extension, v1.1): **selectable models per task** — register ≥1 SOTA
-      alternative per task; `vc_preprocess --sep-model <name>` per stage; `vc_serve`
-      `/api/sep-models` + WebUI per-stage model picker. (Briefly mis-filed as a new
-      spec 005; folded back here per constitution rule 5 “extend existing spec”.)
+- [x] S7 (extension, v1.1): **selectable models per task** — implemented end-to-end:
+      `vc_preprocess` supports `--separate-model/--deharmony-model/--dereverb-model/
+      --deecho-model/--denoise-model`; `vc_serve` adds `GET /api/sep-models` discovery
+      + `/api/step` model validation/forwarding; WebUI cascade adds per-stage model
+      picker (hidden unless a stage has >1 installed model). Model registry lives in
+      `src/separation/sep_registry.cpp` and discovers drop-in alternatives from
+      `<name>.json` `{ "task": ..., "label": ... }`.
 
 ## Gates
 Real audio only for functional tests. STFT round-trip < 1e-4. Each model runner

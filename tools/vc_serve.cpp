@@ -40,6 +40,8 @@
 #include <thread>
 #include <vector>
 
+#include "voxmutatio/separation/sep_registry.h"
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -275,18 +277,41 @@ std::string voices_json() {
     return j;
 }
 
-// ---- per-step material preprocessing (apply each step individually, preview, then train) ----
-void run_step(std::string name, std::string step) {
+// Installed separation models grouped by stage, for the WebUI per-stage picker.
+std::string sep_models_json() {
+    auto models = voxmutatio::separation::list_sep_models(g.models + "/separation");
+    std::string j = "{";
+    bool first_task = true;
+    for (const auto& task : voxmutatio::separation::sep_tasks()) {
+        if (!first_task) j += ",";
+        first_task = false;
+        j += "\"" + json_escape(task) + "\":[";
+        bool first = true;
+        for (const auto& m : models) {
+            if (m.task != task) continue;
+            if (!first) j += ",";
+            first = false;
+            j += "{\"name\":\"" + json_escape(m.name) + "\",\"label\":\"" + json_escape(m.label) + "\"}";
+        }
+        j += "]";
+    }
+    j += "}";
+    return j;
+}
+
+void run_step(std::string name, std::string step, std::string model) {
     std::lock_guard<std::mutex> gpu_lk(g_gpu_mu);  // serialise GPU use
     std::string dir = g.runs + "/" + name, work = dir + "/work", tmp = dir + "/work_tmp", log = dir + "/train.log";
-    std::ofstream(log, std::ios::app) << "[serve] preprocess step '" << step << "' on '" << name << "'\n";
+    std::ofstream(log, std::ios::app) << "[serve] preprocess step '" << step << "'"
+        << (model.empty() ? "" : " model '" + model + "'") << " on '" << name << "'\n";
     set_stage("step:" + step);
     fs::remove_all(tmp); fs::create_directories(tmp);
     std::string flag = step == "separate" ? "--separate" : step == "dereverb" ? "--dereverb"
                      : step == "deecho" ? "--deecho"
                      : step == "deharmony" ? "--deharmony" : "--denoise";
+    std::string model_flag = model.empty() ? "" : (" --" + step + "-model '" + model + "'");
     int rc = std::system(("{ '" + g.build + "/vc_preprocess' --input '" + work + "' --output-dir '" + tmp +
-        "' --sr 44100 --no-slice " + flag + " --sep-dir '" + g.models + "/separation' 2>&1 | " +
+        "' --sr 44100 --no-slice " + flag + model_flag + " --sep-dir '" + g.models + "/separation' 2>&1 | " +
         "grep --line-buffered -E 'processed|error|enabled' ; } >> '" + log + "' 2>&1").c_str());
     if (rc != 0 || fs::is_empty(tmp)) { fs::remove_all(tmp); finish("error", true); return; }
     fs::remove_all(work); fs::rename(tmp, work);
@@ -327,10 +352,15 @@ void handle_step(int fd, const Request& req) {
     std::string name = field(parts, "name", ""), step = field(parts, "step", "");
     if (!safe_name(name) || !fs::exists(g.runs + "/" + name + "/work")) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"upload material first\"}"); return; }
     if (step != "separate" && step != "dereverb" && step != "deecho" && step != "denoise" && step != "deharmony") { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown step\"}"); return; }
+    std::string model = field(parts, "model", "");
+    if (!model.empty() &&
+        !voxmutatio::separation::sep_model_available(g.models + "/separation", step, model)) {
+        send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown model\"}"); return;
+    }
     bool expected = false;
     if (!g_job.running.compare_exchange_strong(expected, true)) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"busy\"}"); return; }
     { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "step:" + step; g_job.done = false; g_job.error = false; }
-    std::thread(run_step, name, step).detach();
+    std::thread(run_step, name, step, model).detach();
     send_json(fd, "{\"step\":\"" + json_escape(step) + "\"}");
 }
 
@@ -518,6 +548,7 @@ void handle_connection(int fd) {
     Request req;
     if (read_request(fd, req)) {
         if (req.method == "GET" && req.path == "/api/voices") send_json(fd, voices_json());
+        else if (req.method == "GET" && req.path == "/api/sep-models") send_json(fd, sep_models_json());
         else if (req.method == "GET" && req.path == "/api/train/status") handle_status(fd, req);
         else if (req.method == "POST" && req.path == "/api/train") handle_train(fd, req);
         else if (req.method == "POST" && req.path == "/api/material") handle_material(fd, req);
