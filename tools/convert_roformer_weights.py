@@ -51,6 +51,11 @@ REGISTRY = {
     "dereverb": ("dereverb_roformer", "anvuew/dereverb_mel_band_roformer",
                  "archive only/8_256_6/deverb_mel_band_roformer_8_256dim_6depth.ckpt",
                  "archive only/8_256_6/deverb_mel_band_roformer_8_256dim_6depth.yaml"),
+    "vocals": ("vocal_roformer", "becruily/mel-band-roformer-vocals",
+               "mel_band_roformer_vocals_becruily.ckpt", "config_vocals_becruily.yaml"),
+    "denoise": ("denoise_roformer", "poiqazwsx/melband-roformer-denoise",
+                "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt",
+                "model_mel_band_roformer_denoise.yaml"),
 }
 VALID = {
     "dim", "depth", "stereo", "num_stems", "time_transformer_depth",

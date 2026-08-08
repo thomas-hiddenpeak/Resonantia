@@ -24,7 +24,6 @@
 
 #include "voxmutatio/io/audio_io.h"
 #include "voxmutatio/separation/roformer.h"
-#include "voxmutatio/separation/separator.h"
 
 namespace fs = std::filesystem;
 namespace io = voxmutatio::io;
@@ -60,10 +59,9 @@ void print_usage() {
         "  --min-rms <f>      Drop slices quieter than this RMS (default: 0.010)\n"
         "  --trim             Trim leading/trailing silence before slicing\n"
         "  --trim-thresh <f>  Amplitude threshold for --trim (default: 0.020)\n"
-        "  --separate         Extract vocals (Open-Unmix) before slicing\n"
-        "  --sep-model <path> Vocal-separation weights (default:\n"
-        "                     models/separation/umxhq_vocals.safetensors)\n"
+        "  --separate         Extract vocals (MelBand-RoFormer) before slicing\n"
         "  --dereverb         Remove reverb (MelBand-RoFormer) before slicing\n"
+        "  --denoise          Remove noise (MelBand-RoFormer) before slicing\n"
         "  --sep-dir <path>   Separation model dir (default: models/separation)\n"
         "  --help             Show this help\n";
 }
@@ -74,8 +72,7 @@ int main(int argc, char** argv) {
     std::string input, output_dir;
     int sr = 40000;
     double seg_sec = 3.0, hop_sec = 0.0, min_rms = 0.010, trim_thresh = 0.020;
-    bool trim = false, separate = false, dereverb = false;
-    std::string sep_model = "models/separation/umxhq_vocals.safetensors";
+    bool trim = false, separate = false, dereverb = false, denoise = false;
     std::string sep_dir = "models/separation";
 
     for (int i = 1; i < argc; ++i) {
@@ -91,8 +88,8 @@ int main(int argc, char** argv) {
         else if (a == "--trim") trim = true;
         else if (a == "--trim-thresh") trim_thresh = std::atof(next());
         else if (a == "--separate") separate = true;
-        else if (a == "--sep-model") sep_model = next();
         else if (a == "--dereverb") dereverb = true;
+        else if (a == "--denoise") denoise = true;
         else if (a == "--sep-dir") sep_dir = next();
         else { std::cerr << "Unknown argument: " << a << "\n"; return 1; }
     }
@@ -115,14 +112,14 @@ int main(int argc, char** argv) {
     }
     if (files.empty()) { std::cerr << "error: no audio under " << input << "\n"; return 1; }
 
-    std::unique_ptr<voxmutatio::separation::Separator> sep;
+    std::unique_ptr<voxmutatio::separation::Roformer> voc;
     if (separate) {
-        sep = std::make_unique<voxmutatio::separation::Separator>(sep_model);
-        if (!sep->valid()) {
-            std::cerr << "error: could not load separation model: " << sep_model << "\n";
+        voc = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, "vocal_roformer");
+        if (!voc->valid()) {
+            std::cerr << "error: could not load vocal model in: " << sep_dir << "\n";
             return 1;
         }
-        std::cout << "Vocal separation enabled (Open-Unmix)\n";
+        std::cout << "Vocal separation enabled (MelBand-RoFormer)\n";
     }
     std::unique_ptr<voxmutatio::separation::Roformer> derev;
     if (dereverb) {
@@ -132,6 +129,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cout << "De-reverb enabled (MelBand-RoFormer)\n";
+    }
+    std::unique_ptr<voxmutatio::separation::Roformer> denoiser;
+    if (denoise) {
+        denoiser = std::make_unique<voxmutatio::separation::Roformer>(sep_dir, "denoise_roformer");
+        if (!denoiser->valid()) {
+            std::cerr << "error: could not load de-noise model in: " << sep_dir << "\n";
+            return 1;
+        }
+        std::cout << "De-noise enabled (MelBand-RoFormer)\n";
     }
 
     fs::create_directories(output_dir);
@@ -144,11 +150,14 @@ int main(int argc, char** argv) {
         auto opt = io::read_audio(f, sr);
         if (!opt) { std::cerr << "skip (read failed): " << f << "\n"; continue; }
         std::vector<float> a = std::move(opt->data);
-        if (sep) {
-            a = sep->separate_mono(a.data(), static_cast<int>(a.size()), sr);
+        if (voc) {
+            a = voc->separate_mono(a.data(), static_cast<int>(a.size()), sr);
         }
         if (derev) {
             a = derev->separate_mono(a.data(), static_cast<int>(a.size()), sr);
+        }
+        if (denoiser) {
+            a = denoiser->separate_mono(a.data(), static_cast<int>(a.size()), sr);
         }
         if (trim) {
             auto [lo, hi] = voiced_span(a, static_cast<float>(trim_thresh), sr / 10);
