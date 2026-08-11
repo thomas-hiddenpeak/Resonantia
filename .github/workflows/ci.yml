@@ -51,6 +51,10 @@ jobs:
         with:
           persist-credentials: false
           clean: true
+          # `git show --check HEAD` needs the parent commit. With checkout's
+          # default depth of 1, HEAD is treated as a root commit and every
+          # pre-existing file is incorrectly checked as newly added content.
+          fetch-depth: 2
 
       - name: Validate runner and scripts
         shell: bash
