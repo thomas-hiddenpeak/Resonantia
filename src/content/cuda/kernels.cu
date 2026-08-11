@@ -7,34 +7,89 @@
 #include <cublas_v2.h>
 #include <cufft.h>
 
+#include <algorithm>
 #include <cmath>
+#include <initializer_list>
+#include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
+
+#include "voxmutatio/core/cuda_buffer.h"
 
 namespace voxmutatio::content::cuda {
 
 namespace {
 
-cudaError_t check_cuda(cudaError_t err, const char* file, int line) {
-    if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error at %s:%d: %s\n", file, line,
-                cudaGetErrorString(err));
-        return err;
-    }
-    return err;
-}
-
-#define CUDA_CHECK(err) check_cuda(err, __FILE__, __LINE__)
-
-cublasStatus_t check_cublas(cublasStatus_t err, const char* file, int line) {
+void check_cublas(cublasStatus_t err, const char* file, int line) {
     if (err != CUBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "cuBLAS error at %s:%d: %d\n", file, line, err);
-        return err;
+        throw std::runtime_error(std::string("cuBLAS error at ") + file + ":" +
+                                 std::to_string(line) + " (status " +
+                                 std::to_string(static_cast<int>(err)) + ")");
     }
-    return err;
 }
 
 #define CUBLAS_CHECK(err) check_cublas(err, __FILE__, __LINE__)
+
+class CublasHandle final {
+ public:
+    CublasHandle() {
+        const cublasStatus_t status = cublasCreate(&handle_);
+        if (status != CUBLAS_STATUS_SUCCESS && handle_) {
+            (void)cublasDestroy(handle_);
+            handle_ = nullptr;
+        }
+        CUBLAS_CHECK(status);
+    }
+
+    ~CublasHandle() noexcept {
+        if (handle_) (void)cublasDestroy(handle_);
+    }
+
+    CublasHandle(const CublasHandle&) = delete;
+    CublasHandle& operator=(const CublasHandle&) = delete;
+
+    [[nodiscard]] cublasHandle_t get() const noexcept { return handle_; }
+
+    void close() {
+        if (!handle_) return;
+        const cublasStatus_t status = cublasDestroy(handle_);
+        if (status == CUBLAS_STATUS_SUCCESS) handle_ = nullptr;
+        CUBLAS_CHECK(status);
+    }
+
+ private:
+    cublasHandle_t handle_{};
+};
+
+void check_cufft(cufftResult err, const char* file, int line) {
+    if (err != CUFFT_SUCCESS) {
+        throw std::runtime_error(std::string("cuFFT error at ") + file + ":" +
+                                 std::to_string(line) + " (status " +
+                                 std::to_string(static_cast<int>(err)) + ")");
+    }
+}
+
+#define CUFFT_CHECK(err) check_cufft(err, __FILE__, __LINE__)
+
+std::size_t checked_element_count(std::initializer_list<int> dimensions,
+                                  const char* operation) {
+    std::size_t count = 1;
+    constexpr std::size_t kMaxElements =
+        static_cast<std::size_t>(std::numeric_limits<int>::max());
+    for (int dimension : dimensions) {
+        if (dimension <= 0) {
+            throw std::invalid_argument(std::string(operation) +
+                                        " requires positive dimensions");
+        }
+        if (count > kMaxElements / static_cast<std::size_t>(dimension)) {
+            throw std::length_error(std::string(operation) +
+                                    " tensor exceeds INT_MAX elements");
+        }
+        count *= static_cast<std::size_t>(dimension);
+    }
+    return count;
+}
 
 // GELU kernel
 __global__ void gelu_kernel(const float* input, float* output, int size) {
@@ -92,11 +147,21 @@ static float hann_window_host(int i, int size) {
 // STFT computation with cuFFT
 std::vector<float> compute_stft(const float* audio, int num_samples,
                                  int frame_size, int hop_length) {
+    if (!audio || num_samples <= 0 || frame_size <= 1 || hop_length <= 0 ||
+        num_samples < frame_size) {
+        throw std::invalid_argument(
+            "compute_fbank requires audio, frame_size > 1, hop_length > 0, and at least one frame");
+    }
     int num_frames = (num_samples - frame_size) / hop_length + 1;
     int fft_size = frame_size;
+    int num_freqs = fft_size / 2 + 1;
+    const std::size_t framed_count = static_cast<std::size_t>(num_frames) * fft_size;
+    if (framed_count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::length_error("compute_fbank input is too large");
+    }
     
     // Apply Hann window and extract frames (host side)
-    std::vector<float> windowed(num_frames * fft_size);
+    std::vector<float> windowed(framed_count);
     for (int f = 0; f < num_frames; ++f) {
         for (int i = 0; i < frame_size; ++i) {
             windowed[f * fft_size + i] = 
@@ -105,41 +170,30 @@ std::vector<float> compute_stft(const float* audio, int num_samples,
     }
     
     // GPU FFT
-    cufftComplex* d_input = nullptr;
-    cufftComplex* d_output = nullptr;
-    cudaMalloc(&d_input, num_frames * fft_size * sizeof(cufftComplex));
-    cudaMalloc(&d_output, num_frames * (fft_size / 2 + 1) * sizeof(cufftComplex));
-    
-    // Convert to complex
-    std::vector<cuFloatComplex> h_input(num_frames * fft_size, {0.0f, 0.0f});
-    for (int i = 0; i < num_frames * fft_size; ++i) {
-        h_input[i].x = windowed[i];
-    }
-    cudaMemcpy(d_input, h_input.data(), 
-               num_frames * fft_size * sizeof(cufftComplex), 
-               cudaMemcpyHostToDevice);
+    core::CudaBuffer d_input(framed_count);
+    // CudaBuffer stores floats; an R2C output contains two floats per bin.
+    core::CudaBuffer d_output(static_cast<std::size_t>(num_frames) * num_freqs * 2);
+    d_input.copy_from_host(windowed.data(), windowed.size());
     
     // Create FFT plan
-    cufftHandle plan;
-    cufftPlan1d(&plan, fft_size, CUFFT_C2C, num_frames);
-    cufftExecC2C(plan, d_input, d_output, CUFFT_FORWARD);
-    cufftDestroy(plan);
+    cufftHandle plan{};
+    CUFFT_CHECK(cufftPlan1d(&plan, fft_size, CUFFT_R2C, num_frames));
+    cufftResult exec_status = cufftExecR2C(
+        plan, d_input.data(), reinterpret_cast<cufftComplex*>(d_output.data()));
+    cufftResult destroy_status = cufftDestroy(plan);
+    CUFFT_CHECK(exec_status);
+    CUFFT_CHECK(destroy_status);
     
     // Copy results back
-    std::vector<cuFloatComplex> h_output(num_frames * (fft_size / 2 + 1));
-    cudaMemcpy(h_output.data(), d_output,
-               num_frames * (fft_size / 2 + 1) * sizeof(cufftComplex),
-               cudaMemcpyDeviceToHost);
+    std::vector<cuFloatComplex> h_output(static_cast<std::size_t>(num_frames) * num_freqs);
+    d_output.copy_to_host(reinterpret_cast<float*>(h_output.data()), h_output.size() * 2);
     
     // Compute magnitude spectrum
-    std::vector<float> magnitudes(num_frames * (fft_size / 2 + 1));
-    for (int i = 0; i < num_frames * (fft_size / 2 + 1); ++i) {
+    std::vector<float> magnitudes(static_cast<std::size_t>(num_frames) * num_freqs);
+    for (std::size_t i = 0; i < magnitudes.size(); ++i) {
         magnitudes[i] = sqrtf(h_output[i].x * h_output[i].x + 
                               h_output[i].y * h_output[i].y);
     }
-    
-    cudaFree(d_input);
-    cudaFree(d_output);
     
     return magnitudes;
 }
@@ -149,6 +203,11 @@ std::vector<float> compute_stft(const float* audio, int num_samples,
 std::vector<float> compute_fbank(const float* audio, int num_samples,
                                   int num_mels, int frame_size,
                                   int hop_length, int sample_rate) {
+    constexpr int kMaximumMelBins = 4096;
+    if (num_mels <= 0 || num_mels > kMaximumMelBins || sample_rate <= 0) {
+        throw std::invalid_argument(
+            "compute_fbank requires sample_rate > 0 and 1..4096 mel bins");
+    }
     // Compute STFT
     int num_freqs = frame_size / 2 + 1;
     auto magnitudes = compute_stft(audio, num_samples, frame_size, hop_length);
@@ -181,8 +240,9 @@ std::vector<float> compute_fbank(const float* audio, int num_samples,
     
     std::vector<int> freq_indices(num_mels + 2);
     for (int i = 0; i < num_mels + 2; ++i) {
-        freq_indices[i] = static_cast<int>(roundf(
-            (num_freqs - 1) * freq_points[i] / (sample_rate / 2.0f)));
+        freq_indices[i] = std::clamp(static_cast<int>(roundf(
+            (num_freqs - 1) * freq_points[i] / (sample_rate / 2.0f))), 0,
+            num_freqs - 1);
     }
     
     // Fill Mel filterbank
@@ -217,117 +277,122 @@ std::vector<float> compute_fbank(const float* audio, int num_samples,
 void matmul(const float* A, int M, int K,
             const float* B, int N,
             float* C) {
-    // GPU allocations
-    float *d_A, *d_B, *d_C;
-    CUDA_CHECK(cudaMalloc(&d_A, M * K * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_B, K * N * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_C, M * N * sizeof(float)));
-    
-    // Copy inputs
-    CUDA_CHECK(cudaMemcpy(d_A, A, M * K * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, B, K * N * sizeof(float), cudaMemcpyHostToDevice));
+    if (!A || !B || !C || M <= 0 || K <= 0 || N <= 0) {
+        throw std::invalid_argument("matmul requires non-null buffers and positive dimensions");
+    }
+    const std::size_t a_count = checked_element_count({M, K}, "matmul A");
+    const std::size_t b_count = checked_element_count({K, N}, "matmul B");
+    const std::size_t c_count = checked_element_count({M, N}, "matmul C");
+    core::CudaBuffer d_A(a_count);
+    core::CudaBuffer d_B(b_count);
+    core::CudaBuffer d_C(c_count);
+    d_A.copy_from_host(A, a_count);
+    d_B.copy_from_host(B, b_count);
     
     // cuBLAS handle
-    cublasHandle_t handle;
-    CUBLAS_CHECK(cublasCreate(&handle));
+    CublasHandle handle;
     
     // cuBLAS uses column-major, so C = A @ B becomes C^T = B^T @ A^T
     float alpha = 1.0f;
     float beta = 0.0f;
-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T,
-                             N, M, K, &alpha,
-                             d_B, N, d_A, M, &beta, d_C, N));
+    cublasStatus_t gemm_status = cublasSgemm(
+        handle.get(), CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B.data(), N,
+        d_A.data(), K, &beta, d_C.data(), N);
+    CUBLAS_CHECK(gemm_status);
+    handle.close();
     
     // Copy result (transpose back to row-major)
-    CUDA_CHECK(cudaMemcpy(C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    // Cleanup
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
-    cublasDestroy(handle);
+    d_C.copy_to_host(C, c_count);
 }
 
 std::vector<float> layer_norm(const float* input, int seq_len, int dim) {
-    std::vector<float> output(seq_len * dim);
+    if (!input || seq_len <= 0 || dim <= 0) {
+        throw std::invalid_argument(
+            "layer_norm requires a non-null input and positive dimensions");
+    }
+    const std::size_t element_count =
+        checked_element_count({seq_len, dim}, "layer_norm");
+    std::vector<float> output(element_count);
     std::vector<float> mean(seq_len);
     std::vector<float> rstd(seq_len);
     
-    float *d_input, *d_output, *d_mean, *d_rstd;
-    CUDA_CHECK(cudaMalloc(&d_input, seq_len * dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, seq_len * dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_mean, seq_len * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_rstd, seq_len * sizeof(float)));
-    
-    CUDA_CHECK(cudaMemcpy(d_input, input, seq_len * dim * sizeof(float), 
-                          cudaMemcpyHostToDevice));
+    core::CudaBuffer d_input(element_count);
+    core::CudaBuffer d_output(element_count);
+    core::CudaBuffer d_mean(seq_len);
+    core::CudaBuffer d_rstd(seq_len);
+
+    d_input.copy_from_host(input, element_count);
     
     int block_size = 256;
-    int grid_size = (seq_len + block_size - 1) / block_size;
+    int grid_size = (seq_len - 1) / block_size + 1;
     
-    layer_norm_kernel<<<grid_size, block_size>>>(d_input, d_output, d_mean, d_rstd,
+    layer_norm_kernel<<<grid_size, block_size>>>(d_input.data(), d_output.data(),
+                                                  d_mean.data(), d_rstd.data(),
                                                   seq_len, dim);
-    
-    CUDA_CHECK(cudaMemcpy(output.data(), d_output, seq_len * dim * sizeof(float),
-                          cudaMemcpyDeviceToHost));
-    
-    cudaFree(d_input);
-    cudaFree(d_output);
-    cudaFree(d_mean);
-    cudaFree(d_rstd);
+
+    d_output.copy_to_host(output.data(), element_count);
     
     return output;
 }
 
 void gelu_forward(const float* input, float* output, int size) {
-    float *d_input, *d_output;
-    CUDA_CHECK(cudaMalloc(&d_input, size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, size * sizeof(float)));
-    
-    CUDA_CHECK(cudaMemcpy(d_input, input, size * sizeof(float), cudaMemcpyHostToDevice));
+    if (!input || !output || size <= 0) {
+        throw std::invalid_argument(
+            "gelu_forward requires non-null buffers and a positive size");
+    }
+    core::CudaBuffer d_input(size);
+    core::CudaBuffer d_output(size);
+
+    d_input.copy_from_host(input, size);
     
     int block_size = 256;
-    int grid_size = (size + block_size - 1) / block_size;
+    int grid_size = (size - 1) / block_size + 1;
     
-    gelu_kernel<<<grid_size, block_size>>>(d_input, d_output, size);
-    
-    CUDA_CHECK(cudaMemcpy(output, d_output, size * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    cudaFree(d_input);
-    cudaFree(d_output);
+    gelu_kernel<<<grid_size, block_size>>>(d_input.data(), d_output.data(), size);
+
+    d_output.copy_to_host(output, size);
 }
 
 void relu_forward(const float* input, float* output, int size) {
-    float *d_input, *d_output;
-    CUDA_CHECK(cudaMalloc(&d_input, size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, size * sizeof(float)));
-    
-    CUDA_CHECK(cudaMemcpy(d_input, input, size * sizeof(float), cudaMemcpyHostToDevice));
+    if (!input || !output || size <= 0) {
+        throw std::invalid_argument(
+            "relu_forward requires non-null buffers and a positive size");
+    }
+    core::CudaBuffer d_input(size);
+    core::CudaBuffer d_output(size);
+
+    d_input.copy_from_host(input, size);
     
     int block_size = 256;
-    int grid_size = (size + block_size - 1) / block_size;
+    int grid_size = (size - 1) / block_size + 1;
     
-    relu_kernel<<<grid_size, block_size>>>(d_input, d_output, size);
-    
-    CUDA_CHECK(cudaMemcpy(output, d_output, size * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    cudaFree(d_input);
-    cudaFree(d_output);
+    relu_kernel<<<grid_size, block_size>>>(d_input.data(), d_output.data(), size);
+
+    d_output.copy_to_host(output, size);
 }
 
 std::vector<float> multihead_attention(const float* q, const float* k,
                                         const float* v,
                                         int seq_len, int num_heads,
                                         int head_dim) {
-    int total_dim = num_heads * head_dim;
-    std::vector<float> output(seq_len * total_dim, 0.0f);
+    if (!q || !k || !v || seq_len <= 0 || num_heads <= 0 || head_dim <= 0) {
+        throw std::invalid_argument(
+            "multihead_attention requires non-null inputs and positive dimensions");
+    }
+    const int total_dim = static_cast<int>(
+        checked_element_count({num_heads, head_dim}, "multihead_attention head dimension"));
+    const std::size_t output_count =
+        checked_element_count({seq_len, total_dim}, "multihead_attention output");
+    const std::size_t score_count =
+        checked_element_count({seq_len, seq_len}, "multihead_attention scores");
+    std::vector<float> output(output_count, 0.0f);
     
     // Scaled dot-product attention for each head
     float scale = 1.0f / sqrtf(head_dim);
     
     for (int h = 0; h < num_heads; ++h) {
         // Compute attention scores: Q @ K^T
-        std::vector<float> scores(seq_len * seq_len);
+        std::vector<float> scores(score_count);
         
         for (int i = 0; i < seq_len; ++i) {
             for (int j = 0; j < seq_len; ++j) {
@@ -377,8 +442,17 @@ std::vector<float> multihead_attention(const float* q, const float* k,
 std::vector<float> conv1d(const float* input, int seq_len, int channels,
                           const float* weight, int out_channels,
                           int kernel_size) {
+    if (!input || !weight || seq_len <= 0 || channels <= 0 || out_channels <= 0 ||
+        kernel_size <= 0 || kernel_size % 2 == 0) {
+        throw std::invalid_argument(
+            "conv1d requires non-null inputs, positive dimensions, and an odd kernel");
+    }
     int padding = kernel_size / 2;
-    std::vector<float> output(seq_len * out_channels, 0.0f);
+    const std::size_t output_count =
+        checked_element_count({seq_len, out_channels}, "conv1d output");
+    (void)checked_element_count(
+        {out_channels, channels, kernel_size}, "conv1d weights");
+    std::vector<float> output(output_count, 0.0f);
     
     for (int o = 0; o < out_channels; ++o) {
         for (int i = 0; i < seq_len; ++i) {
@@ -403,15 +477,20 @@ std::vector<float> conv1d(const float* input, int seq_len, int channels,
 void batched_matmul(const float** d_A, int M, int K,
                     const float** d_B, int N,
                     float** d_C, int batch_size) {
-    cublasHandle_t handle;
-    CUBLAS_CHECK(cublasCreate(&handle));
+    if (!d_A || !d_B || !d_C || M <= 0 || K <= 0 || N <= 0 || batch_size <= 0) {
+        throw std::invalid_argument(
+            "batched_matmul requires device pointer arrays and positive dimensions");
+    }
+    CublasHandle handle;
     
     float alpha = 1.0f;
     float beta = 0.0f;
     
-    // Note: This is a simplified implementation
-    // Full batched GEMM would use cublasSgemmBatched
-    CUBLAS_CHECK(cublasDestroy(handle));
+    cublasStatus_t gemm_status = cublasSgemmBatched(
+        handle.get(), CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B, N, d_A, K,
+        &beta, d_C, N, batch_size);
+    CUBLAS_CHECK(gemm_status);
+    handle.close();
 }
 
 // ============================================================================
@@ -554,41 +633,53 @@ __global__ void softmax_rows_kernel(float* data, int rows, int cols) {
 }
 
 void gelu_exact(const float* input, float* output, int size) {
-    float *d_in, *d_out;
-    CUDA_CHECK(cudaMalloc(&d_in, size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_out, size * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_in, input, size * sizeof(float), cudaMemcpyHostToDevice));
-    int block = 256, grid = (size + block - 1) / block;
-    gelu_exact_kernel<<<grid, block>>>(d_in, d_out, size);
-    CUDA_CHECK(cudaMemcpy(output, d_out, size * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_in); cudaFree(d_out);
+    if (!input || !output || size <= 0) {
+        throw std::invalid_argument(
+            "gelu_exact requires non-null buffers and a positive size");
+    }
+    core::CudaBuffer d_in(size);
+    core::CudaBuffer d_out(size);
+    d_in.copy_from_host(input, size);
+    int block = 256, grid = (size - 1) / block + 1;
+    gelu_exact_kernel<<<grid, block>>>(d_in.data(), d_out.data(), size);
+    d_out.copy_to_host(output, size);
 }
 
 std::vector<float> conv1d_strided(const float* input, int in_channels, int in_len,
                                    const float* weight, const float* bias,
                                    int out_channels, int kernel, int stride) {
+    if (!input || !weight || in_channels <= 0 || in_len <= 0 || out_channels <= 0 ||
+        kernel <= 0 || stride <= 0 || in_len < kernel) {
+        throw std::invalid_argument(
+            "conv1d_strided requires non-null inputs, positive dimensions and stride, "
+            "and in_len >= kernel");
+    }
     int out_len = (in_len - kernel) / stride + 1;
-    std::vector<float> output(out_channels * out_len);
+    const std::size_t input_count =
+        checked_element_count({in_channels, in_len}, "conv1d_strided input");
+    const std::size_t weight_count = checked_element_count(
+        {out_channels, in_channels, kernel}, "conv1d_strided weights");
+    const std::size_t output_count =
+        checked_element_count({out_channels, out_len}, "conv1d_strided output");
+    std::vector<float> output(output_count);
 
-    float *d_in, *d_w, *d_b = nullptr, *d_out;
-    CUDA_CHECK(cudaMalloc(&d_in, in_channels * in_len * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_w, out_channels * in_channels * kernel * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_out, out_channels * out_len * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_in, input, in_channels * in_len * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_w, weight, out_channels * in_channels * kernel * sizeof(float), cudaMemcpyHostToDevice));
+    core::CudaBuffer d_in(input_count);
+    core::CudaBuffer d_w(weight_count);
+    core::CudaBuffer d_b;
+    core::CudaBuffer d_out(output_count);
+    d_in.copy_from_host(input, input_count);
+    d_w.copy_from_host(weight, weight_count);
     if (bias) {
-        CUDA_CHECK(cudaMalloc(&d_b, out_channels * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_b, bias, out_channels * sizeof(float), cudaMemcpyHostToDevice));
+        d_b.copy_from_host(bias, out_channels);
     }
 
     int block = 256;
-    dim3 grid((out_len + block - 1) / block, out_channels);
-    conv1d_strided_kernel<<<grid, block>>>(d_in, d_w, d_b, d_out,
+    dim3 grid((out_len - 1) / block + 1, out_channels);
+    conv1d_strided_kernel<<<grid, block>>>(d_in.data(), d_w.data(),
+                                            bias ? d_b.data() : nullptr, d_out.data(),
                                             in_channels, in_len, out_channels,
                                             kernel, stride, out_len);
-    CUDA_CHECK(cudaMemcpy(output.data(), d_out, out_channels * out_len * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_in); cudaFree(d_w); cudaFree(d_out);
-    if (d_b) cudaFree(d_b);
+    d_out.copy_to_host(output.data(), output_count);
     return output;
 }
 
@@ -596,89 +687,122 @@ std::vector<float> conv1d_grouped(const float* input, int in_channels, int in_le
                                    const float* weight, const float* bias,
                                    int out_channels, int kernel, int stride,
                                    int padding, int groups) {
-    int out_len = (in_len + 2 * padding - kernel) / stride + 1;
-    std::vector<float> output(out_channels * out_len);
+    if (!input || !weight || in_channels <= 0 || in_len <= 0 || out_channels <= 0 ||
+        kernel <= 0 || stride <= 0 || padding < 0 || groups <= 0 ||
+        in_channels % groups != 0 || out_channels % groups != 0 ||
+        static_cast<int64_t>(in_len) + 2LL * padding < kernel) {
+        throw std::invalid_argument(
+            "conv1d_grouped requires valid non-null inputs, positive dimensions/stride/groups, "
+            "divisible channels, and a non-empty output");
+    }
+    const int64_t numerator =
+        static_cast<int64_t>(in_len) + 2LL * padding - kernel;
+    const int64_t out_len64 = numerator / stride + 1;
+    if (out_len64 <= 0 || out_len64 > std::numeric_limits<int>::max()) {
+        throw std::length_error("conv1d_grouped output length exceeds int range");
+    }
+    const int out_len = static_cast<int>(out_len64);
+    const int channels_per_group = in_channels / groups;
+    const std::size_t input_count =
+        checked_element_count({in_channels, in_len}, "conv1d_grouped input");
+    const std::size_t weight_count = checked_element_count(
+        {out_channels, channels_per_group, kernel}, "conv1d_grouped weights");
+    const std::size_t output_count =
+        checked_element_count({out_channels, out_len}, "conv1d_grouped output");
+    std::vector<float> output(output_count);
 
-    int w_size = out_channels * (in_channels / groups) * kernel;
-    float *d_in, *d_w, *d_b = nullptr, *d_out;
-    CUDA_CHECK(cudaMalloc(&d_in, in_channels * in_len * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_w, w_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_out, out_channels * out_len * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_in, input, in_channels * in_len * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_w, weight, w_size * sizeof(float), cudaMemcpyHostToDevice));
+    core::CudaBuffer d_in(input_count);
+    core::CudaBuffer d_w(weight_count);
+    core::CudaBuffer d_b;
+    core::CudaBuffer d_out(output_count);
+    d_in.copy_from_host(input, input_count);
+    d_w.copy_from_host(weight, weight_count);
     if (bias) {
-        CUDA_CHECK(cudaMalloc(&d_b, out_channels * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_b, bias, out_channels * sizeof(float), cudaMemcpyHostToDevice));
+        d_b.copy_from_host(bias, out_channels);
     }
 
     int block = 256;
-    dim3 grid((out_len + block - 1) / block, out_channels);
-    conv1d_grouped_kernel<<<grid, block>>>(d_in, d_w, d_b, d_out,
+    dim3 grid((out_len - 1) / block + 1, out_channels);
+    conv1d_grouped_kernel<<<grid, block>>>(d_in.data(), d_w.data(),
+                                            bias ? d_b.data() : nullptr, d_out.data(),
                                             in_channels, in_len, out_channels,
                                             kernel, stride, padding, groups, out_len);
-    CUDA_CHECK(cudaMemcpy(output.data(), d_out, out_channels * out_len * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_in); cudaFree(d_w); cudaFree(d_out);
-    if (d_b) cudaFree(d_b);
+    d_out.copy_to_host(output.data(), output_count);
     return output;
 }
 
 void group_norm(const float* input, float* output, int channels, int length,
                 int num_groups, const float* weight, const float* bias, float eps) {
-    float *d_in, *d_out, *d_w, *d_b;
-    int n = channels * length;
-    CUDA_CHECK(cudaMalloc(&d_in, n * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_out, n * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_w, channels * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_b, channels * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_in, input, n * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_w, weight, channels * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b, bias, channels * sizeof(float), cudaMemcpyHostToDevice));
+    if (!input || !output || !weight || !bias || channels <= 0 || length <= 0 ||
+        num_groups <= 0 || channels % num_groups != 0 || !std::isfinite(eps) || eps <= 0.0f) {
+        throw std::invalid_argument(
+            "group_norm requires valid buffers, dimensions/groups, and positive finite eps");
+    }
+    const std::size_t element_count =
+        checked_element_count({channels, length}, "group_norm");
+    core::CudaBuffer d_in(element_count);
+    core::CudaBuffer d_out(element_count);
+    core::CudaBuffer d_w(channels);
+    core::CudaBuffer d_b(channels);
+    d_in.copy_from_host(input, element_count);
+    d_w.copy_from_host(weight, channels);
+    d_b.copy_from_host(bias, channels);
 
-    group_norm_kernel<<<num_groups, 1>>>(d_in, d_out, d_w, d_b, channels, length, num_groups, eps);
-    CUDA_CHECK(cudaMemcpy(output, d_out, n * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_in); cudaFree(d_out); cudaFree(d_w); cudaFree(d_b);
+    group_norm_kernel<<<num_groups, 1>>>(d_in.data(), d_out.data(), d_w.data(),
+                                         d_b.data(), channels, length, num_groups, eps);
+    d_out.copy_to_host(output, element_count);
 }
 
 std::vector<float> layer_norm_affine(const float* input, int seq_len, int dim,
                                       const float* weight, const float* bias, float eps) {
-    std::vector<float> output(seq_len * dim);
-    float *d_in, *d_out, *d_w, *d_b;
-    CUDA_CHECK(cudaMalloc(&d_in, seq_len * dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_out, seq_len * dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_w, dim * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_b, dim * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_in, input, seq_len * dim * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_w, weight, dim * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b, bias, dim * sizeof(float), cudaMemcpyHostToDevice));
+    if (!input || !weight || !bias || seq_len <= 0 || dim <= 0 ||
+        !std::isfinite(eps) || eps <= 0.0f) {
+        throw std::invalid_argument(
+            "layer_norm_affine requires valid buffers/dimensions and positive finite eps");
+    }
+    const std::size_t element_count =
+        checked_element_count({seq_len, dim}, "layer_norm_affine");
+    std::vector<float> output(element_count);
+    core::CudaBuffer d_in(element_count);
+    core::CudaBuffer d_out(element_count);
+    core::CudaBuffer d_w(dim);
+    core::CudaBuffer d_b(dim);
+    d_in.copy_from_host(input, element_count);
+    d_w.copy_from_host(weight, dim);
+    d_b.copy_from_host(bias, dim);
 
-    layer_norm_affine_kernel<<<seq_len, 1>>>(d_in, d_out, d_w, d_b, seq_len, dim, eps);
-    CUDA_CHECK(cudaMemcpy(output.data(), d_out, seq_len * dim * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_in); cudaFree(d_out); cudaFree(d_w); cudaFree(d_b);
+    layer_norm_affine_kernel<<<seq_len, 1>>>(d_in.data(), d_out.data(), d_w.data(),
+                                             d_b.data(), seq_len, dim, eps);
+    d_out.copy_to_host(output.data(), element_count);
     return output;
 }
 
 // Linear: output[M,N] = input[M,K] @ weight[N,K]^T + bias[N]
 std::vector<float> linear(const float* input, int M, int K,
                           const float* weight, const float* bias, int N) {
-    std::vector<float> output(M * N);
-    float *d_in, *d_w, *d_out;
-    CUDA_CHECK(cudaMalloc(&d_in, M * K * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_w, N * K * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_out, M * N * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(d_in, input, M * K * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_w, weight, N * K * sizeof(float), cudaMemcpyHostToDevice));
+    if (!input || !weight || M <= 0 || K <= 0 || N <= 0) {
+        throw std::invalid_argument(
+            "linear requires non-null inputs and positive dimensions");
+    }
+    const std::size_t input_count = checked_element_count({M, K}, "linear input");
+    const std::size_t weight_count = checked_element_count({N, K}, "linear weights");
+    const std::size_t output_count = checked_element_count({M, N}, "linear output");
+    std::vector<float> output(output_count);
+    core::CudaBuffer d_in(input_count);
+    core::CudaBuffer d_w(weight_count);
+    core::CudaBuffer d_out(output_count);
+    d_in.copy_from_host(input, input_count);
+    d_w.copy_from_host(weight, weight_count);
 
-    cublasHandle_t handle;
-    CUBLAS_CHECK(cublasCreate(&handle));
+    CublasHandle handle;
     float alpha = 1.0f, beta = 0.0f;
     // output_cm[N,M] = weight_cm^T[N,K] @ input_cm[K,M]
-    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+    CUBLAS_CHECK(cublasSgemm(handle.get(), CUBLAS_OP_T, CUBLAS_OP_N,
                              N, M, K, &alpha,
-                             d_w, K, d_in, K, &beta, d_out, N));
-    cublasDestroy(handle);
+                             d_w.data(), K, d_in.data(), K, &beta, d_out.data(), N));
+    handle.close();
 
-    CUDA_CHECK(cudaMemcpy(output.data(), d_out, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_in); cudaFree(d_w); cudaFree(d_out);
+    d_out.copy_to_host(output.data(), output_count);
 
     // Add bias
     if (bias) {
@@ -695,14 +819,26 @@ std::vector<float> multihead_attention_split(const float* q, const float* k,
                                               const float* v,
                                               int seq_len, int dim,
                                               int num_heads) {
+    if (!q || !k || !v || seq_len <= 0 || dim <= 0 || num_heads <= 0 ||
+        dim % num_heads != 0) {
+        throw std::invalid_argument(
+            "multihead_attention_split requires non-null inputs, positive dimensions/heads, "
+            "and dim divisible by num_heads");
+    }
     int head_dim = dim / num_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
-    std::vector<float> output(seq_len * dim, 0.0f);
+    const std::size_t tensor_count =
+        checked_element_count({seq_len, dim}, "multihead_attention_split tensor");
+    const std::size_t head_count = checked_element_count(
+        {seq_len, head_dim}, "multihead_attention_split head");
+    const std::size_t score_count = checked_element_count(
+        {seq_len, seq_len}, "multihead_attention_split scores");
+    std::vector<float> output(tensor_count, 0.0f);
 
     // Process each head
     for (int h = 0; h < num_heads; ++h) {
         // Extract per-head Q,K,V into contiguous [seq_len, head_dim]
-        std::vector<float> qh(seq_len * head_dim), kh(seq_len * head_dim), vh(seq_len * head_dim);
+        std::vector<float> qh(head_count), kh(head_count), vh(head_count);
         for (int i = 0; i < seq_len; ++i) {
             for (int d = 0; d < head_dim; ++d) {
                 qh[i * head_dim + d] = q[i * dim + h * head_dim + d] * scale;
@@ -712,32 +848,29 @@ std::vector<float> multihead_attention_split(const float* q, const float* k,
         }
 
         // scores[seq,seq] = qh @ kh^T
-        float *d_q, *d_k, *d_scores;
-        CUDA_CHECK(cudaMalloc(&d_q, seq_len * head_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_k, seq_len * head_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_scores, seq_len * seq_len * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_q, qh.data(), seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_k, kh.data(), seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice));
+        core::CudaBuffer d_q(head_count);
+        core::CudaBuffer d_k(head_count);
+        core::CudaBuffer d_scores(score_count);
+        d_q.copy_from_host(qh.data(), head_count);
+        d_k.copy_from_host(kh.data(), head_count);
 
-        cublasHandle_t handle;
-        CUBLAS_CHECK(cublasCreate(&handle));
+        CublasHandle handle;
         float alpha = 1.0f, beta = 0.0f;
         // scores_cm[seq,seq] = kh_cm^T[seq,hd] @ qh_cm[hd,seq]
         // scores row-major [i,j] = sum_d qh[i,d]*kh[j,d]
-        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        CUBLAS_CHECK(cublasSgemm(handle.get(), CUBLAS_OP_T, CUBLAS_OP_N,
                                  seq_len, seq_len, head_dim, &alpha,
-                                 d_k, head_dim, d_q, head_dim, &beta,
-                                 d_scores, seq_len));
+                                 d_k.data(), head_dim, d_q.data(), head_dim, &beta,
+                                 d_scores.data(), seq_len));
 
         // Softmax over rows
-        int block = 256, grid = (seq_len + block - 1) / block;
-        softmax_rows_kernel<<<grid, block>>>(d_scores, seq_len, seq_len);
+        int block = 256, grid = (seq_len - 1) / block + 1;
+        softmax_rows_kernel<<<grid, block>>>(d_scores.data(), seq_len, seq_len);
 
         // out[seq,hd] = scores[seq,seq] @ vh[seq,hd]
-        float *d_v, *d_outh;
-        CUDA_CHECK(cudaMalloc(&d_v, seq_len * head_dim * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_outh, seq_len * head_dim * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_v, vh.data(), seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice));
+        core::CudaBuffer d_v(head_count);
+        core::CudaBuffer d_outh(head_count);
+        d_v.copy_from_host(vh.data(), head_count);
         // out_cm[hd,seq] = vh_cm^T? We want out[i,d] = sum_j scores[i,j]*vh[j,d]
         // out_cm[hd,seq]: use vh_cm[hd,seq] @ scores_cm... 
         // Simpler: out row-major = scores[seq,seq] @ vh[seq,hd]
@@ -748,22 +881,20 @@ std::vector<float> multihead_attention_split(const float* q, const float* k,
         // out_cm[hd,seq] = vh_cm[hd,seq] @ scores_cm^T[seq,seq]  (since out[i,d]=sum_j scores[i,j]vh[j,d] = sum_j vh_cm[d,j]*scores_cm[j? ])
         // out[i,d] = sum_j scores[i,j] * vh[j,d]. In col-major: out_cm[d,i]=sum_j vh_cm[d,j]*scores_cm[j,i]? scores_cm[j,i]=scores[i,j] (since scores_cm is transpose). Yes!
         // So out_cm[hd,seq] = vh_cm[hd,seq] @ scores_cm[seq,seq], with OP_N,OP_N.
-        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        CUBLAS_CHECK(cublasSgemm(handle.get(), CUBLAS_OP_N, CUBLAS_OP_N,
                                  head_dim, seq_len, seq_len, &alpha,
-                                 d_v, head_dim, d_scores, seq_len, &beta,
-                                 d_outh, head_dim));
+                                 d_v.data(), head_dim, d_scores.data(), seq_len, &beta,
+                                 d_outh.data(), head_dim));
 
-        std::vector<float> outh(seq_len * head_dim);
-        CUDA_CHECK(cudaMemcpy(outh.data(), d_outh, seq_len * head_dim * sizeof(float), cudaMemcpyDeviceToHost));
+        std::vector<float> outh(head_count);
+        d_outh.copy_to_host(outh.data(), head_count);
 
         // Scatter back into output
         for (int i = 0; i < seq_len; ++i)
             for (int d = 0; d < head_dim; ++d)
                 output[i * dim + h * head_dim + d] = outh[i * head_dim + d];
 
-        cublasDestroy(handle);
-        cudaFree(d_q); cudaFree(d_k); cudaFree(d_scores);
-        cudaFree(d_v); cudaFree(d_outh);
+        handle.close();
     }
 
     return output;

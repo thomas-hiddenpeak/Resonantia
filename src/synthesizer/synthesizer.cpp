@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -64,6 +65,170 @@ struct Weights {
     }
     bool has(const std::string& n) const { return meta(n) != nullptr; }
 };
+
+bool expect_shape(const Weights& w, const std::string& name,
+                  std::initializer_list<int64_t> shape) {
+    const io::Tensor* tensor = w.meta(name);
+    if (!tensor) {
+        fprintf(stderr, "VITS: missing required tensor 'model.%s'\n", name.c_str());
+        return false;
+    }
+    if (tensor->shape != std::vector<int64_t>(shape)) {
+        fprintf(stderr, "VITS: tensor 'model.%s' has incompatible shape\n", name.c_str());
+        return false;
+    }
+    std::size_t elements = 1;
+    for (int64_t dim : shape) elements *= static_cast<std::size_t>(dim);
+    if (tensor->dtype != "F32" || tensor->data_nbytes != elements * sizeof(float)) {
+        fprintf(stderr, "VITS: tensor 'model.%s' is not F32 with the expected size\n",
+                name.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool validate_checkpoint(const Weights& w, int feature_dim, int& num_speakers) {
+    bool ok = true;
+    ok &= expect_shape(w, "enc_p.emb_phone.weight", {kHidden, feature_dim});
+    ok &= expect_shape(w, "enc_p.emb_phone.bias", {kHidden});
+    ok &= expect_shape(w, "enc_p.emb_pitch.weight", {256, kHidden});
+    for (int layer = 0; layer < kNLayers; ++layer) {
+        const std::string a = "enc_p.encoder.attn_layers." + std::to_string(layer) + ".";
+        ok &= expect_shape(w, a + "emb_rel_k", {1, 2 * kWindow + 1, kHidden / kNHeads});
+        ok &= expect_shape(w, a + "emb_rel_v", {1, 2 * kWindow + 1, kHidden / kNHeads});
+        for (const char* proj : {"conv_q", "conv_k", "conv_v", "conv_o"}) {
+            ok &= expect_shape(w, a + proj + ".weight", {kHidden, kHidden, 1});
+            ok &= expect_shape(w, a + proj + ".bias", {kHidden});
+        }
+        const std::string f = "enc_p.encoder.ffn_layers." + std::to_string(layer) + ".";
+        ok &= expect_shape(w, f + "conv_1.weight", {kFilter, kHidden, 3});
+        ok &= expect_shape(w, f + "conv_1.bias", {kFilter});
+        ok &= expect_shape(w, f + "conv_2.weight", {kHidden, kFilter, 3});
+        ok &= expect_shape(w, f + "conv_2.bias", {kHidden});
+        for (const char* norm : {"norm_layers_1", "norm_layers_2"}) {
+            const std::string n = "enc_p.encoder." + std::string(norm) + "." +
+                                  std::to_string(layer) + ".";
+            ok &= expect_shape(w, n + "gamma", {kHidden});
+            ok &= expect_shape(w, n + "beta", {kHidden});
+        }
+    }
+    ok &= expect_shape(w, "enc_p.proj.weight", {2 * kInter, kHidden, 1});
+    ok &= expect_shape(w, "enc_p.proj.bias", {2 * kInter});
+
+    for (int coupling = 0; coupling < 4; ++coupling) {
+        const std::string p = "flow.flows." + std::to_string(coupling * 2) + ".";
+        ok &= expect_shape(w, p + "pre.weight", {kHidden, kInter / 2, 1});
+        ok &= expect_shape(w, p + "pre.bias", {kHidden});
+        ok &= expect_shape(w, p + "post.weight", {kInter / 2, kHidden, 1});
+        ok &= expect_shape(w, p + "post.bias", {kInter / 2});
+        const std::string e = p + "enc.";
+        ok &= expect_shape(w, e + "cond_layer.weight_g", {2 * kHidden * 3, 1, 1});
+        ok &= expect_shape(w, e + "cond_layer.weight_v", {2 * kHidden * 3, kGin, 1});
+        ok &= expect_shape(w, e + "cond_layer.bias", {2 * kHidden * 3});
+        for (int layer = 0; layer < 3; ++layer) {
+            const std::string in = e + "in_layers." + std::to_string(layer) + ".";
+            ok &= expect_shape(w, in + "weight_g", {2 * kHidden, 1, 1});
+            ok &= expect_shape(w, in + "weight_v", {2 * kHidden, kHidden, 5});
+            ok &= expect_shape(w, in + "bias", {2 * kHidden});
+            const int rs_channels = layer < 2 ? 2 * kHidden : kHidden;
+            const std::string rs = e + "res_skip_layers." + std::to_string(layer) + ".";
+            ok &= expect_shape(w, rs + "weight_g", {rs_channels, 1, 1});
+            ok &= expect_shape(w, rs + "weight_v", {rs_channels, kHidden, 1});
+            ok &= expect_shape(w, rs + "bias", {rs_channels});
+        }
+    }
+
+    ok &= expect_shape(w, "dec.m_source.l_linear.weight", {1, 1});
+    ok &= expect_shape(w, "dec.m_source.l_linear.bias", {1});
+    ok &= expect_shape(w, "dec.conv_pre.weight", {512, kInter, 7});
+    ok &= expect_shape(w, "dec.conv_pre.bias", {512});
+    ok &= expect_shape(w, "dec.cond.weight", {512, kGin, 1});
+    ok &= expect_shape(w, "dec.cond.bias", {512});
+    const int rates[4] = {10, 10, 2, 2};
+    const int kernels[4] = {16, 16, 4, 4};
+    const int resblock_kernels[3] = {3, 7, 11};
+    int channels = 512;
+    for (int stage = 0; stage < 4; ++stage) {
+        const int out_channels = channels / 2;
+        const std::string up = "dec.ups." + std::to_string(stage) + ".";
+        ok &= expect_shape(w, up + "weight_g", {channels, 1, 1});
+        ok &= expect_shape(w, up + "weight_v", {channels, out_channels, kernels[stage]});
+        ok &= expect_shape(w, up + "bias", {out_channels});
+        int source_kernel = 1;
+        if (stage < 3) {
+            int remaining_rate = 1;
+            for (int next = stage + 1; next < 4; ++next) remaining_rate *= rates[next];
+            source_kernel = remaining_rate * 2;
+        }
+        const std::string noise = "dec.noise_convs." + std::to_string(stage) + ".";
+        ok &= expect_shape(w, noise + "weight", {out_channels, 1, source_kernel});
+        ok &= expect_shape(w, noise + "bias", {out_channels});
+        for (int block = 0; block < 3; ++block) {
+            const int rb = stage * 3 + block;
+            const int kernel = resblock_kernels[block];
+            const std::string p = "dec.resblocks." + std::to_string(rb) + ".";
+            for (int layer = 0; layer < 3; ++layer) {
+                for (const char* group : {"convs1", "convs2"}) {
+                    const std::string c = p + group + "." + std::to_string(layer) + ".";
+                    ok &= expect_shape(w, c + "weight_g", {out_channels, 1, 1});
+                    ok &= expect_shape(w, c + "weight_v", {out_channels, out_channels, kernel});
+                    ok &= expect_shape(w, c + "bias", {out_channels});
+                }
+            }
+        }
+        channels = out_channels;
+    }
+    ok &= expect_shape(w, "dec.conv_post.weight", {1, channels, 7});
+
+    const io::Tensor* speakers = w.meta("emb_g.weight");
+    if (!speakers || speakers->shape.size() != 2 || speakers->shape[0] <= 0 ||
+        speakers->shape[1] != kGin || speakers->dtype != "F32" ||
+        speakers->data_nbytes != static_cast<std::size_t>(speakers->shape[0] * kGin) * sizeof(float)) {
+        fprintf(stderr, "VITS: tensor 'model.emb_g.weight' has incompatible shape or dtype\n");
+        ok = false;
+    } else {
+        num_speakers = static_cast<int>(speakers->shape[0]);
+    }
+    return ok;
+}
+
+bool supported_architecture(const SynthesizerConfig& config) {
+    return (config.version == ModelVersion::kV1 ||
+            config.version == ModelVersion::kV2) &&
+           config.inter_channels == kInter && config.hidden_channels == kHidden &&
+           config.filter_channels == kFilter && config.n_heads == kNHeads &&
+           config.n_layers == kNLayers && config.kernel_size == 3 &&
+           config.gin_channels == kGin && config.upsample_initial_channel == 512 &&
+           config.resblock == "1" &&
+           config.upsample_rates == std::vector<int>({10, 10, 2, 2}) &&
+           config.upsample_kernel_sizes == std::vector<int>({16, 16, 4, 4}) &&
+           config.resblock_kernel_sizes == std::vector<int>({3, 7, 11}) &&
+           config.resblock_dilation_sizes ==
+               std::vector<std::vector<int>>({{1, 3, 5}, {1, 3, 5}, {1, 3, 5}}) &&
+           config.sample_rate == 40'000;
+}
+
+bool valid_speaker(int speaker_id, int num_speakers) {
+    return speaker_id >= 0 && speaker_id < num_speakers;
+}
+
+bool valid_pitch(const float* pitch, const float* pitchf, int frames) {
+    if (!pitch || !pitchf || frames <= 0) return false;
+    for (int frame = 0; frame < frames; ++frame) {
+        if (!std::isfinite(pitch[frame]) || pitch[frame] < 0.0f || pitch[frame] > 255.0f ||
+            !std::isfinite(pitchf[frame]) || pitchf[frame] < 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool valid_coarse_pitch(const int* pitch, int frames) {
+    if (!pitch || frames <= 0) return false;
+    for (int frame = 0; frame < frames; ++frame)
+        if (pitch[frame] < 0 || pitch[frame] > 255) return false;
+    return true;
+}
 
 // Reconstruct weight_norm weight: weight[o,inner] = g[o] * v[o,inner] / ||v[o]||.
 std::vector<float> reconstruct_wn(const Weights& w, const std::string& name,
@@ -267,9 +432,10 @@ std::vector<float> ffn(const Weights& w, const std::string& p,
 
 // TextEncoder -> m_p [inter, T]
 std::vector<float> text_encoder(const Weights& w, const float* phone, int T,
-                                const int* pitch, std::vector<float>* logs_out) {
-    // emb_phone: Linear(768,192). phone [T,768] -> [T,192]
-    auto xtc = k::linear(phone, T, 768, w.get("enc_p.emb_phone.weight"),
+                                int feature_dim, const int* pitch,
+                                std::vector<float>* logs_out) {
+    // emb_phone: Linear(feature_dim,192). phone [T,feature_dim] -> [T,192]
+    auto xtc = k::linear(phone, T, feature_dim, w.get("enc_p.emb_phone.weight"),
                          w.get("enc_p.emb_phone.bias"), kHidden);  // [T,192]
     // emb_pitch: Embedding(256,192). Add.
     const float* emb_pitch = w.get("enc_p.emb_pitch.weight");  // [256,192]
@@ -548,26 +714,54 @@ std::vector<float> generator(const Weights& w, std::vector<float> x, int T,
 }  // namespace
 
 bool Synthesizer::init(const SynthesizerConfig& config) {
+    initialized_ = false;
+    num_speakers_ = 0;
+    has_f0_ = false;
+    if (!config.has_f0) {
+        fprintf(stderr, "VITS: non-F0 checkpoints are not supported by this synthesizer\n");
+        return false;
+    }
+    if (config.model_path.empty() || !supported_architecture(config)) {
+        fprintf(stderr, "VITS: invalid or unsupported synthesizer configuration\n");
+        return false;
+    }
+
+    const int feature_dim = config.version == ModelVersion::kV1 ? 256 : 768;
+    Weights weights;
+    int checkpoint_speakers = 0;
+    if (!weights.load(config.model_path) ||
+        !validate_checkpoint(weights, feature_dim, checkpoint_speakers)) {
+        fprintf(stderr, "VITS: checkpoint validation failed for '%s'\n",
+                config.model_path.c_str());
+        return false;
+    }
+
     config_ = config;
+    config_.spk_embed_dim = checkpoint_speakers;
     sample_rate_ = config.sample_rate;
     version_ = config.version;
-    has_f0_ = config.has_f0;
-    num_speakers_ = config.spk_embed_dim;
+    has_f0_ = true;
+    num_speakers_ = checkpoint_speakers;
+    feature_dim_ = feature_dim;
+    initialized_ = true;
     return true;
 }
 
 std::vector<float> Synthesizer::debug_text_encoder(const float* features, int frames,
                                                    const int* pitch_coarse) {
+    if (!initialized_ || !features || !valid_coarse_pitch(pitch_coarse, frames)) return {};
     Weights w;
     if (!w.load(config_.model_path)) return {};
-    return text_encoder(w, features, frames, pitch_coarse, nullptr);
+    return text_encoder(w, features, frames, feature_dim_, pitch_coarse, nullptr);
 }
 
 std::vector<float> Synthesizer::debug_flow(const float* features, int frames,
                                            const int* pitch_coarse, int speaker_id) {
+    if (!initialized_ || !features || !valid_coarse_pitch(pitch_coarse, frames) ||
+        !valid_speaker(speaker_id, num_speakers_)) return {};
     Weights w;
     if (!w.load(config_.model_path)) return {};
-    auto m_p = text_encoder(w, features, frames, pitch_coarse, nullptr);
+    auto m_p = text_encoder(w, features, frames, feature_dim_, pitch_coarse, nullptr);
     const float* emb_g = w.get("emb_g.weight");  // [num_spk, gin]
     std::vector<float> g(kGin);
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
@@ -575,12 +769,16 @@ std::vector<float> Synthesizer::debug_flow(const float* features, int frames,
 }
 
 std::vector<float> Synthesizer::debug_har(const float* f0, int frames) {
+    if (!initialized_ || !f0 || frames <= 0) return {};
+    for (int frame = 0; frame < frames; ++frame)
+        if (!std::isfinite(f0[frame]) || f0[frame] < 0.0f) return {};
     Weights w;
     if (!w.load(config_.model_path)) return {};
     return sine_source(f0, frames, 400, sample_rate_, w);
 }
 
 std::vector<float> Synthesizer::debug_convpre(const float* z, int frames, int speaker_id) {
+    if (!initialized_ || !z || frames <= 0 || !valid_speaker(speaker_id, num_speakers_)) return {};
     Weights w;
     if (!w.load(config_.model_path)) return {};
     const float* emb_g = w.get("emb_g.weight");
@@ -601,6 +799,10 @@ std::vector<float> Synthesizer::debug_convpre(const float* z, int frames, int sp
 
 std::vector<float> Synthesizer::debug_gen_stage0(const float* z, const float* f0,
                                                  int frames, int speaker_id, int which) {
+    if (!initialized_ || !z || !f0 || frames <= 0 || which < 0 || which > 2 ||
+        !valid_speaker(speaker_id, num_speakers_)) return {};
+    for (int frame = 0; frame < frames; ++frame)
+        if (!std::isfinite(f0[frame]) || f0[frame] < 0.0f) return {};
     Weights w;
     if (!w.load(config_.model_path)) return {};
     const float* emb_g = w.get("emb_g.weight");
@@ -651,6 +853,10 @@ std::vector<float> Synthesizer::debug_gen_stage0(const float* z, const float* f0
 
 std::vector<float> Synthesizer::debug_decode(const float* z, const float* f0,
                                              int frames, int speaker_id) {
+    if (!initialized_ || !z || !f0 || frames <= 0 ||
+        !valid_speaker(speaker_id, num_speakers_)) return {};
+    for (int frame = 0; frame < frames; ++frame)
+        if (!std::isfinite(f0[frame]) || f0[frame] < 0.0f) return {};
     Weights w;
     if (!w.load(config_.model_path)) return {};
     const float* emb_g = w.get("emb_g.weight");
@@ -662,15 +868,18 @@ std::vector<float> Synthesizer::debug_decode(const float* z, const float* f0,
 
 std::vector<float> Synthesizer::debug_encp(const float* features, int frames,
                                            const int* pitch_coarse, bool want_logs) {
+    if (!initialized_ || !features || !valid_coarse_pitch(pitch_coarse, frames)) return {};
     Weights w;
     if (!w.load(config_.model_path)) return {};
     std::vector<float> logs;
-    auto m_p = text_encoder(w, features, frames, pitch_coarse, want_logs ? &logs : nullptr);
+    auto m_p = text_encoder(w, features, frames, feature_dim_, pitch_coarse,
+                            want_logs ? &logs : nullptr);
     if (want_logs) m_p.insert(m_p.end(), logs.begin(), logs.end());  // [m_p ; logs_p]
     return m_p;
 }
 
 std::vector<float> Synthesizer::debug_flow_reverse(const float* x, int frames, int speaker_id) {
+    if (!initialized_ || !x || frames <= 0 || !valid_speaker(speaker_id, num_speakers_)) return {};
     Weights w;
     if (!w.load(config_.model_path)) return {};
     const float* emb_g = w.get("emb_g.weight");
@@ -686,6 +895,11 @@ AudioBuffer Synthesizer::infer(const float* features, int frames,
     AudioBuffer result;
     result.sample_rate = sample_rate_;
 
+    if (!initialized_ || !features || !valid_speaker(speaker_id, num_speakers_) ||
+        !valid_pitch(pitch, pitchf, frames)) {
+        return result;
+    }
+
     Weights w;
     if (!w.load(config_.model_path)) return result;
 
@@ -699,7 +913,7 @@ AudioBuffer Synthesizer::infer(const float* features, int frames,
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
 
     // enc_p -> m_p  (deterministic: z_p = m_p)
-    auto m_p = text_encoder(w, features, frames, pitch_coarse.data(), nullptr);
+    auto m_p = text_encoder(w, features, frames, feature_dim_, pitch_coarse.data(), nullptr);
     // flow reverse -> z
     auto z = flow_reverse(w, m_p, frames, g.data());
     // generator -> audio
@@ -712,7 +926,23 @@ AudioBuffer Synthesizer::infer(const float* features, int frames,
 AudioBuffer Synthesizer::infer_stream(const float* features, int frames,
                                       const float* pitch, const float* pitchf,
                                       int speaker_id, int skip_head, int return_length) {
-    return infer(features, frames, pitch, pitchf, speaker_id);
+    AudioBuffer result;
+    result.sample_rate = sample_rate_;
+    if (!initialized_ || skip_head < 0 || return_length <= 0 || skip_head > frames ||
+        return_length > frames - skip_head) {
+        return result;
+    }
+
+    auto full = infer(features, frames, pitch, pitchf, speaker_id);
+    const std::size_t samples_per_frame = static_cast<std::size_t>(sample_rate_ / 100);
+    const std::size_t begin = static_cast<std::size_t>(skip_head) * samples_per_frame;
+    const std::size_t count = static_cast<std::size_t>(return_length) * samples_per_frame;
+    if (samples_per_frame == 0 || begin > full.data.size() || count > full.data.size() - begin) {
+        return result;
+    }
+    result.data.assign(full.data.begin() + static_cast<std::ptrdiff_t>(begin),
+                       full.data.begin() + static_cast<std::ptrdiff_t>(begin + count));
+    return result;
 }
 
 }  // namespace voxmutatio::synthesizer

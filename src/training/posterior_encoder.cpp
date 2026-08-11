@@ -6,11 +6,13 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "voxmutatio/io/safetensors.h"
 #include "voxmutatio/separation/stft.h"
+#include "checked_weights.h"
 
 namespace voxmutatio::training {
 
@@ -20,25 +22,19 @@ namespace {
 
 std::vector<float> reconstruct_wn(const io::SafetensorsLoader& L, const std::string& name,
                                   int out_dim, int inner) {
-  const auto* g = reinterpret_cast<const float*>(L.data(name + ".weight_g"));
-  const auto* v = reinterpret_cast<const float*>(L.data(name + ".weight_v"));
-  std::vector<float> out(static_cast<std::size_t>(out_dim) * inner);
-  for (int o = 0; o < out_dim; ++o) {
-    double n2 = 0.0;
-    for (int i = 0; i < inner; ++i) { float x = v[o * inner + i]; n2 += (double)x * x; }
-    float inv = static_cast<float>(1.0 / std::sqrt(n2));
-    for (int i = 0; i < inner; ++i) out[o * inner + i] = g[o] * v[o * inner + i] * inv;
-  }
-  return out;
+  return detail::reconstruct_weight_norm(L, name, out_dim, inner);
 }
 std::vector<float> load_plain(const io::SafetensorsLoader& L, const std::string& name, int count) {
-  const auto* p = reinterpret_cast<const float*>(L.data(name));
-  return std::vector<float>(p, p + count);
+  return detail::load_f32(L, name, count);
 }
 
 }  // namespace
 
 std::vector<float> compute_spec_host(const float* audio, int L, int n_fft, int hop, int& out_T) {
+  if (!audio || L <= 0 || n_fft <= 1 || hop <= 0 || hop > n_fft || L < hop) {
+    throw std::invalid_argument(
+        "compute_spec_host requires audio, n_fft > 1, and 0 < hop <= min(n_fft, L)");
+  }
   const int pad = (n_fft - hop) / 2;
   const int nfreq = n_fft / 2 + 1;
   const int T = L / hop;
@@ -80,6 +76,10 @@ std::vector<float> compute_spec_host(const float* audio, int L, int n_fft, int h
 }
 
 std::vector<float> compute_spec(const float* audio, int L, int n_fft, int hop, int& out_T) {
+  if (!audio || L <= 0 || n_fft <= 1 || hop <= 0 || hop > n_fft || L < hop) {
+    throw std::invalid_argument(
+        "compute_spec requires audio, n_fft > 1, and 0 < hop <= min(n_fft, L)");
+  }
   // GPU cuFFT STFT with VITS reflect pad = (n_fft - hop)/2 and periodic Hann.
   // Numerically matches compute_spec_host to ~1e-7 (see test_separation [spec]).
   separation::Stft stft(n_fft, hop, n_fft, true, (n_fft - hop) / 2);
@@ -89,25 +89,28 @@ std::vector<float> compute_spec(const float* audio, int L, int n_fft, int hop, i
 void WaveNet::load(const io::SafetensorsLoader& L, const std::string& prefix,
                    int hidden, int n_layers, int kernel, int speaker_id,
                    std::vector<ag::Tensor>& params_out) {
-  hidden_ = hidden;
-  kernel_ = kernel;
+  WaveNet staged;
+  staged.hidden_ = hidden;
+  staged.kernel_ = kernel;
+  std::vector<ag::Tensor> staged_params;
   const int two_h = 2 * hidden;
 
   // cond(g) folded per layer: cond_layer Conv1d(gin, 2*hidden*n_layers, 1).
   const int gin = 256;
   auto cond_fused = reconstruct_wn(L, prefix + ".cond_layer", two_h * n_layers, gin);
   auto cond_b = load_plain(L, prefix + ".cond_layer.bias", two_h * n_layers);
-  const auto* emb_g = reinterpret_cast<const float*>(L.data("model.emb_g.weight"));
+  const float* emb_g = detail::require_speaker_embedding(L, speaker_id, gin);
   std::vector<float> cond(two_h * n_layers);
   for (int o = 0; o < two_h * n_layers; ++o) {
     float s = cond_b[o];
     for (int ci = 0; ci < gin; ++ci) s += cond_fused[o * gin + ci] * emb_g[speaker_id * gin + ci];
+    if (!std::isfinite(s)) throw std::runtime_error("non-finite WaveNet speaker condition");
     cond[o] = s;
   }
 
   auto param = [&](std::vector<float> host, std::vector<int> shape) {
     auto t = ag::Tensor::from_host(host, std::move(shape), true);
-    params_out.push_back(t);
+    staged_params.push_back(t);
     return t;
   };
 
@@ -124,11 +127,15 @@ void WaveNet::load(const io::SafetensorsLoader& L, const std::string& prefix,
     ly.rs_w = param(reconstruct_wn(L, rs, rs_ch, hidden), {rs_ch, hidden, 1});
     ly.rs_b = param(load_plain(L, rs + ".bias", rs_ch), {rs_ch});
     ly.rs_ch = rs_ch;
-    layers_.push_back(ly);
+    staged.layers_.push_back(std::move(ly));
   }
+  staged.initialized_ = true;
+  params_out.insert(params_out.end(), staged_params.begin(), staged_params.end());
+  *this = std::move(staged);
 }
 
 ag::Tensor WaveNet::forward(const ag::Tensor& x_in, int T) const {
+  if (!initialized_) throw std::logic_error("WaveNet is not initialized");
   const int h = hidden_, two_h = 2 * hidden_, pad = (kernel_ - 1) / 2;
   ag::Tensor x = x_in;
   ag::Tensor output;
@@ -152,8 +159,11 @@ ag::Tensor WaveNet::forward(const ag::Tensor& x_in, int T) const {
 }
 
 bool PosteriorEncoder::init(const std::string& path, int speaker_id) {
+  *this = PosteriorEncoder{};
   io::SafetensorsLoader L;
   if (!L.load(path)) { fprintf(stderr, "PosteriorEncoder: cannot load %s\n", path.c_str()); return false; }
+  try {
+  detail::require_speaker_embedding(L, speaker_id, 256);
   const std::string P = "model.enc_q.";
 
   auto param = [&](std::vector<float> host, std::vector<int> shape) {
@@ -166,11 +176,18 @@ bool PosteriorEncoder::init(const std::string& path, int speaker_id) {
   wn_.load(L, P + "enc", kHidden, 16, 5, speaker_id, params_);
   proj_w_ = param(load_plain(L, P + "proj.weight", 2 * kInter * kHidden), {2 * kInter, kHidden, 1});
   proj_b_ = param(load_plain(L, P + "proj.bias", 2 * kInter), {2 * kInter});
+  initialized_ = true;
   return true;
+  } catch (const std::exception& error) {
+    *this = PosteriorEncoder{};
+    fprintf(stderr, "PosteriorEncoder: invalid checkpoint: %s\n", error.what());
+    return false;
+  }
 }
 
 ag::Tensor PosteriorEncoder::forward(const ag::Tensor& spec, int T, bool sample,
                                      ag::Tensor& m_q, ag::Tensor& logs_q) {
+  if (!initialized_) throw std::logic_error("PosteriorEncoder is not initialized");
   auto x = ag::conv1d(spec, pre_w_, pre_b_, kSpec, T, kHidden, 1, 1, 0, 1, 1);
   x = wn_.forward(x, T);
   auto stats = ag::conv1d(x, proj_w_, proj_b_, kHidden, T, 2 * kInter, 1, 1, 0, 1, 1);
@@ -178,7 +195,8 @@ ag::Tensor PosteriorEncoder::forward(const ag::Tensor& spec, int T, bool sample,
   logs_q = ag::slice_rows(stats, kInter, kInter, T);
   if (!sample) return m_q;
 
-  static std::mt19937 rng(12345);
+  // A shared generator races when multiple trainers run in one process.
+  thread_local std::mt19937 rng(12345);
   std::normal_distribution<float> nd(0.0f, 1.0f);
   std::vector<float> eps(static_cast<std::size_t>(kInter) * T);
   for (auto& e : eps) e = nd(rng);
@@ -187,8 +205,11 @@ ag::Tensor PosteriorEncoder::forward(const ag::Tensor& spec, int T, bool sample,
 }
 
 bool Flow::init(const std::string& path, int speaker_id) {
+  *this = Flow{};
   io::SafetensorsLoader L;
   if (!L.load(path)) { fprintf(stderr, "Flow: cannot load %s\n", path.c_str()); return false; }
+  try {
+  detail::require_speaker_embedding(L, speaker_id, 256);
   const int hidden = 192, half = 96;
   auto param = [&](std::vector<float> host, std::vector<int> shape) {
     auto t = ag::Tensor::from_host(host, std::move(shape), true);
@@ -204,10 +225,17 @@ bool Flow::init(const std::string& path, int speaker_id) {
     c.post_w = param(load_plain(L, p + "post.weight", half * hidden), {half, hidden, 1});
     c.post_b = param(load_plain(L, p + "post.bias", half), {half});
   }
+  initialized_ = true;
   return true;
+  } catch (const std::exception& error) {
+    *this = Flow{};
+    fprintf(stderr, "Flow: invalid checkpoint: %s\n", error.what());
+    return false;
+  }
 }
 
 ag::Tensor Flow::forward(const ag::Tensor& z, int T) const {
+  if (!initialized_) throw std::logic_error("Flow is not initialized");
   const int inter = 192, half = 96, hidden = 192;
   ag::Tensor x = z;
   for (int f = 0; f < 4; ++f) {

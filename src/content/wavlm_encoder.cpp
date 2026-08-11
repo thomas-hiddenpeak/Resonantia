@@ -15,6 +15,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -42,11 +45,98 @@ struct Weights {
     bool load(const std::string& path) { return loader.load(path); }
     const float* get(const std::string& name) const {
         const uint8_t* p = loader.data(name);
-        if (!p) std::fprintf(stderr, "WavLM: missing tensor '%s'\n", name.c_str());
+        if (!p) throw std::runtime_error("WavLM: missing tensor '" + name + "'");
         return reinterpret_cast<const float*>(p);
     }
     bool has(const std::string& name) const { return loader.get_tensor(name) != nullptr; }
+
+    bool expect(const std::string& name, std::initializer_list<int64_t> shape,
+                bool check_values) const {
+        const io::Tensor* tensor = loader.get_tensor(name);
+        if (!tensor || tensor->dtype != "F32" ||
+            tensor->shape != std::vector<int64_t>(shape)) return false;
+        std::size_t count = 1;
+        for (int64_t dim : shape) count *= static_cast<std::size_t>(dim);
+        const auto* bytes = loader.data(name);
+        if (tensor->data_nbytes != count * sizeof(float) || !bytes) return false;
+        if (check_values) {
+            const auto* values = reinterpret_cast<const float*>(bytes);
+            for (std::size_t i = 0; i < count; ++i)
+                if (!std::isfinite(values[i])) return false;
+        }
+        return true;
+    }
+
+    bool validate(int layers, bool check_values = true) const {
+        bool ok = true;
+        int in_channels = 1;
+        for (int layer = 0; layer < kNumConvLayers; ++layer) {
+            const std::string p = "feature_extractor.conv_layers." + std::to_string(layer) + ".";
+            ok &= expect(p + "conv.weight", {kConvDim, in_channels, kConvKernels[layer]}, check_values);
+            in_channels = kConvDim;
+        }
+        ok &= expect("feature_extractor.conv_layers.0.layer_norm.weight", {kConvDim}, check_values);
+        ok &= expect("feature_extractor.conv_layers.0.layer_norm.bias", {kConvDim}, check_values);
+        ok &= expect("feature_projection.layer_norm.weight", {kConvDim}, check_values);
+        ok &= expect("feature_projection.layer_norm.bias", {kConvDim}, check_values);
+        ok &= expect("feature_projection.projection.weight", {kHidden, kConvDim}, check_values);
+        ok &= expect("feature_projection.projection.bias", {kHidden}, check_values);
+        ok &= expect("encoder.pos_conv_embed.conv.parametrizations.weight.original0",
+                     {1, 1, kPosConvKernel}, check_values);
+        ok &= expect("encoder.pos_conv_embed.conv.parametrizations.weight.original1",
+                     {kHidden, kHidden / kPosConvGroups, kPosConvKernel}, check_values);
+        ok &= expect("encoder.pos_conv_embed.conv.bias", {kHidden}, check_values);
+        ok &= expect("encoder.layer_norm.weight", {kHidden}, check_values);
+        ok &= expect("encoder.layer_norm.bias", {kHidden}, check_values);
+        ok &= expect("encoder.layers.0.attention.rel_attn_embed.weight",
+                     {kNumBuckets, kNumHeads}, check_values);
+        for (int layer = 0; layer < layers; ++layer) {
+            const std::string p = "encoder.layers." + std::to_string(layer) + ".";
+            for (const char* projection : {"q_proj", "k_proj", "v_proj", "out_proj"}) {
+                const std::string a = p + "attention." + projection;
+                ok &= expect(a + ".weight", {kHidden, kHidden}, check_values);
+                ok &= expect(a + ".bias", {kHidden}, check_values);
+            }
+            ok &= expect(p + "attention.gru_rel_pos_linear.weight", {8, kHeadDim}, check_values);
+            ok &= expect(p + "attention.gru_rel_pos_linear.bias", {8}, check_values);
+            ok &= expect(p + "attention.gru_rel_pos_const", {1, kNumHeads, 1, 1}, check_values);
+            ok &= expect(p + "layer_norm.weight", {kHidden}, check_values);
+            ok &= expect(p + "layer_norm.bias", {kHidden}, check_values);
+            ok &= expect(p + "feed_forward.intermediate_dense.weight", {kFFN, kHidden}, check_values);
+            ok &= expect(p + "feed_forward.intermediate_dense.bias", {kFFN}, check_values);
+            ok &= expect(p + "feed_forward.output_dense.weight", {kHidden, kFFN}, check_values);
+            ok &= expect(p + "feed_forward.output_dense.bias", {kHidden}, check_values);
+            ok &= expect(p + "final_layer_norm.weight", {kHidden}, check_values);
+            ok &= expect(p + "final_layer_norm.bias", {kHidden}, check_values);
+        }
+        return ok;
+    }
 };
+
+bool validate_pos_conv_norm(const Weights& w) {
+    const float* g = w.get("encoder.pos_conv_embed.conv.parametrizations.weight.original0");
+    const float* v = w.get("encoder.pos_conv_embed.conv.parametrizations.weight.original1");
+    constexpr int kInPerGroup = kHidden / kPosConvGroups;
+    std::vector<double> norm_sq(kPosConvKernel, 0.0);
+    for (int o = 0; o < kHidden; ++o)
+        for (int i = 0; i < kInPerGroup; ++i)
+            for (int k = 0; k < kPosConvKernel; ++k) {
+                const double value = v[(o * kInPerGroup + i) * kPosConvKernel + k];
+                norm_sq[k] += value * value;
+            }
+    for (int k = 0; k < kPosConvKernel; ++k) {
+        if (!(norm_sq[k] > 0.0) || !std::isfinite(norm_sq[k])) return false;
+        const double norm = std::sqrt(norm_sq[k]);
+        for (int o = 0; o < kHidden; ++o)
+            for (int i = 0; i < kInPerGroup; ++i) {
+                const double value = static_cast<double>(g[k]) *
+                    v[(o * kInPerGroup + i) * kPosConvKernel + k] / norm;
+                if (!std::isfinite(value) ||
+                    std::abs(value) > std::numeric_limits<float>::max()) return false;
+            }
+    }
+    return true;
+}
 
 // Transpose [rows, cols] -> [cols, rows]
 std::vector<float> transpose(const std::vector<float>& in, int rows, int cols) {
@@ -62,11 +152,11 @@ std::vector<float> reconstruct_pos_conv_weight(const Weights& w) {
     const float* v = w.get("encoder.pos_conv_embed.conv.parametrizations.weight.original1");
     if (!g || !v) return {};
     const int out_ch = kHidden, in_per_group = kHidden / kPosConvGroups, K = kPosConvKernel;
-    std::vector<float> norm(K, 0.0f);
+    std::vector<double> norm(K, 0.0);
     for (int o = 0; o < out_ch; ++o)
         for (int i = 0; i < in_per_group; ++i)
             for (int kk = 0; kk < K; ++kk) {
-                float val = v[(o * in_per_group + i) * K + kk];
+                const double val = v[(o * in_per_group + i) * K + kk];
                 norm[kk] += val * val;
             }
     for (int kk = 0; kk < K; ++kk) norm[kk] = std::sqrt(norm[kk]);
@@ -75,7 +165,8 @@ std::vector<float> reconstruct_pos_conv_weight(const Weights& w) {
         for (int i = 0; i < in_per_group; ++i)
             for (int kk = 0; kk < K; ++kk) {
                 int idx = (o * in_per_group + i) * K + kk;
-                weight[idx] = g[kk] * v[idx] / norm[kk];
+                weight[idx] = static_cast<float>(
+                    static_cast<double>(g[kk]) * v[idx] / norm[kk]);
             }
     return weight;
 }
@@ -254,19 +345,42 @@ std::vector<float> wavlm_encoder_layer(const Weights& w, int layer_idx,
 }  // namespace
 
 bool WavlmEncoder::init(const WavlmConfig& config) {
+    initialized_ = false;
+    if (config.model_path.empty() || config.output_dim != kHidden ||
+        config.num_layers <= 0 || config.num_layers > 12 || config.half_precision) {
+        return false;
+    }
+    Weights weights;
+    if (!weights.load(config.model_path) || !weights.validate(config.num_layers) ||
+        !validate_pos_conv_norm(weights)) {
+        std::fprintf(stderr, "WavLM: checkpoint validation failed for '%s'\n",
+                     config.model_path.c_str());
+        return false;
+    }
     output_dim_ = config.output_dim;
     half_precision_ = config.half_precision;
     config_ = config;
+    initialized_ = true;
     return true;
 }
 
 std::vector<float> WavlmEncoder::extract(const float* audio, int num_samples) {
-    if (num_samples == 0) return {};
+    if (!initialized_ || !audio || num_samples <= 0 || num_samples > 16'000 * 40 ||
+        !std::all_of(audio, audio + num_samples,
+                     [](float value) { return std::isfinite(value); })) return {};
     Weights w;
-    if (!w.load(config_.model_path)) {
+    if (!w.load(config_.model_path) || !w.validate(config_.num_layers, false)) {
         std::fprintf(stderr, "WavLM: failed to load model '%s'\n", config_.model_path.c_str());
         return {};
     }
+
+    int feature_length = num_samples;
+    for (int layer = 0; layer < kNumConvLayers; ++layer) {
+        if (feature_length < kConvKernels[layer]) return {};
+        feature_length = (feature_length - kConvKernels[layer]) / kConvStrides[layer] + 1;
+    }
+
+    try {
 
     auto feats = feature_extractor(w, audio, num_samples);  // [T,512]
     int T = static_cast<int>(feats.size()) / kConvDim;
@@ -284,8 +398,13 @@ std::vector<float> WavlmEncoder::extract(const float* audio, int num_samples) {
     for (int i = 0; i < layers; ++i)
         hidden = wavlm_encoder_layer(w, i, std::move(hidden), T, position_bias);
 
+    if (!std::all_of(hidden.begin(), hidden.end(),
+                     [](float value) { return std::isfinite(value); })) return {};
     return hidden;  // [T, 768]
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "WavLM inference failed: %s\n", error.what());
+        return {};
+    }
 }
 
 }  // namespace voxmutatio::content
-

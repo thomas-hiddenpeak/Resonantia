@@ -2,6 +2,46 @@
 const API = '/api';
 const $ = (id) => document.getElementById(id);
 
+// API authentication is optional on the server. Keep a supplied bearer token only
+// for this browser tab and retry the first 401 once, so the default open mode stays
+// unchanged while authenticated deployments work without embedding a secret in URLs.
+let authPromptPromise = null;
+let memoryAuthToken = '';
+function storedAuthToken() {
+    try { return sessionStorage.getItem('resonantiaAuthToken') || memoryAuthToken; }
+    catch (e) { return memoryAuthToken; }
+}
+function storeAuthToken(token) {
+    memoryAuthToken = token;
+    try {
+        if (token) sessionStorage.setItem('resonantiaAuthToken', token);
+        else sessionStorage.removeItem('resonantiaAuthToken');
+    } catch (e) { /* storage may be unavailable; memory fallback is enough */ }
+}
+function requestAuthToken() {
+    if (!authPromptPromise) {
+        authPromptPromise = Promise.resolve(window.prompt('此服务需要访问令牌：') || '');
+    }
+    return authPromptPromise;
+}
+async function apiFetch(url, options = {}) {
+    const send = (token) => {
+        const headers = new Headers(options.headers || {});
+        if (token) headers.set('Authorization', 'Bearer ' + token);
+        return fetch(url, { ...options, headers });
+    };
+    let token = storedAuthToken();
+    let response = await send(token);
+    if (response.status !== 401) return response;
+    storeAuthToken('');
+    token = await requestAuthToken();
+    if (!token) return response;
+    storeAuthToken(token);
+    response = await send(token);
+    if (response.status === 401) storeAuthToken('');
+    return response;
+}
+
 // Extract a human-readable message from a non-OK response (JSON {error} or text).
 async function errText(r) {
     const t = await r.text().catch(() => '');
@@ -83,7 +123,7 @@ function populateModelSelects() {
 }
 async function loadSepModels() {
     try {
-        const r = await fetch(`${API}/sep-models`);
+        const r = await apiFetch(`${API}/sep-models`);
         if (r.ok) { SEP_MODELS = await r.json(); populateModelSelects(); }
     } catch (e) { /* offline: pickers stay hidden, server uses defaults */ }
 }
@@ -91,7 +131,7 @@ function pollJob(name) {
     return new Promise((resolve) => {
         const tick = async () => {
             try {
-                const s = await (await fetch(`${API}/train/status?name=${encodeURIComponent(name)}`)).json();
+                const s = await (await apiFetch(`${API}/train/status?name=${encodeURIComponent(name)}`)).json();
                 setConn(true);
                 if (s.running) setTimeout(tick, 1000); else resolve(s);
             } catch (e) { setConn(false); setTimeout(tick, 1500); }
@@ -102,7 +142,7 @@ function pollJob(name) {
 // Fetch the current work-set audio as a frozen blob snapshot for per-stage audition.
 async function auditionSnapshot(name, audioEl) {
     try {
-        const r = await fetch(`${API}/preview?name=${encodeURIComponent(name)}&t=${Date.now()}`);
+        const r = await apiFetch(`${API}/preview?name=${encodeURIComponent(name)}&t=${Date.now()}`);
         if (!r.ok) return false;
         const blob = await r.blob();
         if (audioEl._url) URL.revokeObjectURL(audioEl._url);
@@ -149,7 +189,7 @@ function Cascade(containerId, getName, resetBtnId) {
         try {
             const fd = new FormData(); fd.append('name', name); fd.append('step', s.step);
             const sel = row.querySelector('.stage-model'); if (sel && sel.value) fd.append('model', sel.value);
-            const r = await fetch(`${API}/step`, { method: 'POST', body: fd });
+            const r = await apiFetch(`${API}/step`, { method: 'POST', body: fd });
             if (!r.ok) throw new Error(await errText(r));
             const done = await pollJob(name);
             if (done.error) throw new Error('处理失败（见服务端日志）');
@@ -179,7 +219,7 @@ trainArea.addEventListener('drop', (e) => {
 $('trainFileInput').addEventListener('change', (e) => addTrainFiles(e.target.files));
 
 function addTrainFiles(list) {
-    for (const f of list) if (f.name.match(/\.(wav|flac)$/i)) { trainFiles.push(f); estimateDuration(f); }
+    for (const f of list) if (f.name.match(/\.wav$/i)) { trainFiles.push(f); estimateDuration(f); }
     renderTrainFiles();
     ensureTrainMaterial();
 }
@@ -226,7 +266,7 @@ async function ensureTrainMaterial() {
     const fd = new FormData(); fd.append('name', name);
     trainFiles.forEach((f) => fd.append('files', f, f.name));
     try {
-        const r = await fetch(`${API}/material`, { method: 'POST', body: fd });
+        const r = await apiFetch(`${API}/material`, { method: 'POST', body: fd });
         if (!r.ok) throw new Error(await errText(r));
         setConn(true);
         trainCascade.enable();
@@ -251,7 +291,7 @@ $('btnTrain').addEventListener('click', async () => {
     $('trainStage').textContent = '提交中…';
     $('trainFill').style.width = '5%';
     try {
-        const r = await fetch(`${API}/train`, { method: 'POST', body: fd });
+        const r = await apiFetch(`${API}/train`, { method: 'POST', body: fd });
         if (!r.ok) throw new Error(await errText(r));
         pollTrain(name);
     } catch (err) {
@@ -263,7 +303,7 @@ $('btnTrain').addEventListener('click', async () => {
 const STAGES_PCT = { queued: 10, preprocessing: 25, separating: 30, training: 55, indexing: 90, done: 100, error: 100 };
 async function pollTrain(name) {
     try {
-        const r = await fetch(`${API}/train/status?name=${encodeURIComponent(name)}`);
+        const r = await apiFetch(`${API}/train/status?name=${encodeURIComponent(name)}`);
         const s = await r.json();
         $('trainStage').textContent = s.stage;
         $('trainFill').style.width = (STAGES_PCT[s.stage] || 50) + '%';
@@ -283,7 +323,7 @@ async function pollTrain(name) {
 // ---------- Voices ----------
 async function loadVoices() {
     try {
-        const d = await (await fetch(`${API}/voices`)).json();
+        const d = await (await apiFetch(`${API}/voices`)).json();
         setConn(true);
         const sel = $('voiceSelect'), cur = sel.value, voices = d.voices || [];
         sel.innerHTML = '';
@@ -309,7 +349,7 @@ convArea.addEventListener('drop', (e) => { e.preventDefault(); convArea.classLis
 $('convFileInput').addEventListener('change', (e) => { if (e.target.files[0]) setConvFile(e.target.files[0]); });
 
 function setConvFile(f) {
-    if (!f.name.match(/\.(wav|flac)$/i)) { alert('请上传 WAV 或 FLAC'); return; }
+    if (!f.name.match(/\.wav$/i)) { alert('请上传 WAV'); return; }
     convFile = f;
     $('convFileInfo').querySelector('.file-name').textContent = f.name;
     $('convFileInfo').style.display = 'flex';
@@ -328,7 +368,7 @@ async function ensureConvMaterial() {
     if (!convFile) return;
     const fd = new FormData(); fd.append('name', CONV_SESSION); fd.append('files', convFile, convFile.name);
     try {
-        const r = await fetch(`${API}/material`, { method: 'POST', body: fd });
+        const r = await apiFetch(`${API}/material`, { method: 'POST', body: fd });
         if (!r.ok) throw new Error(await errText(r));
         setConn(true);
         convCascade.enable();
@@ -364,7 +404,7 @@ $('btnConvert').addEventListener('click', async () => {
         fd.append('rms_mix_rate', $('rmsMixRate').value / 100);
         fd.append('protect', $('protect').value / 100);
         fd.append('filter_radius', $('filterRadius').value);
-        const r = await fetch(`${API}/convert`, { method: 'POST', body: fd });
+        const r = await apiFetch(`${API}/convert`, { method: 'POST', body: fd });
         clearInterval(iv);
         if (!r.ok) throw new Error(await errText(r));
         const blob = await r.blob();

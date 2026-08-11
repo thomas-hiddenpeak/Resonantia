@@ -9,6 +9,9 @@
  * Usage:
  *   build_index --hubert <path> --input-dir <dir> --output <index.bin>
  */
+#include <algorithm>
+#include <bit>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -24,10 +27,20 @@ namespace fs = std::filesystem;
 
 namespace {
 
+static_assert(std::endian::native == std::endian::little,
+              "the memory-mapped Flat Index payload requires a little-endian host");
+
+void write_u64_le(std::ostream& out, std::uint64_t value) {
+    char bytes[8];
+    for (int i = 0; i < 8; ++i)
+        bytes[i] = static_cast<char>((value >> (8 * i)) & 0xffu);
+    out.write(bytes, sizeof(bytes));
+}
+
 void print_usage() {
     std::cout << "Usage:\n"
               << "  build_index --hubert <path> --input-dir <dir> --output <index.bin>\n\n"
-              << "Extracts HuBERT v2 features from all .wav/.flac files in the\n"
+              << "Extracts HuBERT v2 features from all .wav files in the\n"
               << "directory and writes a flat feature index.\n";
 }
 
@@ -48,11 +61,17 @@ int main(int argc, char** argv) {
         print_usage();
         return 1;
     }
+    std::error_code input_error;
+    if (!fs::is_directory(input_dir, input_error) || input_error) {
+        std::cerr << "Input directory is unavailable: " << input_dir << "\n";
+        return 1;
+    }
 
     voxmutatio::content::HubertConfig cfg;
     cfg.model_path = hubert_path;
     cfg.output_dim = 768;
     cfg.use_final_proj = false;
+    cfg.num_layers = 12;
 
     voxmutatio::content::HubertEncoder encoder;
     if (!encoder.init(cfg)) {
@@ -65,9 +84,17 @@ int main(int argc, char** argv) {
     int64_t ntotal = 0;
     int file_count = 0;
 
-    for (const auto& entry : fs::directory_iterator(input_dir)) {
+    std::error_code iteration_error;
+    fs::directory_iterator iterator(input_dir, iteration_error), end;
+    for (; !iteration_error && iterator != end; iterator.increment(iteration_error)) {
+        const auto& entry = *iterator;
+        std::error_code type_error;
+        if (!entry.is_regular_file(type_error) || type_error) continue;
         auto ext = entry.path().extension().string();
-        if (ext != ".wav" && ext != ".flac") continue;
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (ext != ".wav") continue;
 
         auto audio = voxmutatio::io::read_audio(entry.path().string(), 16000);
         if (!audio.has_value() || audio->data.empty()) {
@@ -86,6 +113,11 @@ int main(int argc, char** argv) {
         std::cout << "  " << entry.path().filename().string() << ": "
                   << frames << " frames\n";
     }
+    if (iteration_error) {
+        std::cerr << "Failed while scanning input directory: "
+                  << iteration_error.message() << "\n";
+        return 1;
+    }
 
     if (ntotal == 0) {
         std::cerr << "No features extracted\n";
@@ -97,11 +129,20 @@ int main(int argc, char** argv) {
         std::cerr << "Cannot write: " << output_path << "\n";
         return 1;
     }
-    int64_t dim64 = dim;
-    out.write(reinterpret_cast<const char*>(&ntotal), 8);
-    out.write(reinterpret_cast<const char*>(&dim64), 8);
+    write_u64_le(out, static_cast<std::uint64_t>(ntotal));
+    write_u64_le(out, static_cast<std::uint64_t>(dim));
     out.write(reinterpret_cast<const char*>(all_feats.data()),
               all_feats.size() * sizeof(float));
+    out.flush();
+    if (!out) {
+        std::cerr << "Failed while writing index: " << output_path << "\n";
+        return 1;
+    }
+    out.close();
+    if (!out) {
+        std::cerr << "Failed while closing index: " << output_path << "\n";
+        return 1;
+    }
 
     std::cout << "Wrote index: " << output_path << " (" << file_count
               << " files, " << ntotal << " vectors x " << dim << ")\n";

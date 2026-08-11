@@ -19,7 +19,8 @@ import safetensors
 def convert_checkpoint(input_path: str, output_path: str):
     """Convert a PyTorch checkpoint to safetensors format."""
     print(f"Loading {input_path}...")
-    state_dict = torch.load(input_path, map_location="cpu")
+    # Checkpoints are data, not trusted Python programs.
+    state_dict = torch.load(input_path, map_location="cpu", weights_only=True)
 
     # Handle wrapped state dicts (e.g., {"model": {...}, "sd": {...}})
     if isinstance(state_dict, dict):

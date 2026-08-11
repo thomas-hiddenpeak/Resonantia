@@ -40,6 +40,7 @@ class Discriminator {
   std::vector<PDisc> p_;
 
   std::vector<autograd::Tensor> params_;
+  bool initialized_ = false;
 };
 
 }  // namespace voxmutatio::training

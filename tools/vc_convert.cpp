@@ -1,158 +1,18 @@
 /**
  * @file vc_convert.cpp
- * @brief Single-file offline voice conversion CLI tool.
- *
- * Usage:
- *   vc_convert --hubert <path> --model <path> --input <wav> --output <wav> [options]
+ * @brief Thin process entry point for single-file offline voice conversion.
  */
-#include <cstdlib>
-#include <cstring>
+
 #include <iostream>
-#include <string>
-#include <filesystem>
 
-#include "voxmutatio/core/types.h"
-#include "voxmutatio/core/device.h"
-#include "voxmutatio/pipeline/pipeline.h"
-
-namespace {
-
-void print_usage() {
-    std::cout
-        << "Usage:\n"
-        << "  vc_convert --hubert <path> --model <path> --input <wav> --output <wav> [options]\n\n"
-        << "Options:\n"
-        << "  --hubert <path>       HuBERT model safetensors directory\n"
-        << "  --model <path>        VITS synthesizer safetensors path\n"
-        << "  --input <wav>         Input audio file path\n"
-        << "  --output <wav>        Output audio file path\n"
-        << "  --index <path>        CUDA Flat Index file (optional)\n"
-        << "  --rmvpe <path>        RMVPE model safetensors (optional)\n"
-        << "  --fcpe <path>         FCPE model safetensors (optional)\n"
-        << "  --f0-method <name>    F0 extractor: rmvpe (default) or fcpe\n"
-        << "  --wavlm <path>        WavLM-Base+ safetensors (needs a WavLM-trained model)\n"
-        << "  --content-encoder <n> Content encoder: hubert (default) or wavlm\n"
-        << "  --speaker <id>        Speaker ID (default: 0)\n"
-        << "  --pitch <semitones>   Pitch shift in semitones (default: 0)\n"
-        << "  --formant <semitones> Formant shift (default: 0)\n"
-        << "  --index-rate <0-1>    Index blend rate (default: 0.0)\n"
-        << "  --rms-mix <0-1>       RMS energy mix rate (default: 0.5)\n"
-        << "  --protect <0-1>       Unvoiced protection (default: 0.5)\n"
-        << "  --half                Use FP16 inference\n"
-        << "  --device <cuda|cpu>   Compute device (default: cuda)\n"
-        << "  --help                Show this help\n";
-}
-
-}  // namespace
+#include "tools/app_support/vc_convert_app.h"
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        print_usage();
-        return 1;
+    voxmutatio::app_support::VcConvertOptions options;
+    const auto status = voxmutatio::app_support::parse_vc_convert_options(
+        argc, argv, options, std::cout, std::cerr);
+    if (status != voxmutatio::app_support::ParseStatus::kRun) {
+        return voxmutatio::app_support::parse_exit_code(status);
     }
-
-    // Check for --help
-    for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            print_usage();
-            return 0;
-        }
-    }
-
-    voxmutatio::VCConfig config;
-    std::string input_path;
-    std::string output_path;
-    int speaker_id = 0;
-
-    // Parse arguments
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--hubert" && i + 1 < argc) config.hubert_model_path = argv[++i];
-        else if (arg == "--model" && i + 1 < argc) config.synthesizer_model_path = argv[++i];
-        else if (arg == "--input" && i + 1 < argc) input_path = argv[++i];
-        else if (arg == "--output" && i + 1 < argc) output_path = argv[++i];
-        else if (arg == "--index" && i + 1 < argc) config.index_path = argv[++i];
-        else if (arg == "--rmvpe" && i + 1 < argc) config.rmvpe_model_path = argv[++i];
-        else if (arg == "--fcpe" && i + 1 < argc) config.fcpe_model_path = argv[++i];
-        else if (arg == "--f0-method" && i + 1 < argc) {
-            std::string mth = argv[++i];
-            config.f0_method = (mth == "fcpe") ? voxmutatio::F0Method::kFcpe
-                                                : voxmutatio::F0Method::kRmvpe;
-        }
-        else if (arg == "--wavlm" && i + 1 < argc) config.wavlm_model_path = argv[++i];
-        else if (arg == "--content-encoder" && i + 1 < argc) {
-            std::string ce = argv[++i];
-            config.content_encoder = (ce == "wavlm") ? voxmutatio::ContentEncoder::kWavlm
-                                                       : voxmutatio::ContentEncoder::kHubert;
-        }
-        else if (arg == "--speaker" && i + 1 < argc) speaker_id = std::atoi(argv[++i]);
-        else if (arg == "--pitch" && i + 1 < argc) config.f0_up_key = std::atoi(argv[++i]);
-        else if (arg == "--formant" && i + 1 < argc) config.formant_shift = std::atof(argv[++i]);
-        else if (arg == "--index-rate" && i + 1 < argc) config.index_rate = std::atof(argv[++i]);
-        else if (arg == "--rms-mix" && i + 1 < argc) config.rms_mix_rate = std::atof(argv[++i]);
-        else if (arg == "--protect" && i + 1 < argc) config.protect = std::atof(argv[++i]);
-        else if (arg == "--filter-radius" && i + 1 < argc) config.filter_radius = std::atoi(argv[++i]);
-        else if (arg == "--half") config.use_half_precision = true;
-        else if (arg == "--device" && i + 1 < argc) config.device = argv[++i];
-        else if (arg == "--version" && i + 1 < argc) {
-            std::string v = argv[++i];
-            config.version = (v == "v2") ? voxmutatio::ModelVersion::kV2
-                                         : voxmutatio::ModelVersion::kV1;
-        }
-        else if (arg == "--speakers" && i + 1 < argc) config.num_speakers = std::atoi(argv[++i]);
-        else if (arg == "--sr" && i + 1 < argc) config.model_sample_rate = std::atoi(argv[++i]);
-        else {
-            std::cerr << "Unknown argument: " << arg << "\n";
-            return 1;
-        }
-    }
-
-    // Validate required args
-    if (config.hubert_model_path.empty()) {
-        std::cerr << "error: --hubert is required\n";
-        return 1;
-    }
-    if (config.synthesizer_model_path.empty()) {
-        std::cerr << "error: --model is required\n";
-        return 1;
-    }
-    if (input_path.empty()) {
-        std::cerr << "error: --input is required\n";
-        return 1;
-    }
-    if (output_path.empty()) {
-        std::cerr << "error: --output is required\n";
-        return 1;
-    }
-
-    // Initialize device
-    voxmutatio::Device device;
-    if (auto err = device.init(config.device, config.gpu_device)) {
-        std::cerr << "CUDA init error: " << *err << "\n";
-        return 1;
-    }
-    std::cout << "Device: " << device.name() << "\n";
-
-    // Initialize pipeline
-    voxmutatio::pipeline::VoiceConversionPipeline pipeline;
-    if (!pipeline.init(config)) {
-        std::cerr << "Pipeline init failed\n";
-        return 1;
-    }
-
-    // Run conversion
-    std::cout << "Converting: " << input_path << " -> " << output_path << "\n";
-    auto result = pipeline.convert_file(input_path, output_path, speaker_id);
-
-    if (!result.success) {
-        std::cerr << "Conversion failed: " << result.error_message << "\n";
-        return 1;
-    }
-
-    std::cout << "Done (" << result.total_ms << " ms)\n"
-              << "  HuBERT:  " << result.hubert_ms << " ms\n"
-              << "  F0:      " << result.f0_ms << " ms\n"
-              << "  Index:   " << result.index_ms << " ms\n"
-              << "  Synth:   " << result.synth_ms << " ms\n";
-    return 0;
+    return voxmutatio::app_support::run_vc_convert(options);
 }

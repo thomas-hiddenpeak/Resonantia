@@ -22,10 +22,16 @@ class Stft {
   [[nodiscard]] int num_frames(int L) const;
 
   /// Complex STFT of audio[L] (host in) -> re, im each [n_freq * T] freq-major; sets T.
+  /// Invalid or CUDA-int-unrepresentable public dimensions throw
+  /// std::invalid_argument before reading/allocating; execution failures throw
+  /// std::runtime_error.
   void forward(const float* audio, int L, std::vector<float>& re,
                std::vector<float>& im, int& T) const;
 
   /// iSTFT of re, im [n_freq * T] (freq-major) -> audio[L_out] (host).
+  /// Invalid, incompatible, or CUDA-int-unrepresentable dimensions throw
+  /// std::invalid_argument before allocation; execution failures throw
+  /// std::runtime_error.
   [[nodiscard]] std::vector<float> inverse(const std::vector<float>& re,
                                            const std::vector<float>& im,
                                            int T, int L_out) const;

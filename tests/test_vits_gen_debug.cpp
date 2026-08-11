@@ -30,6 +30,7 @@ TEST_CASE("VITS har source", "[vitsdbg][har]") {
     REQUIRE(nsff0.ok); REQUIRE(har_ref.ok);
     int T = nsff0.shape[0];
     SynthesizerConfig cfg; cfg.model_path="../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+    cfg.version = voxmutatio::ModelVersion::kV2;
     Synthesizer s; s.init(cfg);
     auto har = s.debug_har(nsff0.data.data(), T);
     std::cout<<"har C++ "<<har.size()<<" ref "<<har_ref.data.size()<<std::endl;
@@ -50,6 +51,7 @@ TEST_CASE("VITS conv_pre", "[vitsdbg][convpre]") {
     REQUIRE(z.ok); REQUIRE(cp_ref.ok);
     int T = z.shape[1];
     SynthesizerConfig cfg; cfg.model_path="../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+    cfg.version = voxmutatio::ModelVersion::kV2;
     Synthesizer s; s.init(cfg);
     auto cp = s.debug_convpre(z.data.data(), T, 0);
     std::cout<<"convpre RMS "<<rms(cp,cp_ref.data)<<" corr "<<corr(cp,cp_ref.data)<<std::endl;
@@ -66,6 +68,7 @@ TEST_CASE("VITS gen stage0", "[vitsdbg][stage0]") {
     REQUIRE(z.ok); REQUIRE(nsff0.ok); REQUIRE(ups0.ok);
     int T = z.shape[1];
     SynthesizerConfig cfg; cfg.model_path="../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+    cfg.version = voxmutatio::ModelVersion::kV2;
     Synthesizer s; s.init(cfg);
     auto u0 = s.debug_gen_stage0(z.data.data(), nsff0.data.data(), T, 0, 0);
     std::cout<<"ups0 C++ "<<u0.size()<<" ref "<<ups0.data.size()<<" RMS "<<rms(u0,ups0.data)<<" corr "<<corr(u0,ups0.data)<<std::endl;

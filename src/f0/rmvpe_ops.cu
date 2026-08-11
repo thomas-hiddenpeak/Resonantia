@@ -9,6 +9,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace voxmutatio::f0::ops {
@@ -17,7 +19,9 @@ namespace {
 
 inline void cuda_check(cudaError_t e, const char* file, int line) {
     if (e != cudaSuccess) {
-        fprintf(stderr, "CUDA error %s:%d: %s\n", file, line, cudaGetErrorString(e));
+        throw std::runtime_error(std::string("CUDA error at ") + file + ":" +
+                                 std::to_string(line) + ": " +
+                                 cudaGetErrorString(e));
     }
 }
 #define CK(e) cuda_check((e), __FILE__, __LINE__)

@@ -5,10 +5,12 @@
 
 #include <cmath>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "voxmutatio/io/safetensors.h"
+#include "checked_weights.h"
 
 namespace voxmutatio::training {
 
@@ -18,21 +20,11 @@ namespace {
 
 std::vector<float> reconstruct_wn(const io::SafetensorsLoader& L, const std::string& name,
                                   int out_dim, int inner) {
-  const auto* g = reinterpret_cast<const float*>(L.data(name + ".weight_g"));
-  const auto* v = reinterpret_cast<const float*>(L.data(name + ".weight_v"));
-  std::vector<float> out(static_cast<std::size_t>(out_dim) * inner);
-  for (int o = 0; o < out_dim; ++o) {
-    double n2 = 0.0;
-    for (int i = 0; i < inner; ++i) { float x = v[o * inner + i]; n2 += (double)x * x; }
-    float inv = static_cast<float>(1.0 / std::sqrt(n2));
-    for (int i = 0; i < inner; ++i) out[o * inner + i] = g[o] * v[o * inner + i] * inv;
-  }
-  return out;
+  return detail::reconstruct_weight_norm(L, name, out_dim, inner);
 }
 
 std::vector<float> load_plain(const io::SafetensorsLoader& L, const std::string& name, int count) {
-  const auto* p = reinterpret_cast<const float*>(L.data(name));
-  return std::vector<float>(p, p + count);
+  return detail::load_f32(L, name, count);
 }
 
 int conv1d_out(int L, int k, int stride, int pad, int dil = 1) {
@@ -42,8 +34,10 @@ int conv1d_out(int L, int k, int stride, int pad, int dil = 1) {
 }  // namespace
 
 bool Discriminator::init(const std::string& path) {
+  *this = Discriminator{};
   io::SafetensorsLoader L;
   if (!L.load(path)) { fprintf(stderr, "Discriminator: cannot load %s\n", path.c_str()); return false; }
+  try {
   const std::string P = "model.discriminators.";
 
   auto param = [&](std::vector<float> host, std::vector<int> shape) {
@@ -96,10 +90,17 @@ bool Discriminator::init(const std::string& path) {
     p_.push_back(std::move(pd));
   }
 
+  initialized_ = true;
   return true;
+  } catch (const std::exception& error) {
+    *this = Discriminator{};
+    fprintf(stderr, "Discriminator: invalid checkpoint: %s\n", error.what());
+    return false;
+  }
 }
 
 std::vector<SubDiscResult> Discriminator::forward(const ag::Tensor& audio, int L) {
+  if (!initialized_) throw std::logic_error("Discriminator is not initialized");
   std::vector<SubDiscResult> results;
 
   // DiscriminatorS
@@ -123,8 +124,16 @@ std::vector<SubDiscResult> Discriminator::forward(const ag::Tensor& audio, int L
   // DiscriminatorP
   for (const auto& pd : p_) {
     SubDiscResult r;
-    int p = pd.period, H = L / p, C = 1;
-    ag::Tensor h = audio;  // conv2d reads first H*p samples as [1,H,p]
+    int p = pd.period, padded_L = L, C = 1;
+    ag::Tensor h = audio;
+    const int rem = L % p;
+    if (rem != 0) {
+      padded_L += p - rem;
+      // Match VITS/RVC MultiPeriodDiscriminator: reflect-pad the right edge
+      // before reshaping so every input sample participates in every period.
+      h = ag::reflect_pad_end(audio, padded_L);
+    }
+    int H = padded_L / p;
     for (const auto& c : pd.convs) {
       h = ag::conv2d(h, c.w, c.b, C, H, p, c.cout, c.kh, c.kw, c.sh, c.sw, c.ph, c.pw);
       H = (H + 2 * c.ph - c.kh) / c.sh + 1;

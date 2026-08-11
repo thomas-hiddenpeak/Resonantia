@@ -18,6 +18,7 @@
 #include "voxmutatio/synthesizer/synthesizer.h"
 #include "voxmutatio/training/generator_trainer.h"
 #include "voxmutatio/training/mel_loss.h"
+#include "test_artifacts.h"
 
 using voxmutatio::autograd::Tensor;
 
@@ -41,6 +42,26 @@ double corr(const std::vector<float>& a, const std::vector<float>& b) {
 }
 
 }  // namespace
+
+TEST_CASE("GeneratorTrainer failed re-init releases the previous checkpoint",
+          "[training][decoder][init][rollback]") {
+  using namespace voxmutatio;
+
+  const std::string path =
+      "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+  training::GeneratorTrainer trainer;
+  REQUIRE(trainer.init(path, 0));
+  REQUIRE_FALSE(trainer.params().empty());
+  std::weak_ptr<autograd::Node> previous = trainer.params().front().n;
+
+  // A valid file with an invalid speaker exercises the exception path after a
+  // previous checkpoint was resident on the GPU.
+  REQUIRE_FALSE(trainer.init(path, 100000));
+  CHECK(trainer.params().empty());
+  CHECK(previous.expired());
+  CHECK_THROWS_AS(trainer.decode({}, {}, 1), std::logic_error);
+  CHECK_FALSE(trainer.export_model(path, "/tmp/uninitialized-generator.safetensors"));
+}
 
 TEST_CASE("Autograd decoder matches inference decoder", "[training][decoder][alignment]") {
   using namespace voxmutatio;
@@ -176,7 +197,9 @@ TEST_CASE("Fine-tuned decoder exports and round-trips through inference",
   auto audio_base = base.debug_decode(z_seg.data(), nsff0_seg.data(), Tseg, 0);
   REQUIRE(audio_base.size() == static_cast<size_t>(Lseg));
 
-  const std::string rt_path = "/tmp/resonantia_rt.safetensors";
+  resonantia_test::ScopedArtifact rt_artifact(
+      resonantia_test::unique_artifact_path("generator-roundtrip", ".safetensors"));
+  const std::string rt_path = rt_artifact.path().string();
   {
     training::GeneratorTrainer gt; REQUIRE(gt.init(g_path, 0));
     REQUIRE(gt.export_model(g_path, rt_path));
@@ -220,7 +243,9 @@ TEST_CASE("Fine-tuned decoder exports and round-trips through inference",
   auto audio_tr = gt.decode(zc, hc, Tseg).to_host();
 
   // Export fine-tuned weights and decode through the inference generator.
-  const std::string ft_path = "/tmp/resonantia_ft.safetensors";
+  resonantia_test::ScopedArtifact ft_artifact(
+      resonantia_test::unique_artifact_path("generator-finetuned", ".safetensors"));
+  const std::string ft_path = ft_artifact.path().string();
   REQUIRE(gt.export_model(g_path, ft_path));
   synthesizer::SynthesizerConfig fcfg = scfg; fcfg.model_path = ft_path;
   synthesizer::Synthesizer ft; REQUIRE(ft.init(fcfg));

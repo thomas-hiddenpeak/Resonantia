@@ -51,23 +51,26 @@ struct TrainingMetrics {
     double elapsed_seconds;
 };
 
-/// Fine-tuning trainer for voice conversion models
+/// Legacy fine-tuning facade retained for source compatibility.
+///
+/// No training backend is implemented here. init/train/checkpoint operations
+/// return false; use vc_train's decoder or GAN trainer for real optimization.
 class FineTuneTrainer {
 public:
-    /// Initialize trainer and load pre-trained models
+    /// Unsupported legacy entry point; always returns false.
     bool init(const FineTuneConfig& config);
     
     /// Load training dataset from list file
     bool load_dataset(const std::string& list_path);
     
-    /// Run training loop
+    /// Unsupported legacy entry point; always returns false.
     bool train();
     
-    /// Save checkpoint
+    /// Unsupported legacy entry point; always returns false.
     bool save_checkpoint(const std::string& path, 
                         const std::string& name = "checkpoint");
     
-    /// Load checkpoint for resume
+    /// Unsupported legacy entry point; always returns false.
     bool load_checkpoint(const std::string& path);
     
     /// Get current metrics

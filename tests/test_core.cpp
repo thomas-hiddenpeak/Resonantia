@@ -5,8 +5,13 @@
 #include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/catch_approx.hpp>
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+
 #include "voxmutatio/core/types.h"
 #include "voxmutatio/core/device.h"
+#include "voxmutatio/training/fine_tuning.h"
 
 TEST_CASE("Error code strings", "[core][types]") {
     REQUIRE(voxmutatio::error_code_string(voxmutatio::ErrorCode::kSuccess) == "Success");
@@ -85,4 +90,25 @@ TEST_CASE("Device invalid device ID", "[core][device]") {
     
     // Should return error for invalid device ID
     REQUIRE(err.has_value());
+}
+
+TEST_CASE("Legacy dataset loader reports malformed speaker ids", "[core][training]") {
+    namespace fs = std::filesystem;
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path list = fs::temp_directory_path() /
+        ("resonantia-invalid-dataset-" + std::to_string(unique) + ".txt");
+    {
+        std::ofstream output(list);
+        REQUIRE(output.is_open());
+        output << "voice.wav | not-a-number | label\n";
+        REQUIRE(static_cast<bool>(output));
+    }
+
+    voxmutatio::training::FineTuneTrainer trainer;
+    bool loaded = true;
+    CHECK_NOTHROW(loaded = trainer.load_dataset(list.string()));
+    CHECK_FALSE(loaded);
+    CHECK(trainer.dataset().empty());
+    std::error_code ignored;
+    fs::remove(list, ignored);
 }

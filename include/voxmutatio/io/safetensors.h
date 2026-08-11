@@ -11,15 +11,22 @@ namespace voxmutatio::io {
 /// A tensor stored in safetensors format
 struct Tensor {
     std::string name;
+    std::string dtype;
     std::vector<int64_t> shape;
     std::vector<int64_t> strides;  // in bytes
-    std::size_t data_offset;       // byte offset in file
-    std::size_t data_nbytes;
+    std::size_t data_offset = 0;   // byte offset in file
+    std::size_t data_nbytes = 0;
 };
 
 /// Safetensors file loader (zero-copy mmap)
 class SafetensorsLoader {
 public:
+    SafetensorsLoader() = default;
+    SafetensorsLoader(const SafetensorsLoader&) = delete;
+    SafetensorsLoader& operator=(const SafetensorsLoader&) = delete;
+    SafetensorsLoader(SafetensorsLoader&& other) noexcept;
+    SafetensorsLoader& operator=(SafetensorsLoader&& other) noexcept;
+
     /// Load and parse a safetensors file
     bool load(const std::string& path);
 
@@ -41,6 +48,8 @@ public:
     ~SafetensorsLoader();
 
 private:
+    void reset() noexcept;
+
     void* data_ = nullptr;         // mmap pointer
     std::size_t data_size_ = 0;
     std::unordered_map<std::string, Tensor> tensors_;

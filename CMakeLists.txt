@@ -1,5 +1,20 @@
 cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
 
+# CUDA architecture selection must be available before project() enables the
+# CUDA language; otherwise a fresh configure asks nvcc to guess an architecture
+# before the Jetson SM87 default has been applied.
+set(VOXMUTATIO_CUDA_ARCHITECTURES "87" CACHE STRING
+    "CUDA architectures for Resonantia (87 is the Jetson Orin baseline)")
+set(CMAKE_CUDA_ARCHITECTURES "${VOXMUTATIO_CUDA_ARCHITECTURES}" CACHE STRING
+    "CUDA architectures selected by VOXMUTATIO_CUDA_ARCHITECTURES" FORCE)
+if(NOT DEFINED CMAKE_CUDA_COMPILER AND "$ENV{CUDACXX}" STREQUAL "")
+    find_program(_VOXMUTATIO_NVCC NAMES nvcc HINTS /usr/local/cuda/bin)
+    if(_VOXMUTATIO_NVCC)
+        set(CMAKE_CUDA_COMPILER "${_VOXMUTATIO_NVCC}" CACHE FILEPATH
+            "CUDA compiler selected for Resonantia")
+    endif()
+endif()
+
 project(Resonantia VERSION 0.1.0 LANGUAGES CXX CUDA)
 
 # ============================================================================
@@ -14,12 +29,8 @@ set(CMAKE_CUDA_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ============================================================================
-# CUDA 架构: SM87 (Jetson AGX Orin)
+# CUDA 架构: SM87 (Jetson Orin baseline)
 # ============================================================================
-set(VOXMUTATIO_CUDA_ARCHITECTURES "87" CACHE STRING
-    "CUDA architectures for Resonantia (87 is Jetson AGX Orin)")
-set(CMAKE_CUDA_ARCHITECTURES "${VOXMUTATIO_CUDA_ARCHITECTURES}")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_87,code=sm_87 --expt-relaxed-constexpr -O3 --use_fast_math -Xptxas -O3")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
 
@@ -34,44 +45,166 @@ find_library(CUFFT_LIBRARY cufft PATHS ${CUDAToolkit_LIBRARY_DIR})
 find_library(CUSOLVER_LIBRARY cusolver PATHS ${CUDAToolkit_LIBRARY_DIR})
 
 # ============================================================================
-# 包含目录
+# 内部组件与兼容静态库
 # ============================================================================
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CUDAToolkit_INCLUDE_DIRS}
-)
+# Keep every runtime translation unit explicit.  The OBJECT targets make the
+# dependency graph reviewable while voxmutatio remains the single public static
+# archive consumed by existing callers.
+function(resonantia_add_component target)
+    add_library(${target} OBJECT ${ARGN})
+    target_include_directories(${target} PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+    target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--use_fast_math;-Xptxas=-O3>
+    )
+endfunction()
 
-# ============================================================================
-# 核心静态库 (voxmutatio — voice conversion engine)
-# ============================================================================
-file(GLOB_RECURSE VOXMUTATIO_SOURCES
-    "src/core/*.cpp"
-    "src/core/*.cu"
-    "src/autograd/*.cpp"
-    "src/autograd/*.cu"
-    "src/separation/*.cpp"
-    "src/separation/*.cu"
-    "src/content/*.cpp"
-    "src/content/*.cu"
-    "src/f0/*.cpp"
-    "src/f0/*.cu"
-    "src/index/*.cpp"
-    "src/index/*.cu"
-    "src/synthesizer/*.cpp"
-    "src/synthesizer/*.cu"
-    "src/training/*.cpp"
-    "src/training/*.cu"
-    "src/pipeline/*.cpp"
-    "src/io/*.cpp"
-    "src/webui/*.cpp"
+resonantia_add_component(resonantia_core_obj
+    src/core/device.cpp
+    src/core/types.cpp
 )
+target_link_libraries(resonantia_core_obj PRIVATE CUDA::cudart)
 
-add_library(voxmutatio STATIC ${VOXMUTATIO_SOURCES})
-target_link_libraries(voxmutatio PRIVATE
+resonantia_add_component(resonantia_io_obj
+    src/io/audio_io.cpp
+    src/io/safetensors.cpp
+)
+target_link_libraries(resonantia_io_obj PRIVATE resonantia_core_obj)
+
+resonantia_add_component(resonantia_cuda_ops_obj
+    src/content/cuda/kernels.cu
+)
+target_link_libraries(resonantia_cuda_ops_obj PRIVATE
+    resonantia_core_obj
     CUDA::cudart
     CUDA::cublas
     CUDA::cufft
-    Threads::Threads
+)
+
+resonantia_add_component(resonantia_content_obj
+    src/content/hubert_encoder.cpp
+    src/content/wavlm_encoder.cpp
+)
+target_link_libraries(resonantia_content_obj PRIVATE
+    resonantia_cuda_ops_obj
+    resonantia_io_obj
+)
+
+resonantia_add_component(resonantia_f0_obj
+    src/f0/fcpe.cpp
+    src/f0/rmvpe.cpp
+    src/f0/rmvpe_ops.cu
+)
+target_link_libraries(resonantia_f0_obj PRIVATE
+    resonantia_cuda_ops_obj
+    resonantia_io_obj
+    CUDA::cudart
+)
+
+resonantia_add_component(resonantia_index_obj
+    src/index/cuda_flat_index.cpp
+)
+
+resonantia_add_component(resonantia_synthesizer_obj
+    src/synthesizer/synthesizer.cpp
+    src/synthesizer/vits_ops.cu
+)
+target_link_libraries(resonantia_synthesizer_obj PRIVATE
+    resonantia_core_obj
+    resonantia_cuda_ops_obj
+    resonantia_io_obj
+    CUDA::cudart
+)
+
+resonantia_add_component(resonantia_separation_obj
+    src/separation/roformer.cu
+    src/separation/sep_registry.cpp
+    src/separation/separator.cu
+    src/separation/stft.cu
+    src/separation/vad.cu
+)
+target_link_libraries(resonantia_separation_obj PRIVATE
+    resonantia_core_obj
+    resonantia_io_obj
+    CUDA::cudart
+    CUDA::cublas
+    CUDA::cufft
+)
+
+resonantia_add_component(resonantia_autograd_obj
+    src/autograd/autograd.cu
+)
+target_link_libraries(resonantia_autograd_obj PRIVATE
+    resonantia_core_obj
+    CUDA::cudart
+    CUDA::cublas
+)
+
+resonantia_add_component(resonantia_training_obj
+    src/training/discriminator.cpp
+    src/training/fine_tuning.cpp
+    src/training/gan_trainer.cpp
+    src/training/generator_trainer.cpp
+    src/training/mel_loss.cpp
+    src/training/posterior_encoder.cpp
+)
+target_link_libraries(resonantia_training_obj PRIVATE
+    resonantia_core_obj
+    resonantia_io_obj
+    resonantia_separation_obj
+    resonantia_autograd_obj
+    CUDA::cudart
+)
+
+resonantia_add_component(resonantia_pipeline_obj
+    src/pipeline/pipeline.cpp
+)
+target_link_libraries(resonantia_pipeline_obj PRIVATE
+    resonantia_core_obj
+    resonantia_io_obj
+    resonantia_content_obj
+    resonantia_f0_obj
+    resonantia_index_obj
+    resonantia_synthesizer_obj
+)
+
+resonantia_add_component(resonantia_webui_obj
+    src/webui/server.cpp
+)
+target_link_libraries(resonantia_webui_obj PRIVATE Threads::Threads)
+
+set(_resonantia_runtime_components
+    resonantia_core_obj
+    resonantia_io_obj
+    resonantia_cuda_ops_obj
+    resonantia_content_obj
+    resonantia_f0_obj
+    resonantia_index_obj
+    resonantia_synthesizer_obj
+    resonantia_separation_obj
+    resonantia_autograd_obj
+    resonantia_training_obj
+    resonantia_pipeline_obj
+    resonantia_webui_obj
+)
+
+set(_resonantia_runtime_objects)
+foreach(component IN LISTS _resonantia_runtime_components)
+    list(APPEND _resonantia_runtime_objects $<TARGET_OBJECTS:${component}>)
+endforeach()
+
+add_library(voxmutatio STATIC ${_resonantia_runtime_objects})
+set_target_properties(voxmutatio PROPERTIES LINKER_LANGUAGE CXX)
+target_link_libraries(voxmutatio
+    PUBLIC
+        # Public headers expose CudaBuffer and therefore require both the
+        # CUDA runtime headers and cudart at downstream compile/link time.
+        CUDA::cudart
+    PRIVATE
+        CUDA::cublas
+        CUDA::cufft
+        Threads::Threads
 )
 target_include_directories(voxmutatio PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -80,204 +213,78 @@ target_include_directories(voxmutatio PUBLIC
 # ============================================================================
 # 工具
 # ============================================================================
-add_executable(vc_convert tools/vc_convert.cpp)
-target_include_directories(vc_convert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vc_convert PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
-set_target_properties(vc_convert PROPERTIES
-    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    LINK_FLAGS "-Wl,--disable-new-dtags"
+function(resonantia_add_app_support target source)
+    add_library(${target} STATIC ${source})
+    target_include_directories(${target} PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    )
+    # The Options headers include public voxmutatio types, so consumers need
+    # the complete facade usage requirements as part of this interface.
+    target_link_libraries(${target}
+        PUBLIC voxmutatio
+        PRIVATE CUDA::cublas
+    )
+endfunction()
+
+resonantia_add_app_support(resonantia_vc_batch_app_support
+    tools/app_support/vc_batch_app.cpp)
+resonantia_add_app_support(resonantia_vc_convert_app_support
+    tools/app_support/vc_convert_app.cpp)
+resonantia_add_app_support(resonantia_vc_preprocess_app_support
+    tools/app_support/vc_preprocess_app.cpp)
+resonantia_add_app_support(resonantia_vc_train_app_support
+    tools/app_support/vc_train_app.cpp)
+
+add_library(resonantia_web_support STATIC
+    tools/web/http_transport.cpp
+    tools/web/workflow_support.cpp
+    tools/web/web_service.cpp
+)
+target_include_directories(resonantia_web_support PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+)
+target_link_libraries(resonantia_web_support PRIVATE
+    voxmutatio
+    Threads::Threads
 )
 
-add_executable(vc_train tools/vc_train.cpp)
-target_include_directories(vc_train PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vc_train PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
-set_target_properties(vc_train PROPERTIES
-    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    LINK_FLAGS "-Wl,--disable-new-dtags"
-)
-
-add_executable(vc_preprocess tools/vc_preprocess.cpp)
-target_include_directories(vc_preprocess PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vc_preprocess PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
-set_target_properties(vc_preprocess PROPERTIES
-    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    LINK_FLAGS "-Wl,--disable-new-dtags"
-)
-
-add_executable(vc_serve tools/vc_serve.cpp)
-target_include_directories(vc_serve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vc_serve PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
-set_target_properties(vc_serve PROPERTIES
-    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    LINK_FLAGS "-Wl,--disable-new-dtags"
-)
-
-add_executable(vc_batch tools/vc_batch.cpp)
-target_include_directories(vc_batch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vc_batch PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
-set_target_properties(vc_batch PROPERTIES
-    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    LINK_FLAGS "-Wl,--disable-new-dtags"
-)
-
-add_executable(vc_probe tools/vc_probe.cpp)
-target_include_directories(vc_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(vc_probe PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
-set_target_properties(vc_probe PROPERTIES
-    BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-    LINK_FLAGS "-Wl,--disable-new-dtags"
-)
-
-    add_executable(test_model_load tools/test_model_load.cpp)
-    target_include_directories(test_model_load PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(test_model_load PRIVATE voxmutatio CUDA::cudart)
-    set_target_properties(test_model_load PROPERTIES
+function(resonantia_add_tool target source)
+    add_executable(${target} ${source})
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(${target} PRIVATE
+        voxmutatio
+        CUDA::cudart
+        ${ARGN}
+    )
+    set_target_properties(${target} PROPERTIES
         BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
         INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
         LINK_FLAGS "-Wl,--disable-new-dtags"
     )
+endfunction()
 
-    add_executable(build_index tools/build_index.cpp)
-    target_include_directories(build_index PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(build_index PRIVATE voxmutatio CUDA::cudart CUDA::cublas)
-    set_target_properties(build_index PROPERTIES
-        BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-        INSTALL_RPATH "${CUDAToolkit_LIBRARY_DIR}"
-        LINK_FLAGS "-Wl,--disable-new-dtags"
-    )
+resonantia_add_tool(vc_convert tools/vc_convert.cpp
+    resonantia_vc_convert_app_support CUDA::cublas)
+resonantia_add_tool(vc_train tools/vc_train.cpp
+    resonantia_vc_train_app_support CUDA::cublas)
+resonantia_add_tool(vc_preprocess tools/vc_preprocess.cpp
+    resonantia_vc_preprocess_app_support CUDA::cublas)
+resonantia_add_tool(vc_serve tools/vc_serve.cpp
+    resonantia_web_support CUDA::cublas)
+resonantia_add_tool(vc_batch tools/vc_batch.cpp
+    resonantia_vc_batch_app_support CUDA::cublas)
+resonantia_add_tool(vc_probe tools/vc_probe.cpp CUDA::cublas)
+resonantia_add_tool(test_model_load tools/test_model_load.cpp)
+resonantia_add_tool(build_index tools/build_index.cpp CUDA::cublas)
 
 # ============================================================================
 # 测试
 # ============================================================================
-option(VOXMUTATIO_BUILD_TESTS "Build test executables" ON)
+option(VOXMUTATIO_BUILD_TESTS "Build reproducible contract test executables" ON)
+option(VOXMUTATIO_ENABLE_MODEL_TESTS
+       "Build/register tests that require ignored model weights and reference fixtures" OFF)
 
 if(VOXMUTATIO_BUILD_TESTS)
     enable_testing()
-
-    # Fetch Catch2
-    include(FetchContent)
-    FetchContent_Declare(
-        Catch2
-        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG v3.4.0
-    )
-    FetchContent_MakeAvailable(Catch2)
-
-    # Test: Core
-    add_executable(test_core tests/test_core.cpp)
-    target_link_libraries(test_core PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_core COMMAND test_core)
-
-    # Test: Audio I/O
-    add_executable(test_audio_io tests/test_audio_io.cpp)
-    target_link_libraries(test_audio_io PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_audio_io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_audio_io COMMAND test_audio_io)
-
-    # Test: F0
-    add_executable(test_f0 tests/test_f0.cpp)
-    target_link_libraries(test_f0 PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_f0 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_f0 COMMAND test_f0)
-
-    # Test: Index
-    add_executable(test_index tests/test_index.cpp)
-    target_link_libraries(test_index PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_index PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_index COMMAND test_index)
-
-    # Test: Pipeline (integration)
-    add_executable(test_pipeline tests/test_pipeline.cpp)
-    target_link_libraries(test_pipeline PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_pipeline COMMAND test_pipeline)
-
-    # Test: HuBERT Inference (end-to-end with real model)
-    add_executable(test_hubert_inference tests/test_hubert_inference.cpp)
-    target_link_libraries(test_hubert_inference PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_hubert_inference PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_hubert_inference COMMAND test_hubert_inference WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: RMVPE F0 alignment (end-to-end with real model)
-    add_executable(test_rmvpe_alignment tests/test_rmvpe_alignment.cpp)
-    target_link_libraries(test_rmvpe_alignment PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_rmvpe_alignment PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_rmvpe_alignment COMMAND test_rmvpe_alignment WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: VITS synthesizer alignment (end-to-end with real model)
-    add_executable(test_vits_alignment tests/test_vits_alignment.cpp)
-    target_link_libraries(test_vits_alignment PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_vits_alignment PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_vits_alignment COMMAND test_vits_alignment WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    add_executable(test_vits_gen_debug tests/test_vits_gen_debug.cpp)
-    target_link_libraries(test_vits_gen_debug PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_vits_gen_debug PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-
-    # Test: End-to-end voice conversion (highest priority integration test)
-    add_executable(test_e2e_conversion tests/test_e2e_conversion.cpp)
-    target_link_libraries(test_e2e_conversion PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_e2e_conversion PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_e2e_conversion COMMAND test_e2e_conversion WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: Long-audio chunked inference matches the whole-clip pass (spec 001 edge case)
-    add_executable(test_long_audio_chunking tests/test_long_audio_chunking.cpp)
-    target_link_libraries(test_long_audio_chunking PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_long_audio_chunking PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_long_audio_chunking COMMAND test_long_audio_chunking WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: FCPE F0 extractor aligned with torchfcpe (spec 001 FR-004)
-    add_executable(test_fcpe_alignment tests/test_fcpe_alignment.cpp)
-    target_link_libraries(test_fcpe_alignment PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_fcpe_alignment PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_fcpe_alignment COMMAND test_fcpe_alignment WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: WavLM-Base+ content encoder aligned with transformers (spec 001 FR-003)
-    add_executable(test_wavlm_alignment tests/test_wavlm_alignment.cpp)
-    target_link_libraries(test_wavlm_alignment PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_wavlm_alignment PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_wavlm_alignment COMMAND test_wavlm_alignment WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: Feature index retrieval (RVC weighted k-NN)
-    add_executable(test_index_retrieval tests/test_index_retrieval.cpp)
-    target_link_libraries(test_index_retrieval PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_index_retrieval PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_index_retrieval COMMAND test_index_retrieval WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: Autograd gradient check (training foundation, spec 002)
-    add_executable(test_autograd tests/test_autograd.cpp)
-    target_link_libraries(test_autograd PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_autograd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_autograd COMMAND test_autograd WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: Differentiable mel loss (training signal, spec 002)
-    add_executable(test_mel_loss tests/test_mel_loss.cpp)
-    target_link_libraries(test_mel_loss PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_mel_loss PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_mel_loss COMMAND test_mel_loss WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: Trainable autograd decoder vs inference decoder (spec 002)
-    add_executable(test_generator_trainer tests/test_generator_trainer.cpp)
-    target_link_libraries(test_generator_trainer PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_generator_trainer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_generator_trainer COMMAND test_generator_trainer WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: GAN components (discriminator, spec 002)
-    add_executable(test_gan tests/test_gan.cpp)
-    target_link_libraries(test_gan PRIVATE voxmutatio CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
-    target_include_directories(test_gan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_gan COMMAND test_gan WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-
-    # Test: Source-separation foundation (GPU STFT/iSTFT, spec 004)
-    add_executable(test_separation tests/test_separation.cpp)
-    target_link_libraries(test_separation PRIVATE voxmutatio CUDA::cudart CUDA::cublas CUDA::cufft Catch2::Catch2WithMain)
-    target_include_directories(test_separation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    add_test(NAME test_separation COMMAND test_separation WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ResonantiaTests.cmake)
 endif()

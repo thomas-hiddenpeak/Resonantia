@@ -27,9 +27,13 @@ public:
     /// Get output dimension
     [[nodiscard]] int output_dim() const noexcept { return output_dim_; }
 
+    /// Check whether the configured checkpoint passed contract validation.
+    [[nodiscard]] bool initialized() const noexcept { return initialized_; }
+
 private:
     int output_dim_ = 768;
     bool half_precision_ = false;
+    bool initialized_ = false;
     WavlmConfig config_;
 };
 

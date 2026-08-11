@@ -11,35 +11,66 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "voxmutatio/core/cuda_buffer.h"
 #include "voxmutatio/io/audio_io.h"
 #include "voxmutatio/io/safetensors.h"
+#include "validation.h"
 
 namespace voxmutatio::separation {
 namespace {
 
 using core::CudaBuffer;
 
+[[noreturn]] void throw_cuda(const char* operation, cudaError_t error) {
+  throw std::runtime_error(std::string("VAD CUDA failure in ") + operation + ": " +
+                           cudaGetErrorString(error));
+}
 #define CK(call) do { cudaError_t e_ = (call); if (e_ != cudaSuccess) \
-  fprintf(stderr, "CUDA %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); } while (0)
+  throw_cuda(#call, e_); } while (0)
 
-inline int grid(int n) { return (n + 255) / 256; }
+void ck_blas(cublasStatus_t status, const char* operation) {
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    throw std::runtime_error(std::string("VAD cuBLAS failure in ") + operation +
+                             " (status " + std::to_string(static_cast<int>(status)) + ")");
+  }
+}
+
+inline int grid(int n) { return n > 0 ? 1 + (n - 1) / 256 : 0; }
 
 cublasHandle_t cublas() {
-  static cublasHandle_t h = [] { cublasHandle_t x; cublasCreate(&x); return x; }();
+  static cublasHandle_t h = [] {
+    cublasHandle_t x = nullptr;
+    ck_blas(cublasCreate(&x), "cublasCreate");
+    return x;
+  }();
   return h;
 }
 void gemm_rm(bool tA, bool tB, int M, int N, int K, float alpha,
              const float* A, const float* B, float beta, float* C) {
   int lda = tA ? M : K, ldb = tB ? K : N;
-  cublasSgemm(cublas(), tB ? CUBLAS_OP_T : CUBLAS_OP_N, tA ? CUBLAS_OP_T : CUBLAS_OP_N,
-              N, M, K, &alpha, B, ldb, A, lda, &beta, C, N);
+  ck_blas(cublasSgemm(cublas(), tB ? CUBLAS_OP_T : CUBLAS_OP_N,
+                      tA ? CUBLAS_OP_T : CUBLAS_OP_N, N, M, K, &alpha, B, ldb,
+                      A, lda, &beta, C, N),
+          "cublasSgemm");
 }
 
 constexpr int kChunk = 512, kCtx = 64, kWin = 640, kNfft = 256, kHop = 128;
 constexpr int kFreq = 129, kFrames = 4, kHid = 128;
+
+int checked_chunk_count(int samples) {
+  if (samples <= 0) throw std::invalid_argument("VAD sample count must be positive");
+  const int chunks = samples / kChunk;
+  if (chunks > 0) {
+    // C*129*4 is the widest int-sized launch. Encoder and recurrent launches
+    // use at most C*512 elements.
+    detail::checked_int_product({chunks, kFreq, kFrames}, "VAD chunk tensor");
+  }
+  return chunks;
+}
 
 // STFT magnitude: mag[c,b,f] = sqrt(re^2+im^2), re/im from conv of window with basis.
 // win [C, kWin]; basis [258, kNfft]; out [C, kFreq, kFrames].
@@ -110,45 +141,59 @@ struct Vad::Impl {
   CudaBuffer wih, whh, bsum;                           // LSTM (bsum = bias_ih + bias_hh)
   CudaBuffer cls_w; float cls_b = 0.0f;               // classifier
 
-  static bool up(const io::SafetensorsLoader& L, const std::string& n, CudaBuffer& b, int expect) {
-    const auto* t = L.get_tensor(n);
-    if (!t) { fprintf(stderr, "vad: missing %s\n", n.c_str()); return false; }
-    int cnt = (int)(t->data_nbytes / sizeof(float));
-    if (expect && cnt != expect) fprintf(stderr, "vad: %s cnt %d want %d\n", n.c_str(), cnt, expect);
-    b.copy_from_host(reinterpret_cast<const float*>(L.data(n)), cnt);
-    return true;
+  static bool up(const io::SafetensorsLoader& L, const std::string& n, CudaBuffer& b,
+                 std::initializer_list<int64_t> shape) {
+    return detail::upload_checked_f32(L, n, shape, b, "vad");
   }
 
   explicit Impl(const std::string& dir, const std::string& model) {
     io::SafetensorsLoader L;
     if (!L.load(dir + "/" + model + ".safetensors")) { fprintf(stderr, "vad: cannot load %s\n", model.c_str()); return; }
     bool g = true;
-    g &= up(L, "stft.forward_basis_buffer", basis, 258 * kNfft);
+    g &= up(L, "stft.forward_basis_buffer", basis, {258, 1, kNfft});
     for (int i = 0; i < 4; ++i) {
       std::string p = "encoder." + std::to_string(i) + ".reparam_conv.";
-      g &= up(L, p + "weight", ew[i], e_cout[i] * e_cin[i] * 3);
-      g &= up(L, p + "bias", eb[i], e_cout[i]);
+      g &= up(L, p + "weight", ew[i], {e_cout[i], e_cin[i], 3});
+      g &= up(L, p + "bias", eb[i], {e_cout[i]});
     }
-    g &= up(L, "decoder.rnn.weight_ih", wih, 4 * kHid * kHid);
-    g &= up(L, "decoder.rnn.weight_hh", whh, 4 * kHid * kHid);
-    const auto* ti = L.get_tensor("decoder.rnn.bias_ih");
-    const auto* th = L.get_tensor("decoder.rnn.bias_hh");
-    if (ti && th) {
-      const auto* bi = reinterpret_cast<const float*>(L.data("decoder.rnn.bias_ih"));
-      const auto* bh = reinterpret_cast<const float*>(L.data("decoder.rnn.bias_hh"));
+    g &= up(L, "decoder.rnn.weight_ih", wih, {4 * kHid, kHid});
+    g &= up(L, "decoder.rnn.weight_hh", whh, {4 * kHid, kHid});
+    const float* bi = nullptr;
+    const float* bh = nullptr;
+    std::size_t bi_count = 0;
+    std::size_t bh_count = 0;
+    if (detail::checked_f32_tensor(L, "decoder.rnn.bias_ih", {4 * kHid}, "vad",
+                                   bi, bi_count) &&
+        detail::checked_f32_tensor(L, "decoder.rnn.bias_hh", {4 * kHid}, "vad",
+                                   bh, bh_count)) {
       std::vector<float> bs(4 * kHid);
-      for (int i = 0; i < 4 * kHid; ++i) bs[i] = bi[i] + bh[i];
-      bsum.copy_from_host(bs.data(), bs.size());
-    } else { g = false; }
-    g &= up(L, "decoder.decoder.2.weight", cls_w, kHid);
-    const auto* tb = L.get_tensor("decoder.decoder.2.bias");
-    if (tb) cls_b = reinterpret_cast<const float*>(L.data("decoder.decoder.2.bias"))[0]; else g = false;
+      for (int i = 0; i < 4 * kHid; ++i) {
+        bs[i] = bi[i] + bh[i];
+        if (!std::isfinite(bs[i])) g = false;
+      }
+      if (g) bsum.copy_from_host(bs.data(), bs.size());
+    } else {
+      g = false;
+    }
+    g &= up(L, "decoder.decoder.2.weight", cls_w, {1, kHid, 1});
+    const float* cls_bias = nullptr;
+    std::size_t cls_bias_count = 0;
+    if (detail::checked_f32_tensor(L, "decoder.decoder.2.bias", {1}, "vad",
+                                   cls_bias, cls_bias_count)) {
+      cls_b = cls_bias[0];
+    } else {
+      g = false;
+    }
     ok = g;
   }
 
   std::vector<float> probs(const float* audio, int n) const {
-    int C = n / kChunk;
+    int C = checked_chunk_count(n);
     if (C <= 0) return {};
+    const int stft_elements =
+        detail::checked_int_product({C, kFreq, kFrames}, "VAD STFT tensor");
+    const int recurrent_elements =
+        detail::checked_int_product({C, 4, kHid}, "VAD recurrent tensor");
     // Build padded windows [C, kWin] on host (context + chunk + reflect pad).
     std::vector<float> win(static_cast<size_t>(C) * kWin, 0.0f);
     for (int c = 0; c < C; ++c) {
@@ -160,21 +205,24 @@ struct Vad::Impl {
     CudaBuffer d_win; d_win.copy_from_host(win.data(), win.size());
 
     CudaBuffer mag; mag.allocate(static_cast<size_t>(C) * kFreq * kFrames);
-    k_stft<<<grid(C * kFreq * kFrames), 256>>>(d_win.data(), basis.data(), mag.data(), C);
+    k_stft<<<grid(stft_elements), 256>>>(d_win.data(), basis.data(), mag.data(), C);
 
     CudaBuffer cur = std::move(mag);
     int Fin = kFrames;
     for (int i = 0; i < 4; ++i) {
       int Fout = (Fin + 2 - 3) / e_stride[i] + 1;
       CudaBuffer nxt; nxt.allocate(static_cast<size_t>(C) * e_cout[i] * Fout);
-      k_conv_relu<<<grid(C * e_cout[i] * Fout), 256>>>(cur.data(), ew[i].data(), eb[i].data(),
+      const int conv_elements = detail::checked_int_product(
+          {C, e_cout[i], Fout}, "VAD encoder tensor");
+      k_conv_relu<<<grid(conv_elements), 256>>>(cur.data(), ew[i].data(), eb[i].data(),
           nxt.data(), C, e_cin[i], Fin, e_cout[i], Fout, e_stride[i]);
       cur = std::move(nxt); Fin = Fout;
     }
     // cur is [C, 128, 1] = encoder features [C, 128].
     CudaBuffer xproj; xproj.allocate(static_cast<size_t>(C) * 4 * kHid);
     gemm_rm(false, true, C, 4 * kHid, kHid, 1.0f, cur.data(), wih.data(), 0.0f, xproj.data());
-    k_add_rowbias<<<grid(C * 4 * kHid), 256>>>(xproj.data(), bsum.data(), C, 4 * kHid);
+    k_add_rowbias<<<grid(recurrent_elements), 256>>>(xproj.data(), bsum.data(), C,
+                                                     4 * kHid);
 
     CudaBuffer hseq; hseq.allocate(static_cast<size_t>(C) * kHid);
     CudaBuffer cbuf, hproj, zero;
@@ -192,6 +240,12 @@ struct Vad::Impl {
     CK(cudaDeviceSynchronize());
     std::vector<float> out(C);
     dprob.copy_to_host(out.data(), C);
+    detail::require_finite_output(out, "VAD probability output");
+    for (float probability : out) {
+      if (probability < 0.0f || probability > 1.0f) {
+        throw std::runtime_error("VAD produced a probability outside [0, 1]");
+      }
+    }
     return out;
   }
 };
@@ -203,16 +257,34 @@ bool Vad::valid() const { return p_ && p_->ok; }
 int Vad::sample_rate() const { return 16000; }
 
 std::vector<float> Vad::probs(const float* audio16k, int n) const {
+  if (!valid()) throw std::runtime_error("VAD is not initialized");
+  if (!audio16k || n <= 0) throw std::invalid_argument("VAD input is invalid");
+  checked_chunk_count(n);
+  detail::require_finite_input(audio16k, static_cast<std::size_t>(n), "VAD input");
   return p_->probs(audio16k, n);
 }
 
 std::vector<std::pair<int, int>> Vad::segments(const float* audio, int n, int sr, float thresh,
                                                int min_speech_ms, int min_silence_ms, int pad_ms) const {
+  if (!valid()) throw std::runtime_error("VAD is not initialized");
+  if (!audio || n <= 0 || sr <= 0 || !std::isfinite(thresh) || thresh < 0.0f ||
+      thresh > 1.0f || min_speech_ms < 0 || min_silence_ms < 0 || pad_ms < 0 ||
+      min_speech_ms > 60'000 || min_silence_ms > 60'000 || pad_ms > 60'000) {
+    throw std::invalid_argument("VAD segmentation parameters are invalid");
+  }
+  checked_chunk_count(n);
+  const int model_length =
+      sr == 16000 ? n : detail::checked_resampled_length(n, sr, 16000, "VAD input");
+  checked_chunk_count(model_length);
+  detail::require_finite_input(audio, static_cast<std::size_t>(n),
+                               "VAD segmentation input");
   std::vector<float> a16 = (sr == 16000) ? std::vector<float>(audio, audio + n)
                                          : io::resample_linear(audio, n, sr, 16000);
-  auto pr = p_->probs(a16.data(), static_cast<int>(a16.size()));
+  if (a16.empty()) throw std::runtime_error("VAD resampling failed");
+  detail::require_finite_output(a16, "VAD resampled input");
+  auto pr = probs(a16.data(), static_cast<int>(a16.size()));
   // Hysteresis over 32 ms chunks (512 samples @ 16k), then map to input sr.
-  const float lo = thresh - 0.15f;
+  const float lo = std::max(0.0f, thresh - 0.15f);
   const int min_speech = min_speech_ms * 16, min_sil = min_silence_ms * 16, pad = pad_ms * 16;
   std::vector<std::pair<int, int>> segs;  // in 16k samples
   bool on = false; int start = 0, last_speech = 0;

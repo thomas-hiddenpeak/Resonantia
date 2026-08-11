@@ -46,6 +46,7 @@ class WaveNet {
  private:
   int hidden_ = 0, kernel_ = 0;
   std::vector<WNLayer> layers_;
+  bool initialized_ = false;
 };
 
 class PosteriorEncoder {
@@ -67,6 +68,7 @@ class PosteriorEncoder {
   WaveNet wn_;
   autograd::Tensor proj_w_, proj_b_;
   std::vector<autograd::Tensor> params_;
+  bool initialized_ = false;
 };
 
 /// VITS residual-coupling flow (4 couplings + flips), forward z_q -> z_p.
@@ -84,6 +86,7 @@ class Flow {
   };
   std::array<Coupling, 4> couplings_;
   std::vector<autograd::Tensor> params_;
+  bool initialized_ = false;
 };
 
 }  // namespace voxmutatio::training

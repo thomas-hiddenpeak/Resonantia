@@ -3,17 +3,25 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace voxmutatio::index {
 
-/// CUDA-based Flat Index for feature retrieval (zero FAISS dependency)
+/// Memory-mapped exact Flat Index for feature retrieval (zero FAISS dependency)
 class CudaFlatIndex {
 public:
+    CudaFlatIndex() = default;
+    CudaFlatIndex(const CudaFlatIndex&) = delete;
+    CudaFlatIndex& operator=(const CudaFlatIndex&) = delete;
+    CudaFlatIndex(CudaFlatIndex&& other) noexcept;
+    CudaFlatIndex& operator=(CudaFlatIndex&& other) noexcept;
+
     /// Load a feature index from disk
     bool load(const std::string& path);
 
-    /// Search K nearest neighbors for each query vector on GPU
+    /// Search K nearest neighbors for each query vector without duplicating the
+    /// memory-mapped database in device memory.
     /// queries: [N, dim] row-major
     /// Returns {distances, indices} each [N, K] row-major
     std::pair<std::vector<float>, std::vector<int64_t>>
@@ -36,13 +44,16 @@ public:
     [[nodiscard]] int dim() const noexcept { return dim_; }
 
     /// Check if index is loaded
-    [[nodiscard]] bool valid() const noexcept { return data_ != nullptr; }
+    [[nodiscard]] bool valid() const noexcept {
+        return data_ != nullptr && map_base_ != nullptr && ntotal_ > 0 && dim_ > 0;
+    }
 
     ~CudaFlatIndex();
 
 private:
-    float* data_ = nullptr;       // points into map_base_ (past 16-byte header)
-    float* device_data_ = nullptr; // device copy
+    void release() noexcept;
+
+    const float* data_ = nullptr; // points into map_base_ (past 16-byte header)
     void* map_base_ = nullptr;     // mmap base (whole file)
     std::size_t map_size_ = 0;     // mmap size
     int64_t ntotal_ = 0;

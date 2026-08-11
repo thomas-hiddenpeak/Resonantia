@@ -48,9 +48,9 @@ enum class ModelVersion : std::uint8_t {
 
 /// F0 extraction method
 enum class F0Method : std::uint8_t {
-    kRmvpe,  // Conformer-based (default)
-    kFcpe,   // Fast Context-based (real-time)
-    kPm,     // Parselmouth (CPU fallback)
+    kRmvpe,  // RMVPE DeepUnet + bidirectional GRU (default)
+    kFcpe,   // Optional Fast Context-based extractor; no end-to-end latency guarantee
+    kPm,     // Reserved; current pipeline rejects this unsupported method
 };
 
 /// Content (SSL) encoder selection
@@ -67,16 +67,16 @@ enum class ContentEncoder : std::uint8_t {
 /// Voice conversion configuration
 struct VCConfig {
     // Model paths
-    std::string hubert_model_path;       // HuBERT safetensors directory
+    std::string hubert_model_path;       // required when content_encoder=kHubert
     std::string synthesizer_model_path;  // VITS synthesizer safetensors
-    std::string index_path;              // CUDA Flat Index file (optional)
-    std::string rmvpe_model_path;        // RMVPE safetensors (optional)
-    std::string fcpe_model_path;         // FCPE safetensors (optional, for f0_method=kFcpe)
-    std::string wavlm_model_path;        // WavLM-Base+ safetensors (optional, for content_encoder=kWavlm)
+    std::string index_path;              // required when index_rate > 0
+    std::string rmvpe_model_path;        // required when f0_method=kRmvpe
+    std::string fcpe_model_path;         // required when f0_method=kFcpe
+    std::string wavlm_model_path;        // required when content_encoder=kWavlm
 
     // Inference parameters
     int f0_up_key = 0;                   // pitch shift in semitones
-    double formant_shift = 0.0;          // formant shift in semitones
+    double formant_shift = 0.0;          // reserved; current pipeline requires 0
     double index_rate = 0.0;             // index retrieval blend [0.0, 1.0]
     F0Method f0_method = F0Method::kRmvpe;  // F0 extractor: kRmvpe (default) or kFcpe
     ContentEncoder content_encoder = ContentEncoder::kHubert;  // content SSL encoder
@@ -88,25 +88,26 @@ struct VCConfig {
     bool interp_unvoiced = true;         // interpolate F0 across unvoiced frames (smooth pitch)
 
     // Long-audio handling: clips longer than max_chunk_sec are split at silence and
-    // converted per-chunk, then stitched (bounded memory for arbitrarily long audio).
-    double max_chunk_sec = 30.0;         // >0: split audio longer than this (0 = never chunk)
+    // converted per-chunk, then stitched. HuBERT/Index/VITS run per chunk, while F0
+    // and host preprocessing still consume the whole clip and grow with its duration.
+    double max_chunk_sec = 30.0;         // bounded to [1,30] seconds by the pipeline
     double chunk_pad_sec = 2.0;          // context padding each side of a chunk (trimmed after synth)
     double chunk_query_sec = 1.0;        // search radius to snap each cut to the quietest point
 
     // I/O parameters
-    int target_sample_rate = 0;          // 0 = keep model's native sample rate
-    std::string output_format = "wav";   // wav, flac
+    int target_sample_rate = 0;          // 0 or the model's native sample rate
+    std::string output_format = "wav";   // WAV is the supported output format
 
     // Runtime
-    std::string device = "cuda";         // cuda, cpu
-    bool use_half_precision = false;     // FP16 inference
+    std::string device = "cuda";         // CUDA is the supported backend
+    bool use_half_precision = false;     // reserved; current pipeline requires false
     int gpu_device = 0;
 
-    // Model metadata (auto-detected from checkpoint)
+    // Checkpoint contract selected by the caller and validated at initialization.
     ModelVersion version = ModelVersion::kV1;
-    bool has_f0 = true;                  // whether the model uses F0 conditioning
-    int num_speakers = 1;
-    int model_sample_rate = 40'000;      // native model output sample rate
+    bool has_f0 = true;                  // only F0-conditioned checkpoints are supported
+    int num_speakers = 1;                // compatibility hint; checkpoint is authoritative
+    int model_sample_rate = 40'000;      // only 40 kHz checkpoints are currently supported
 };
 
 // ============================================================================

@@ -10,11 +10,15 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "voxmutatio/f0/rmvpe.h"
 #include "voxmutatio/io/audio_io.h"
+#include "voxmutatio/io/safetensors.h"
+#include "f0_checkpoint_fixture.h"
+#include "test_artifacts.h"
 
 namespace {
 
@@ -138,4 +142,49 @@ TEST_CASE("RMVPE F0 alignment (SC-002)", "[rmvpe][alignment][f0]") {
     CHECK(mean_err < 0.5);
     // Most voiced frames should match tightly
     CHECK(matched >= voiced * 0.95);
+}
+
+TEST_CASE("RMVPE initialization and inference failure boundaries",
+          "[rmvpe][integration][contract]") {
+    using namespace voxmutatio;
+
+    f0::RmvpeConfig config;
+    config.model_path = "../models/rmvpe.safetensors";
+    f0::RmvpeExtractor extractor;
+    REQUIRE(extractor.init(config));
+
+    float finite_sample = 0.0f;
+    float nonfinite_sample = std::numeric_limits<float>::quiet_NaN();
+    int frames = 19;
+    CHECK(extractor.infer(nullptr, 1).empty());
+    CHECK(extractor.infer(&finite_sample, 0).empty());
+    CHECK(extractor.infer(&finite_sample, std::numeric_limits<int>::max()).empty());
+    CHECK(extractor.infer(&nonfinite_sample, 1).empty());
+    CHECK(extractor.infer_salience(&nonfinite_sample, 1, frames).empty());
+    CHECK(frames == 0);
+
+    resonantia_test::ScopedArtifact sparse_checkpoint(
+        resonantia_test::unique_artifact_path("rmvpe-complete-sparse", ".safetensors"));
+    REQUIRE(resonantia_test::f0_fixture::create_zero_payload_sparse_clone(
+        "../models/rmvpe.safetensors", sparse_checkpoint.path()));
+    {
+        f0::RmvpeExtractor manifest_probe;
+        f0::RmvpeConfig sparse_config;
+        sparse_config.model_path = sparse_checkpoint.path().string();
+        REQUIRE(manifest_probe.init(sparse_config));
+    }
+    REQUIRE(resonantia_test::f0_fixture::write_tensor_value(
+        sparse_checkpoint.path(), "cnn.weight", 0,
+        std::numeric_limits<float>::quiet_NaN()));
+    {
+        io::SafetensorsLoader generic_loader;
+        REQUIRE(generic_loader.load(sparse_checkpoint.path().string()));
+    }
+
+    config.model_path = sparse_checkpoint.path().string();
+    CHECK_FALSE(extractor.init(config));
+    CHECK(extractor.infer(&finite_sample, 1).empty());
+    frames = 19;
+    CHECK(extractor.infer_salience(&finite_sample, 1, frames).empty());
+    CHECK(frames == 0);
 }

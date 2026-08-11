@@ -4,9 +4,9 @@
  *
  * The production pipeline splits clips longer than `max_chunk_sec` at silence,
  * converts each chunk with context padding, and stitches the result. This test
- * tiles a real speech fixture past the chunk threshold and asserts the chunked
- * output is numerically consistent with a single whole-clip pass (same knobs),
- * so the >5min edge case is handled without seams or drift.
+ * tiles a real speech fixture to roughly 18 seconds, past the configured chunk
+ * threshold, and asserts the chunked output is numerically consistent with a
+ * single whole-clip pass. It does not establish five-minute resource bounds.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -125,9 +125,10 @@ TEST_CASE("Long-audio chunking matches whole-clip pass", "[chunk][integration]")
     REQUIRE(!chunked.audio.data.empty());
     for (float v : chunked.audio.data) { REQUIRE(!std::isnan(v)); REQUIRE(!std::isinf(v)); }
 
-    // B) Reference whole-clip pass: never chunk, match the 2s outer reflect pad.
+    // B) Reference whole-clip pass: keep the valid chunk threshold above this
+    // fixture's duration, and match the 2s outer reflect pad.
     VCConfig whole_cfg = base_config();
-    whole_cfg.max_chunk_sec = 0.0;   // disable chunking
+    whole_cfg.max_chunk_sec = 30.0;
     whole_cfg.edge_pad_sec = 2.0;    // same outer context as the chunk path
     pipeline::VoiceConversionPipeline whole_pipe;
     REQUIRE(whole_pipe.init(whole_cfg));

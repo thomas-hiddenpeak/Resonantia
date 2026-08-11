@@ -34,6 +34,83 @@ Ref load_bin(const std::string& p) {
 }
 }  // namespace
 
+TEST_CASE("Training components failed re-init release previous checkpoints",
+          "[gan][init][rollback]") {
+  using namespace voxmutatio;
+
+  const std::string path =
+      "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+
+  {
+    training::PosteriorEncoder encoder;
+    REQUIRE(encoder.init(path, 0));
+    REQUIRE_FALSE(encoder.params().empty());
+    std::weak_ptr<autograd::Node> previous = encoder.params().front().n;
+
+    // Exercise the pre-parse failure path after a successful initialization.
+    REQUIRE_FALSE(encoder.init("/tmp/resonantia-missing-generator.safetensors", 0));
+    CHECK(encoder.params().empty());
+    CHECK(previous.expired());
+    Tensor m_q, logs_q;
+    CHECK_THROWS_AS(encoder.forward({}, 1, false, m_q, logs_q), std::logic_error);
+  }
+
+  {
+    training::Flow flow;
+    REQUIRE(flow.init(path, 0));
+    REQUIRE_FALSE(flow.params().empty());
+    std::weak_ptr<autograd::Node> previous = flow.params().front().n;
+
+    // Exercise the checked-weight exception path.
+    REQUIRE_FALSE(flow.init(path, 100000));
+    CHECK(flow.params().empty());
+    CHECK(previous.expired());
+    CHECK_THROWS_AS(flow.forward({}, 1), std::logic_error);
+  }
+
+  {
+    const std::string d_path =
+        "../models/pretrained_v2/pretrained_v2/f0D40k.safetensors";
+    training::Discriminator discriminator;
+    REQUIRE(discriminator.init(d_path));
+    REQUIRE_FALSE(discriminator.params().empty());
+    std::weak_ptr<autograd::Node> previous = discriminator.params().front().n;
+
+    REQUIRE_FALSE(discriminator.init(
+        "/tmp/resonantia-missing-discriminator.safetensors"));
+    CHECK(discriminator.params().empty());
+    CHECK(previous.expired());
+    CHECK_THROWS_AS(discriminator.forward({}, 1), std::logic_error);
+  }
+
+  {
+    const std::string d_path =
+        "../models/pretrained_v2/pretrained_v2/f0D40k.safetensors";
+    training::MelSpecConfig mel_cfg;
+    mel_cfg.n_fft = 1024;
+    mel_cfg.hop = 256;
+    mel_cfg.n_mels = 80;
+    mel_cfg.sample_rate = 40000;
+
+    training::GANTrainer trainer;
+    REQUIRE(trainer.init(path, d_path, 0, mel_cfg));
+    REQUIRE_FALSE(trainer.generator().params().empty());
+    std::weak_ptr<autograd::Node> previous = trainer.generator().params().front().n;
+
+    // The generator side is valid and reloads successfully, but discriminator
+    // loading fails. The aggregate and both optimizers must be rolled back.
+    REQUIRE_FALSE(trainer.init(
+        path, "/tmp/resonantia-missing-discriminator.safetensors", 0, mel_cfg));
+    CHECK(trainer.generator().params().empty());
+    CHECK(previous.expired());
+    CHECK(trainer.g_lr() == 0.0f);
+    CHECK_THROWS_AS(trainer.train_step({}, {}, {}, 1, 400), std::logic_error);
+    CHECK_THROWS_AS(trainer.train_step_full({}, {}, {}, {}, {}, 1, 400),
+                    std::logic_error);
+    CHECK_FALSE(trainer.export_model(path, "/tmp/uninitialized-gan.safetensors"));
+  }
+}
+
 TEST_CASE("Discriminator forward/backward on real audio", "[gan][discriminator]") {
   using namespace voxmutatio;
 

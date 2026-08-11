@@ -42,6 +42,7 @@ class GeneratorTrainer {
   autograd::Tensor conv_post_w_;
   std::vector<autograd::Tensor> params_;
   std::vector<float> cond_g_init_;  // cond(g) folded into conv_pre bias at init
+  bool initialized_ = false;
 
   autograd::Tensor resblock(const autograd::Tensor& xn, int idx, int C, int L,
                             int kernel, const int* dil);

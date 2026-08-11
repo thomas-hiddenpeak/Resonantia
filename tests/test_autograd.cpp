@@ -293,6 +293,19 @@ TEST_CASE("Autograd GAN: exp + conv2d", "[autograd][gradcheck][gan]") {
     std::printf("[flip_rows] %.2e\n", e);
     CHECK(e < 3e-2);
   }
+  SECTION("reflect_pad_end") {
+    const std::vector<float> input = {1, 2, 3, 4, 5};
+    auto padded = ag::reflect_pad_end(Tensor::from_host(input, {1, 5}, false), 7).to_host();
+    const std::vector<float> expected{1, 2, 3, 4, 5, 4, 3};
+    REQUIRE(padded == expected);
+    double e = grad_check(
+        [](std::vector<Tensor>& t) {
+          return ag::sum(ag::gelu(ag::reflect_pad_end(t[0], 7)));
+        },
+        {input}, {{1, 5}});
+    std::printf("[reflect_pad_end] %.2e\n", e);
+    CHECK(e < 3e-2);
+  }
 }
 
 TEST_CASE("Autograd A3: primitives", "[autograd][gradcheck][a3]") {
@@ -399,4 +412,19 @@ TEST_CASE("Autograd A2: AdamW convex convergence", "[autograd][a2][optim]") {
     max_err = std::max(max_err, std::abs((double)xh[i] - target[i]));
   std::printf("[AdamW] max |x-target| after 400 steps: %.2e\n", max_err);
   CHECK(max_err < 1e-2);
+}
+
+TEST_CASE("Autograd rejects invalid public shapes and indices", "[autograd][bounds]") {
+  REQUIRE_THROWS_AS(Tensor::from_host({1.0f}, {2}, false), std::invalid_argument);
+
+  auto a = Tensor::from_host({1.0f, 2.0f}, {1, 2}, false);
+  auto b = Tensor::from_host({1.0f}, {1, 1}, false);
+  REQUIRE_THROWS_AS(ag::add(a, b), std::invalid_argument);
+  REQUIRE_THROWS_AS(ag::matmul(a, a), std::invalid_argument);
+  REQUIRE_THROWS_AS(ag::slice_rows(a, 1, 1, 2), std::out_of_range);
+  REQUIRE_THROWS_AS(ag::frame(a, 2, 2, 1), std::out_of_range);
+
+  auto table = Tensor::from_host(std::vector<float>(6, 0.0f), {3, 2}, false);
+  REQUIRE_THROWS_AS(ag::embedding(table, {-1}, 2), std::out_of_range);
+  REQUIRE_THROWS_AS(ag::embedding(table, {3}, 2), std::out_of_range);
 }

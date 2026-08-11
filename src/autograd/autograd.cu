@@ -6,9 +6,13 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <mutex>
+#include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -17,15 +21,24 @@ namespace voxmutatio::autograd {
 namespace {
 
 inline void ck(cudaError_t e, const char* f, int l) {
-  if (e != cudaSuccess)
-    fprintf(stderr, "CUDA %s:%d: %s\n", f, l, cudaGetErrorString(e));
+  if (e != cudaSuccess) {
+    throw std::runtime_error(std::string("CUDA ") + f + ":" + std::to_string(l) +
+                             ": " + cudaGetErrorString(e));
+  }
 }
 #define CK(e) ck((e), __FILE__, __LINE__)
 
+inline void ck_blas(cublasStatus_t status, const char* operation) {
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    throw std::runtime_error(std::string(operation) + " failed with cuBLAS status " +
+                             std::to_string(static_cast<int>(status)));
+  }
+}
+
 cublasHandle_t cublas() {
   static cublasHandle_t h = [] {
-    cublasHandle_t x;
-    cublasCreate(&x);
+    cublasHandle_t x = nullptr;
+    ck_blas(cublasCreate(&x), "cublasCreate");
     return x;
   }();
   return h;
@@ -34,8 +47,10 @@ cublasHandle_t cublas() {
 // Check a kernel launch.
 inline void check_launch(const char* name) {
   cudaError_t e = cudaGetLastError();
-  if (e != cudaSuccess)
-    fprintf(stderr, "kernel %s launch: %s\n", name, cudaGetErrorString(e));
+  if (e != cudaSuccess) {
+    throw std::runtime_error(std::string("kernel ") + name + " launch failed: " +
+                             cudaGetErrorString(e));
+  }
 }
 
 __global__ void k_add(const float* a, const float* b, float* o, int n) {
@@ -75,12 +90,13 @@ void gemm_rm(bool transA, bool transB, int M, int N, int K, float alpha,
              const float* A, const float* B, float beta, float* C) {
   int lda = transA ? M : K;  // physical ld of A's row-major storage
   int ldb = transB ? K : N;  // physical ld of B's row-major storage
-  cublasSgemm(cublas(),
-              transB ? CUBLAS_OP_T : CUBLAS_OP_N,
-              transA ? CUBLAS_OP_T : CUBLAS_OP_N,
-              N, M, K, &alpha,
-              B, ldb, A, lda, &beta,
-              C, N);
+  ck_blas(cublasSgemm(cublas(),
+                      transB ? CUBLAS_OP_T : CUBLAS_OP_N,
+                      transA ? CUBLAS_OP_T : CUBLAS_OP_N,
+                      N, M, K, &alpha,
+                      B, ldb, A, lda, &beta,
+                      C, N),
+          "cublasSgemm");
 }
 
 // Reuses device scratch buffers across ops/steps so im2col does not cudaMalloc/
@@ -91,23 +107,75 @@ class ScratchPool {
   static ScratchPool& get() { static ScratchPool p; return p; }
   std::shared_ptr<core::CudaBuffer> acquire(std::size_t n) {
     std::unique_ptr<core::CudaBuffer> buf;
-    if (!free_.empty()) { buf = std::move(free_.back()); free_.pop_back(); }
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (!free_.empty()) {
+        auto best = free_.end();
+        for (auto it = free_.begin(); it != free_.end(); ++it) {
+          if ((*it)->size() >= n &&
+              (best == free_.end() || (*it)->size() < (*best)->size()))
+            best = it;
+        }
+        if (best == free_.end())
+          best = std::max_element(free_.begin(), free_.end(),
+              [](const auto& a, const auto& b) { return a->size() < b->size(); });
+        buf = std::move(*best);
+        free_.erase(best);
+      }
+    }
     if (!buf) buf = std::make_unique<core::CudaBuffer>();
     if (buf->size() < n) buf->allocate(n);
     core::CudaBuffer* raw = buf.release();
     return std::shared_ptr<core::CudaBuffer>(raw, [this](core::CudaBuffer* p) {
+      std::lock_guard<std::mutex> lock(mu_);
       free_.emplace_back(p);
     });
   }
  private:
+  std::mutex mu_;
   std::vector<std::unique_ptr<core::CudaBuffer>> free_;
 };
 
+void require_tensor(const Tensor& t, const char* name) {
+  if (!t.n) throw std::invalid_argument(std::string(name) + " is an empty Tensor");
+}
+
+int checked_numel_int(const Tensor& t, const char* name) {
+  require_tensor(t, name);
+  const int64_t n = t.numel();
+  if (n > std::numeric_limits<int>::max())
+    throw std::length_error(std::string(name) + " exceeds CUDA kernel index range");
+  return static_cast<int>(n);
+}
+
+void require_rank(const Tensor& t, std::size_t rank, const char* name) {
+  require_tensor(t, name);
+  if (t.shape().size() != rank)
+    throw std::invalid_argument(std::string(name) + " has the wrong rank");
+}
+
+void require_same_shape(const Tensor& a, const Tensor& b, const char* operation) {
+  require_tensor(a, "lhs");
+  require_tensor(b, "rhs");
+  if (a.shape() != b.shape())
+    throw std::invalid_argument(std::string(operation) + " requires equal shapes");
+}
+
+void require_flat_size(const Tensor& t, int64_t expected, const char* name) {
+  require_tensor(t, name);
+  if (expected <= 0 || t.numel() != expected)
+    throw std::invalid_argument(std::string(name) + " size does not match declared dimensions");
+}
+
 std::shared_ptr<Node> make_node(std::vector<int> shape, bool requires_grad) {
+  if (shape.empty()) throw std::invalid_argument("tensor shape cannot be empty");
   auto nd = std::make_shared<Node>();
   nd->shape = std::move(shape);
   nd->requires_grad = requires_grad;
-  nd->data.allocate(static_cast<std::size_t>(nd->numel()));
+  const int64_t n = nd->numel();
+  if (n > std::numeric_limits<int>::max())
+    throw std::length_error("tensor exceeds CUDA kernel index range");
+  nd->data.allocate(static_cast<std::size_t>(n));
   return nd;
 }
 
@@ -122,6 +190,8 @@ bool any_requires_grad(std::initializer_list<const Tensor*> ts) {
 Tensor Tensor::from_host(const std::vector<float>& v, std::vector<int> shape,
                          bool requires_grad) {
   auto nd = make_node(std::move(shape), requires_grad);
+  if (static_cast<int64_t>(v.size()) != nd->numel())
+    throw std::invalid_argument("Tensor::from_host data size does not match shape");
   nd->data.copy_from_host(v.data(), v.size());
   return Tensor(nd);
 }
@@ -133,12 +203,14 @@ Tensor Tensor::zeros(std::vector<int> shape, bool requires_grad) {
 }
 
 std::vector<float> Tensor::to_host() const {
+  require_tensor(*this, "tensor");
   std::vector<float> out(static_cast<std::size_t>(numel()));
   n->data.copy_to_host(out.data(), out.size());
   return out;
 }
 
 std::vector<float> Tensor::grad_to_host() const {
+  require_tensor(*this, "tensor");
   std::vector<float> out(static_cast<std::size_t>(numel()), 0.0f);
   if (n->grad.size() >= static_cast<std::size_t>(numel()))
     n->grad.copy_to_host(out.data(), out.size());
@@ -146,7 +218,8 @@ std::vector<float> Tensor::grad_to_host() const {
 }
 
 Tensor add(const Tensor& a, const Tensor& b) {
-  int n = static_cast<int>(a.numel());
+  require_same_shape(a, b, "add");
+  int n = checked_numel_int(a, "add input");
   auto out = make_node(a.shape(), any_requires_grad({&a, &b}));
   k_add<<<grid(n), 256>>>(a.n->data.data(), b.n->data.data(), out->data.data(), n);
   check_launch("add");
@@ -162,7 +235,8 @@ Tensor add(const Tensor& a, const Tensor& b) {
 }
 
 Tensor mul(const Tensor& a, const Tensor& b) {
-  int n = static_cast<int>(a.numel());
+  require_same_shape(a, b, "mul");
+  int n = checked_numel_int(a, "mul input");
   auto out = make_node(a.shape(), any_requires_grad({&a, &b}));
   k_mul<<<grid(n), 256>>>(a.n->data.data(), b.n->data.data(), out->data.data(), n);
   check_launch("mul");
@@ -179,6 +253,10 @@ Tensor mul(const Tensor& a, const Tensor& b) {
 }
 
 Tensor matmul(const Tensor& a, const Tensor& b) {
+  require_rank(a, 2, "matmul lhs");
+  require_rank(b, 2, "matmul rhs");
+  if (a.shape()[1] != b.shape()[0])
+    throw std::invalid_argument("matmul inner dimensions do not match");
   int M = a.shape()[0], K = a.shape()[1], N = b.shape()[1];
   auto out = make_node({M, N}, any_requires_grad({&a, &b}));
   // C = A @ B
@@ -200,7 +278,7 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
 }
 
 Tensor sum(const Tensor& a) {
-  int n = static_cast<int>(a.numel());
+  int n = checked_numel_int(a, "sum input");
   auto out = make_node({1}, any_requires_grad({&a}));
   out->data.zero();
   k_sum<<<grid(n), 256>>>(a.n->data.data(), out->data.data(), n);
@@ -337,7 +415,10 @@ __global__ void k_ln_b(float* dx, float* dw, float* db, const float* dy,
 }
 
 Tensor add_bias(const Tensor& x, const Tensor& b) {
+  checked_numel_int(x, "add_bias input");
+  require_rank(b, 1, "add_bias bias");
   int C = x.shape().back();
+  if (b.numel() != C) throw std::invalid_argument("add_bias bias size mismatch");
   int R = static_cast<int>(x.numel()) / C;
   int n = R * C;
   auto out = make_node(x.shape(), any_requires_grad({&x, &b}));
@@ -353,8 +434,16 @@ Tensor add_bias(const Tensor& x, const Tensor& b) {
 }
 
 Tensor linear(const Tensor& x, const Tensor& w, const Tensor& b) {
+  require_rank(x, 2, "linear input");
+  require_rank(w, 2, "linear weight");
+  if (x.shape()[1] != w.shape()[1])
+    throw std::invalid_argument("linear input/weight dimensions do not match");
   int M = x.shape()[0], K = x.shape()[1], N = w.shape()[0];
   bool has_b = static_cast<bool>(b.n);
+  if (has_b) {
+    require_rank(b, 1, "linear bias");
+    if (b.numel() != N) throw std::invalid_argument("linear bias size mismatch");
+  }
   bool rg = any_requires_grad({&x, &w}) ||
             (has_b && (b.n->requires_grad || !b.n->parents.empty()));
   auto out = make_node({M, N}, rg);
@@ -378,7 +467,7 @@ Tensor linear(const Tensor& x, const Tensor& w, const Tensor& b) {
 
 template <typename Fwd, typename Bwd>
 static Tensor act_op(const Tensor& x, Fwd fwd, Bwd bwd, bool use_output) {
-  int n = static_cast<int>(x.numel());
+  int n = checked_numel_int(x, "activation input");
   auto out = make_node(x.shape(), any_requires_grad({&x}));
   fwd(x.n->data.data(), out->data.data(), n);
   out->parents = {x.n};
@@ -422,6 +511,8 @@ Tensor sigmoid(const Tensor& x) {
 }
 
 Tensor softmax_rows(const Tensor& x, int rows, int cols) {
+  if (rows <= 0 || cols <= 0 || x.numel() != static_cast<int64_t>(rows) * cols)
+    throw std::invalid_argument("softmax_rows dimensions do not match input");
   auto out = make_node(x.shape(), any_requires_grad({&x}));
   k_softmax_f<<<grid(rows), 256>>>(x.n->data.data(), out->data.data(), rows, cols);
   check_launch("softmax");
@@ -435,6 +526,11 @@ Tensor softmax_rows(const Tensor& x, int rows, int cols) {
 
 Tensor layer_norm(const Tensor& x, const Tensor& w, const Tensor& b,
                   int rows, int dim, float eps) {
+  if (rows <= 0 || dim <= 0 || !std::isfinite(eps) || eps <= 0.0f)
+    throw std::invalid_argument("invalid layer_norm parameters");
+  require_flat_size(x, static_cast<int64_t>(rows) * dim, "layer_norm input");
+  require_flat_size(w, dim, "layer_norm weight");
+  require_flat_size(b, dim, "layer_norm bias");
   auto out = make_node(x.shape(), any_requires_grad({&x, &w, &b}));
   auto mean = std::make_shared<core::CudaBuffer>(rows);
   auto rstd = std::make_shared<core::CudaBuffer>(rows);
@@ -572,8 +668,20 @@ __global__ void k_convt_dw(float* dw, const float* dout, const float* x,
 Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
               int Cin, int L, int Cout, int K, int stride, int pad,
               int dilation, int groups) {
-  int Lout = (L + 2 * pad - dilation * (K - 1) - 1) / stride + 1;
+  if (Cin <= 0 || L <= 0 || Cout <= 0 || K <= 0 || stride <= 0 || pad < 0 ||
+      dilation <= 0 || groups <= 0 || Cin % groups != 0 || Cout % groups != 0)
+    throw std::invalid_argument("invalid conv1d parameters");
+  require_flat_size(x, static_cast<int64_t>(Cin) * L, "conv1d input");
+  require_flat_size(w, static_cast<int64_t>(Cout) * (Cin / groups) * K, "conv1d weight");
   bool has_b = static_cast<bool>(b.n);
+  if (has_b) require_flat_size(b, Cout, "conv1d bias");
+  const int64_t numerator = static_cast<int64_t>(L) + 2LL * pad -
+                            static_cast<int64_t>(dilation) * (K - 1) - 1;
+  if (numerator < 0) throw std::invalid_argument("conv1d kernel exceeds padded input");
+  const int64_t lout64 = numerator / stride + 1;
+  if (lout64 <= 0 || lout64 > std::numeric_limits<int>::max())
+    throw std::length_error("conv1d output length is invalid");
+  int Lout = static_cast<int>(lout64);
   bool rg = any_requires_grad({&x, &w}) ||
             (has_b && (b.n->requires_grad || !b.n->parents.empty()));
   auto out = make_node({Cout, Lout}, rg);
@@ -590,7 +698,14 @@ Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
     if (has_b) k_bias_rows<<<grid(Cout * Lout), 256>>>(o->data.data(), pb->data.data(), Cout, Lout);
     check_launch("conv1d_im2col");
     if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
-    out->backward_fn = [o, px, pw, pb, col, Cin, L, Cout, K, stride, pad, dilation, Lout, rows] {
+    out->backward_fn = [o, px, pw, pb, Cin, L, Cout, K, stride, pad, dilation, Lout, rows] {
+      // Recompute im2col during backward rather than retaining every convolution's
+      // workspace for the lifetime of the graph. This bounds forward memory by the
+      // largest convolution workspace instead of their sum.
+      auto col = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * Lout);
+      k_im2col_1d<<<grid(rows * Lout), 256>>>(px->data.data(), col->data(), Cin, L, K,
+                                              stride, pad, dilation, Lout);
+      check_launch("conv1d_backward_im2col");
       // dW += dout[Cout,Lout] @ col^T[Lout, Cin*K]
       gemm_rm(false, true, Cout, rows, Lout, 1.0f, o->grad.data(), col->data(), 1.0f, pw->grad.data());
       // dcol = W^T[Cin*K,Cout] @ dout[Cout,Lout]; scatter into dx
@@ -624,8 +739,16 @@ Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
 
 Tensor conv_transpose1d(const Tensor& x, const Tensor& w, const Tensor& b,
                         int Cin, int L, int Cout, int K, int stride, int pad) {
-  int Lout = (L - 1) * stride - 2 * pad + K;
+  if (Cin <= 0 || L <= 0 || Cout <= 0 || K <= 0 || stride <= 0 || pad < 0)
+    throw std::invalid_argument("invalid conv_transpose1d parameters");
+  require_flat_size(x, static_cast<int64_t>(Cin) * L, "conv_transpose1d input");
+  require_flat_size(w, static_cast<int64_t>(Cin) * Cout * K, "conv_transpose1d weight");
   bool has_b = static_cast<bool>(b.n);
+  if (has_b) require_flat_size(b, Cout, "conv_transpose1d bias");
+  const int64_t lout64 = static_cast<int64_t>(L - 1) * stride - 2LL * pad + K;
+  if (lout64 <= 0 || lout64 > std::numeric_limits<int>::max())
+    throw std::length_error("conv_transpose1d output length is invalid");
+  int Lout = static_cast<int>(lout64);
   bool rg = any_requires_grad({&x, &w}) ||
             (has_b && (b.n->requires_grad || !b.n->parents.empty()));
   auto out = make_node({Cout, Lout}, rg);
@@ -676,6 +799,9 @@ __global__ void k_acc_scaled(float* dst, const float* src, float s, int n) {
 }
 
 Tensor transpose2d(const Tensor& x, int rows, int cols) {
+  if (rows <= 0 || cols <= 0)
+    throw std::invalid_argument("transpose2d dimensions must be positive");
+  require_flat_size(x, static_cast<int64_t>(rows) * cols, "transpose2d input");
   auto out = make_node({cols, rows}, any_requires_grad({&x}));
   k_transpose<<<grid(rows * cols), 256>>>(x.n->data.data(), out->data.data(), rows, cols);
   check_launch("transpose2d");
@@ -688,11 +814,15 @@ Tensor transpose2d(const Tensor& x, int rows, int cols) {
 }
 
 Tensor concat_rows(const Tensor& a, const Tensor& b, int cols) {
+  if (cols <= 0 || a.numel() % cols != 0 || b.numel() % cols != 0)
+    throw std::invalid_argument("concat_rows inputs do not match column count");
   int Ra = static_cast<int>(a.numel()) / cols;
   int Rb = static_cast<int>(b.numel()) / cols;
   auto out = make_node({Ra + Rb, cols}, any_requires_grad({&a, &b}));
-  cudaMemcpy(out->data.data(), a.n->data.data(), Ra * cols * sizeof(float), cudaMemcpyDeviceToDevice);
-  cudaMemcpy(out->data.data() + Ra * cols, b.n->data.data(), Rb * cols * sizeof(float), cudaMemcpyDeviceToDevice);
+  CK(cudaMemcpy(out->data.data(), a.n->data.data(), Ra * cols * sizeof(float),
+                cudaMemcpyDeviceToDevice));
+  CK(cudaMemcpy(out->data.data() + Ra * cols, b.n->data.data(), Rb * cols * sizeof(float),
+                cudaMemcpyDeviceToDevice));
   out->parents = {a.n, b.n};
   Node* o = out.get(); Node* pa = a.n.get(); Node* pb = b.n.get();
   int na = Ra * cols, nb = Rb * cols;
@@ -704,9 +834,14 @@ Tensor concat_rows(const Tensor& a, const Tensor& b, int cols) {
 }
 
 Tensor slice_rows(const Tensor& x, int start, int count, int cols) {
+  if (cols <= 0 || start < 0 || count <= 0 || x.numel() % cols != 0)
+    throw std::invalid_argument("invalid slice_rows parameters");
+  const int64_t rows = x.numel() / cols;
+  if (static_cast<int64_t>(start) + count > rows)
+    throw std::out_of_range("slice_rows exceeds input");
   auto out = make_node({count, cols}, any_requires_grad({&x}));
-  cudaMemcpy(out->data.data(), x.n->data.data() + start * cols,
-             count * cols * sizeof(float), cudaMemcpyDeviceToDevice);
+  CK(cudaMemcpy(out->data.data(), x.n->data.data() + start * cols,
+                count * cols * sizeof(float), cudaMemcpyDeviceToDevice));
   out->parents = {x.n};
   Node* o = out.get(); Node* px = x.n.get();
   int n = count * cols, off = start * cols;
@@ -717,12 +852,23 @@ Tensor slice_rows(const Tensor& x, int start, int count, int cols) {
 }
 
 Tensor embedding(const Tensor& table, const std::vector<int>& idx, int dim) {
+  require_rank(table, 2, "embedding table");
+  if (dim <= 0 || table.shape()[1] != dim || idx.empty())
+    throw std::invalid_argument("invalid embedding dimensions");
+  const int vocab = table.shape()[0];
+  for (int value : idx)
+    if (value < 0 || value >= vocab) throw std::out_of_range("embedding index out of range");
   int T = static_cast<int>(idx.size());
   auto out = make_node({T, dim}, any_requires_grad({&table}));
   int* d_idx_raw = nullptr;
-  cudaMalloc(&d_idx_raw, T * sizeof(int));
-  cudaMemcpy(d_idx_raw, idx.data(), T * sizeof(int), cudaMemcpyHostToDevice);
-  std::shared_ptr<int> d_idx(d_idx_raw, [](int* p) { if (p) cudaFree(p); });
+  CK(cudaMalloc(&d_idx_raw, T * sizeof(int)));
+  CK(cudaMemcpy(d_idx_raw, idx.data(), T * sizeof(int), cudaMemcpyHostToDevice));
+  std::shared_ptr<int> d_idx(d_idx_raw, [](int* p) {
+    if (!p) return;
+    cudaError_t e = cudaFree(p);
+    if (e != cudaSuccess)
+      fprintf(stderr, "autograd embedding cudaFree failed: %s\n", cudaGetErrorString(e));
+  });
   k_embed_f<<<grid(T * dim), 256>>>(table.n->data.data(), d_idx.get(), out->data.data(), T, dim);
   check_launch("embedding");
   out->parents = {table.n};
@@ -734,7 +880,8 @@ Tensor embedding(const Tensor& table, const std::vector<int>& idx, int dim) {
 }
 
 Tensor scale(const Tensor& x, float s) {
-  int n = static_cast<int>(x.numel());
+  if (!std::isfinite(s)) throw std::invalid_argument("scale must be finite");
+  int n = checked_numel_int(x, "scale input");
   auto out = make_node(x.shape(), any_requires_grad({&x}));
   k_scale<<<grid(n), 256>>>(x.n->data.data(), out->data.data(), s, n);
   check_launch("scale");
@@ -800,6 +947,11 @@ Tensor abs_op(const Tensor& x) {
 }
 
 Tensor frame(const Tensor& x, int T, int n_fft, int hop) {
+  if (T <= 0 || n_fft <= 0 || hop <= 0)
+    throw std::invalid_argument("invalid frame parameters");
+  require_tensor(x, "frame input");
+  const int64_t needed = static_cast<int64_t>(T - 1) * hop + n_fft;
+  if (needed > x.numel()) throw std::out_of_range("frame window exceeds input");
   auto out = make_node({T, n_fft}, any_requires_grad({&x}));
   k_frame_f<<<grid(T * n_fft), 256>>>(x.n->data.data(), out->data.data(), T, n_fft, hop);
   check_launch("frame");
@@ -837,6 +989,9 @@ __global__ void k_flip_rows_b(float* dx, const float* dy, int rows, int cols) {
   if (i < rows * cols) { int r = i / cols, c = i % cols; atomicAdd(&dx[r * cols + c], dy[(rows - 1 - r) * cols + c]); }
 }
 Tensor flip_rows(const Tensor& x, int rows, int cols) {
+  if (rows <= 0 || cols <= 0)
+    throw std::invalid_argument("flip_rows dimensions must be positive");
+  require_flat_size(x, static_cast<int64_t>(rows) * cols, "flip_rows input");
   auto out = make_node(x.shape(), any_requires_grad({&x}));
   k_flip_rows_f<<<grid(rows * cols), 256>>>(x.n->data.data(), out->data.data(), rows, cols);
   check_launch("flip_rows");
@@ -844,6 +999,44 @@ Tensor flip_rows(const Tensor& x, int rows, int cols) {
   Node* o = out.get(); Node* px = x.n.get();
   out->backward_fn = [o, px, rows, cols] {
     k_flip_rows_b<<<grid(rows * cols), 256>>>(px->grad.data(), o->grad.data(), rows, cols);
+  };
+  return Tensor(out);
+}
+
+__global__ void k_reflect_pad_end_f(const float* x, float* out, int length,
+                                    int target_length) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= target_length) return;
+  const int src = (i < length) ? i : (2 * length - 2 - i);
+  out[i] = x[src];
+}
+
+__global__ void k_reflect_pad_end_b(float* dx, const float* dout, int length,
+                                    int target_length) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= target_length) return;
+  const int src = (i < length) ? i : (2 * length - 2 - i);
+  atomicAdd(&dx[src], dout[i]);
+}
+
+Tensor reflect_pad_end(const Tensor& x, int target_len) {
+  require_rank(x, 2, "reflect_pad_end input");
+  if (x.shape()[0] != 1)
+    throw std::invalid_argument("reflect_pad_end expects shape [1, length]");
+  const int length = x.shape()[1];
+  if (target_len < length || target_len >= 2 * length)
+    throw std::invalid_argument("reflect_pad_end target is outside reflect range");
+  if (target_len == length) return x;
+  auto out = make_node({1, target_len}, any_requires_grad({&x}));
+  k_reflect_pad_end_f<<<grid(target_len), 256>>>(x.n->data.data(), out->data.data(),
+                                                length, target_len);
+  check_launch("reflect_pad_end");
+  out->parents = {x.n};
+  Node* o = out.get();
+  Node* px = x.n.get();
+  out->backward_fn = [o, px, length, target_len] {
+    k_reflect_pad_end_b<<<grid(target_len), 256>>>(px->grad.data(), o->grad.data(),
+                                                  length, target_len);
   };
   return Tensor(out);
 }
@@ -940,9 +1133,23 @@ __global__ void k_col2im_2d(float* dx, const float* dcol, int Cin, int H, int W,
 Tensor conv2d(const Tensor& x, const Tensor& w, const Tensor& b,
               int Cin, int H, int W, int Cout, int kh, int kw,
               int sh, int sw, int ph, int pw) {
-  int Hout = (H + 2 * ph - kh) / sh + 1;
-  int Wout = (W + 2 * pw - kw) / sw + 1;
+  if (Cin <= 0 || H <= 0 || W <= 0 || Cout <= 0 || kh <= 0 || kw <= 0 ||
+      sh <= 0 || sw <= 0 || ph < 0 || pw < 0)
+    throw std::invalid_argument("invalid conv2d parameters");
+  require_flat_size(x, static_cast<int64_t>(Cin) * H * W, "conv2d input");
+  require_flat_size(w, static_cast<int64_t>(Cout) * Cin * kh * kw, "conv2d weight");
   bool has_b = static_cast<bool>(b.n);
+  if (has_b) require_flat_size(b, Cout, "conv2d bias");
+  const int64_t hn = static_cast<int64_t>(H) + 2LL * ph - kh;
+  const int64_t wn = static_cast<int64_t>(W) + 2LL * pw - kw;
+  if (hn < 0 || wn < 0) throw std::invalid_argument("conv2d kernel exceeds padded input");
+  const int64_t hout64 = hn / sh + 1;
+  const int64_t wout64 = wn / sw + 1;
+  if (hout64 <= 0 || wout64 <= 0 || hout64 > std::numeric_limits<int>::max() ||
+      wout64 > std::numeric_limits<int>::max())
+    throw std::length_error("conv2d output dimensions are invalid");
+  int Hout = static_cast<int>(hout64);
+  int Wout = static_cast<int>(wout64);
   bool rg = any_requires_grad({&x, &w}) ||
             (has_b && (b.n->requires_grad || !b.n->parents.empty()));
   auto out = make_node({Cout, Hout, Wout}, rg);
@@ -959,7 +1166,11 @@ Tensor conv2d(const Tensor& x, const Tensor& w, const Tensor& b,
   if (has_b) k_bias_rows<<<grid(Cout * cols), 256>>>(o->data.data(), pbn->data.data(), Cout, cols);
   check_launch("conv2d_im2col");
   if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
-  out->backward_fn = [o, pxn, pwn, pbn, col, Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout, rows, cols] {
+  out->backward_fn = [o, pxn, pwn, pbn, Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout, rows, cols] {
+    auto col = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * cols);
+    k_im2col_2d<<<grid(rows * cols), 256>>>(pxn->data.data(), col->data(), Cin, H, W,
+                                           kh, kw, sh, sw, ph, pw, Hout, Wout);
+    check_launch("conv2d_backward_im2col");
     // dW += dout[Cout,cols] @ col^T[cols,rows]
     gemm_rm(false, true, Cout, rows, cols, 1.0f, o->grad.data(), col->data(), 1.0f, pwn->grad.data());
     // dcol = W^T[rows,Cout] @ dout[Cout,cols]; scatter into dx
@@ -1013,10 +1224,24 @@ __global__ void k_adamw(float* p, const float* g, float* m, float* v, float lr,
   p[i] -= lr * (mh / (sqrtf(vh) + eps) + wd * p[i]);
 }
 
+__global__ void k_grad_sq_acc(const float* grad, float* total, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) atomicAdd(total, grad[i] * grad[i]);
+}
+
+__global__ void k_scale_grad(float* grad, float scale, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) grad[i] *= scale;
+}
+
 AdamW::AdamW(std::vector<Tensor> params, float lr, float beta1, float beta2,
              float eps, float weight_decay)
     : params_(std::move(params)), lr_(lr), beta1_(beta1), beta2_(beta2),
       eps_(eps), wd_(weight_decay) {
+  if (params_.empty() || !std::isfinite(lr_) || lr_ <= 0.0f ||
+      beta1_ < 0.0f || beta1_ >= 1.0f || beta2_ < 0.0f || beta2_ >= 1.0f ||
+      !std::isfinite(eps_) || eps_ <= 0.0f || !std::isfinite(wd_) || wd_ < 0.0f)
+    throw std::invalid_argument("invalid AdamW parameters");
   m_.resize(params_.size());
   v_.resize(params_.size());
   for (std::size_t i = 0; i < params_.size(); ++i) {
@@ -1030,6 +1255,33 @@ AdamW::AdamW(std::vector<Tensor> params, float lr, float beta1, float beta2,
 
 void AdamW::zero_grad() {
   for (auto& p : params_) p.n->ensure_grad();
+}
+
+float AdamW::clip_grad_norm(float max_norm) {
+  if (!std::isfinite(max_norm) || max_norm <= 0.0f)
+    throw std::invalid_argument("gradient max_norm must be finite and positive");
+  core::CudaBuffer sum_sq(1);
+  sum_sq.zero();
+  for (auto& param : params_) {
+    const int n = checked_numel_int(param, "optimizer parameter");
+    if (param.n->grad.size() < static_cast<std::size_t>(n)) continue;
+    k_grad_sq_acc<<<grid(n), 256>>>(param.n->grad.data(), sum_sq.data(), n);
+    check_launch("gradient norm");
+  }
+  float host_sum = 0.0f;
+  sum_sq.copy_to_host(&host_sum, 1);
+  const float norm = std::sqrt(host_sum);
+  if (!std::isfinite(norm)) throw std::runtime_error("non-finite gradient norm");
+  if (norm > max_norm) {
+    const float factor = max_norm / (norm + 1e-12f);
+    for (auto& param : params_) {
+      const int n = checked_numel_int(param, "optimizer parameter");
+      if (param.n->grad.size() < static_cast<std::size_t>(n)) continue;
+      k_scale_grad<<<grid(n), 256>>>(param.n->grad.data(), factor, n);
+      check_launch("gradient clipping");
+    }
+  }
+  return norm;
 }
 
 void AdamW::step() {

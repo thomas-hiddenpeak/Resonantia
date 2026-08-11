@@ -11,6 +11,7 @@ Run:
       --with huggingface-hub convert_roformer_weights.py
 """
 import json
+import hashlib
 import os
 import sys
 import urllib.request
@@ -22,19 +23,32 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import save_file
 
 REF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roformer_ref")
+MSST_REVISION = "e247dfe4abc1f17c69dff719207fe045dc04413a"
+MSST_FILES = {
+    "mel_band_roformer.py": "3b4a57ab268933900172e05fb76dd9e8acc1eb770c745d583a4e42b94b79ec15",
+    "attend.py": "0459d799ade55541df2994b0becf7aec12214491360c5a06e346f6d615eaed15",
+}
 
 
 def _bootstrap_msst_code():
-    """Fetch the version-matched MSST model code (matches the checkpoint) if absent."""
-    base = "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/models/bs_roformer"
+    """Fetch and verify the exact reviewed MSST source revision."""
+    base = ("https://raw.githubusercontent.com/ZFTurbo/"
+            f"Music-Source-Separation-Training/{MSST_REVISION}/models/bs_roformer")
     pkg = os.path.join(REF_DIR, "models", "bs_roformer")
     os.makedirs(pkg, exist_ok=True)
     for d in (os.path.join(REF_DIR, "models"), pkg):
         open(os.path.join(d, "__init__.py"), "a").close()
-    for fn in ("mel_band_roformer.py", "attend.py"):
+    for fn, expected_sha256 in MSST_FILES.items():
         dst = os.path.join(pkg, fn)
         if not os.path.exists(dst):
             urllib.request.urlretrieve(f"{base}/{fn}", dst)
+        with open(dst, "rb") as source:
+            actual_sha256 = hashlib.sha256(source.read()).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                f"refusing to import {dst}: SHA-256 {actual_sha256} does not match "
+                f"the pinned source {expected_sha256}"
+            )
 
 
 _bootstrap_msst_code()
@@ -63,6 +77,13 @@ REGISTRY = {
     # num_stems=2 (Vocals/Instrumental); output stem 0 (lead vocal) for de-harmony.
     "karaoke": ("karaoke_roformer", "becruily/mel-band-roformer-karaoke",
                 "mel_band_roformer_karaoke_becruily.ckpt", "config_karaoke_becruily.yaml", 0),
+}
+REVISIONS = {
+    "dereverb": "cef05ad2b5b3145ea5c149d3ad5d1f8439b34d06",
+    "vocals": "af457f56e56eb23fa8322929eef6a63b455e5858",
+    "denoise": "4e39bc34a36dda8e73254cd8f5d44f15de2bd7b9",
+    "deecho": "9c83bf27196213e6107cf0de5ff2d06d56a46876",
+    "karaoke": "0c149975cfaa261c7d87baf54330a9da85bcf888",
 }
 # Registry key -> (pipeline stage/task, human label). Written into <name>.json so
 # the C++ SepModelRegistry (spec 004 S7) can offer the model as a per-stage choice.
@@ -93,14 +114,16 @@ def main():
     if key not in REGISTRY:
         raise SystemExit(f"unknown model '{key}'; known: {list(REGISTRY)}")
     entry = REGISTRY[key]
+    revision = REVISIONS[key]
     name, REPO, CKPT, YAML = entry[:4]
     target_stem = entry[4] if len(entry) > 4 else 0  # which stem to output (multi-stem)
     is_ref = key == "dereverb"  # only the anvuew dereverb model backs the alignment test
-    cfg = yaml.load(open(hf_hub_download(REPO, YAML)), Loader=yaml.FullLoader)
+    cfg = yaml.safe_load(open(hf_hub_download(REPO, YAML, revision=revision)))
     mcfg = {k: v for k, v in cfg["model"].items() if k in VALID}
     mcfg.update(flash_attn=False, attn_dropout=0.0, ff_dropout=0.0)
     model = MelBandRoformer(**mcfg).eval()
-    sd = torch.load(hf_hub_download(REPO, CKPT), map_location="cpu")
+    sd = torch.load(hf_hub_download(REPO, CKPT, revision=revision),
+                    map_location="cpu", weights_only=True)
     if "state_dict" in sd:
         sd = sd["state_dict"]
     sd = {k[6:] if k.startswith("model.") else k: v for k, v in sd.items()}
@@ -134,7 +157,13 @@ def main():
     np.asarray(dim_inputs, dtype=np.int64).tofile(os.path.join(MODELS, f"{name}_dim_inputs.i64"))
     # Runtime config for the C++ runner: [nfft,hop,dim,depth,num_bands,heads,dim_head,mask_depth,ff_mult,sr,chunk_size,target_stem]
     ff_mult = int(cfg["model"].get("mlp_expansion_factor", 4))
-    chunk_size = int(cfg.get("audio", {}).get("chunk_size", mcfg["sample_rate"] * 8))
+    # The CUDA runner uses full O(T^2) time attention. Four seconds keeps the
+    # score tensor bounded on commodity GPUs; the runtime also clamps legacy
+    # sidecars that were exported with substantially larger chunks.
+    chunk_size = min(
+        int(cfg.get("audio", {}).get("chunk_size", mcfg["sample_rate"] * 4)),
+        int(mcfg["sample_rate"] * 4),
+    )
     cfg_i64 = np.asarray([mcfg["stft_n_fft"], mcfg["stft_hop_length"], mcfg["dim"],
                           mcfg["depth"], mcfg["num_bands"], mcfg["heads"], mcfg["dim_head"],
                           mcfg["mask_estimator_depth"], ff_mult, mcfg["sample_rate"],

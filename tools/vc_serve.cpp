@@ -1,603 +1,147 @@
 /**
  * @file vc_serve.cpp
- * @brief Pure-C++ HTTP server that orchestrates the full Resonantia workflow.
- *
- * Serves the WebUI and drives training + inference by spawning the verified
- * CLI tools (vc_preprocess, vc_train, build_index, vc_convert) as subprocesses.
- * No inline model loading -> no GPU contention with training; each stage reuses
- * an already-tested binary. Hand-written HTTP/1.1 over POSIX sockets, no
- * third-party dependency, no Python at runtime.
- *
- * Endpoints:
- *   GET  /                     -> webui/index.html (+ static assets)
- *   GET  /api/voices           -> {"voices":[...],"training":{...}}
- *   POST /api/train            -> multipart {files[], name, mode, steps, seg}
- *   GET  /api/train/status     -> {"stage","running","done","error","log"}
- *   POST /api/preprocess       -> multipart {audio, pp_*} -> cleaned WAV (preview)
- *   POST /api/convert          -> multipart {audio, voice, f0_up_key, pp_*, ...} -> WAV
- *
- * Usage:
- *   vc_serve [--port 8080] [--webroot webui] [--repo <path>]
+ * @brief Startup configuration and assembly for the Resonantia Web service.
  */
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
-#include <algorithm>
-#include <atomic>
-#include <cctype>
-#include <csignal>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <exception>
 #include <filesystem>
-#include <fstream>
-#include <mutex>
-#include <sstream>
+#include <memory>
 #include <string>
-#include <thread>
-#include <vector>
+#include <utility>
 
-#include "voxmutatio/separation/sep_registry.h"
+#include "tools/web/http_transport.h"
+#include "tools/web/web_service.h"
+#include "tools/web/workflow_support.h"
 
 namespace fs = std::filesystem;
 
 namespace {
 
-// ---- resolved paths (set in main) ----
-struct Paths {
-    std::string repo, models, build, runs, webroot;
-    std::string hubert, rmvpe, gmodel, dmodel;
-} g;
+struct StartupConfig {
+    std::string host = "0.0.0.0";
+    int port = 8080;
+    std::string webroot = "webui";
+    std::string repo;
+    std::string auth_token;
+};
 
-// ---- single training job state ----
-struct Job {
-    std::mutex mu;
-    std::string name, stage = "idle";
-    std::atomic<bool> running{false};
-    bool done = false, error = false;
-} g_job;
-
-// Serialises every GPU subprocess (train/step/convert/preprocess) so overlapping
-// requests never contend for the single GPU. Interactive ops try_lock -> 409.
-std::mutex g_gpu_mu;
-
-std::string lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
-    return s;
-}
-
-// Only allow a safe subset for names used in shell commands / paths.
-bool safe_name(const std::string& s) {
-    if (s.empty() || s.size() > 64) return false;
-    for (char c : s)
-        if (!(std::isalnum((unsigned char)c) || c == '_' || c == '-')) return false;
-    return true;
-}
-std::string safe_filename(const std::string& s) {
-    std::string base = fs::path(s).filename().string(), out;
-    for (char c : base)
-        if (std::isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.') out += c;
-    return out.empty() ? "clip.wav" : out;
-}
-std::string json_escape(const std::string& s) {
-    std::string o;
-    for (char c : s) {
-        switch (c) {
-            case '"': o += "\\\""; break;
-            case '\\': o += "\\\\"; break;
-            case '\n': o += "\\n"; break;
-            case '\r': break;
-            case '\t': o += "\\t"; break;
-            default:
-                if ((unsigned char)c < 0x20) { char b[8]; std::snprintf(b, 8, "\\u%04x", c); o += b; }
-                else o += c;
+bool parse_startup_config(int argc, char** argv, StartupConfig& config, int& exit_code) {
+    for (int index = 1; index < argc; ++index) {
+        const std::string argument = argv[index];
+        if (argument == "--help" || argument == "-h") {
+            std::printf("Usage: vc_serve [--host IPv4] [--port 8080] [--webroot webui] "
+                        "[--repo PATH] [--auth-token TOKEN]\n");
+            exit_code = 0;
+            return false;
         }
-    }
-    return o;
-}
-
-// ---- HTTP ----
-struct Request { std::string method, path, query, content_type, body; };
-struct Part { std::string name, filename, data; };
-
-bool read_request(int fd, Request& req) {
-    std::string buf; char tmp[8192];
-    size_t he = std::string::npos;
-    while (he == std::string::npos) {
-        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-        if (n <= 0) return false;
-        buf.append(tmp, n);
-        he = buf.find("\r\n\r\n");
-        if (buf.size() > (256u << 20)) return false;
-    }
-    std::string head = buf.substr(0, he), body = buf.substr(he + 4);
-    std::istringstream hs(head); std::string line; std::getline(hs, line);
-    { std::istringstream ls(line); std::string target; ls >> req.method >> target;
-      auto q = target.find('?');
-      if (q == std::string::npos) req.path = target;
-      else { req.path = target.substr(0, q); req.query = target.substr(q + 1); } }
-    size_t clen = 0;
-    while (std::getline(hs, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        auto c = line.find(':'); if (c == std::string::npos) continue;
-        std::string k = lower(line.substr(0, c)), v = line.substr(c + 1);
-        while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
-        if (k == "content-length") { try { clen = std::stoul(v); } catch (...) { clen = 0; } }
-        else if (k == "content-type") req.content_type = v;
-    }
-    if (clen > (512u << 20)) return false;  // cap body at 512 MB
-    while (body.size() < clen) { ssize_t n = recv(fd, tmp, sizeof(tmp), 0); if (n <= 0) break; body.append(tmp, n); }
-    req.body = std::move(body);
-    return true;
-}
-
-std::vector<Part> parse_multipart(const std::string& body, const std::string& boundary) {
-    std::vector<Part> parts; std::string delim = "--" + boundary;
-    size_t pos = body.find(delim);
-    while (pos != std::string::npos) {
-        pos += delim.size();
-        if (body.compare(pos, 2, "--") == 0) break;
-        if (body.compare(pos, 2, "\r\n") == 0) pos += 2;
-        size_t hend = body.find("\r\n\r\n", pos); if (hend == std::string::npos) break;
-        std::string headers = body.substr(pos, hend - pos);
-        size_t cstart = hend + 4, next = body.find(delim, cstart);
-        if (next == std::string::npos) break;
-        size_t cend = next; if (cend >= 2 && body.compare(cend - 2, 2, "\r\n") == 0) cend -= 2;
-        Part part; part.data = body.substr(cstart, cend - cstart);
-        std::string h = lower(headers);
-        auto grab = [&](const std::string& key) -> std::string {
-            size_t k = h.find(key + "=\""); if (k == std::string::npos) return "";
-            k += key.size() + 2; size_t e = headers.find('"', k);
-            return (e == std::string::npos) ? "" : headers.substr(k, e - k);
-        };
-        part.name = grab("name"); part.filename = grab("filename");
-        parts.push_back(std::move(part)); pos = next;
-    }
-    return parts;
-}
-
-void send_response(int fd, int status, const char* text, const std::string& ctype, const std::string& body) {
-    std::ostringstream os;
-    os << "HTTP/1.1 " << status << " " << text << "\r\nContent-Type: " << ctype
-       << "\r\nContent-Length: " << body.size() << "\r\nConnection: close\r\n\r\n";
-    std::string h = os.str();
-    send(fd, h.data(), h.size(), MSG_NOSIGNAL);
-    if (!body.empty()) send(fd, body.data(), body.size(), MSG_NOSIGNAL);
-}
-void send_json(int fd, const std::string& j) { send_response(fd, 200, "OK", "application/json", j); }
-
-std::string read_file(const std::string& p) {
-    std::ifstream f(p, std::ios::binary); if (!f) return "";
-    std::ostringstream ss; ss << f.rdbuf(); return ss.str();
-}
-std::string log_tail(const std::string& p, size_t n = 600) {
-    std::string s = read_file(p);
-    return s.size() > n ? s.substr(s.size() - n) : s;
-}
-std::string mime_for(const std::string& p) {
-    if (p.size() >= 5 && p.substr(p.size() - 5) == ".html") return "text/html; charset=utf-8";
-    if (p.size() >= 3 && p.substr(p.size() - 3) == ".js") return "application/javascript";
-    if (p.size() >= 4 && p.substr(p.size() - 4) == ".css") return "text/css";
-    if (p.size() >= 4 && p.substr(p.size() - 4) == ".wav") return "audio/wav";
-    return "application/octet-stream";
-}
-void serve_static(int fd, const std::string& path) {
-    std::string rel = (path == "/") ? "/index.html" : path;
-    if (rel.find("..") != std::string::npos) { send_response(fd, 403, "Forbidden", "text/plain", "no"); return; }
-    std::string full = g.webroot + rel, content = read_file(full);
-    if (content.empty()) { send_response(fd, 404, "Not Found", "text/plain", "not found"); return; }
-    send_response(fd, 200, "OK", mime_for(full), content);
-}
-std::string field(const std::vector<Part>& ps, const std::string& n, const std::string& def) {
-    for (auto& p : ps) if (p.name == n && p.filename.empty()) return p.data;
-    return def;
-}
-std::string query_get(const std::string& q, const std::string& key) {
-    std::istringstream ss(q); std::string kv;
-    while (std::getline(ss, kv, '&')) { auto e = kv.find('='); if (e != std::string::npos && kv.substr(0, e) == key) return kv.substr(e + 1); }
-    return "";
-}
-
-// ---- workflow ----
-void set_stage(const std::string& s) { std::lock_guard<std::mutex> lk(g_job.mu); g_job.stage = s; }
-void finish(const std::string& stage, bool error) {
-    std::lock_guard<std::mutex> lk(g_job.mu);
-    g_job.stage = stage; g_job.error = error; g_job.done = true; g_job.running = false;
-}
-
-void run_training(std::string name, std::string mode, int steps, int seg, int epochs, bool separate, bool dereverb, bool deecho, bool denoise, bool deharmony, bool vad) {
-    std::lock_guard<std::mutex> gpu_lk(g_gpu_mu);  // serialise GPU use
-    std::string dir = g.runs + "/" + name, log = dir + "/train.log";
-    std::string clips = dir + "/clips", model = dir + "/model.safetensors", index = dir + "/model.index";
-    auto sh = [&](const std::string& cmd) {
-        std::string full = "{ " + cmd + " ; } >> '" + log + "' 2>&1";
-        return std::system(full.c_str());
-    };
-    { std::ofstream(log, std::ios::trunc) << "[serve] training '" << name << "' mode=" << mode
-        << (epochs > 0 ? " epochs=" + std::to_string(epochs) : " steps=" + std::to_string(steps))
-        << " seg=" << seg << (separate ? " +separate" : "") << "\n"; }
-
-    // If the material was preprocessed step-by-step (runs/<name>/work), slice that
-    // (separation already applied); otherwise slice raw and apply separation flags.
-    bool preprocessed = fs::exists(dir + "/work") && !fs::is_empty(dir + "/work");
-    std::string src = preprocessed ? dir + "/work" : dir + "/raw";
-    set_stage((!preprocessed && (separate || dereverb || deecho || denoise)) ? "separating" : "preprocessing");
-    std::string sep_flags;
-    if (!preprocessed) {
-        if (separate) sep_flags += " --separate";
-        if (deharmony) sep_flags += " --deharmony";
-        if (dereverb) sep_flags += " --dereverb";
-        if (deecho) sep_flags += " --deecho";
-        if (denoise) sep_flags += " --denoise";
-        if (!sep_flags.empty()) sep_flags += " --sep-dir '" + g.models + "/separation'";
-    }
-    // Smart slicing (Silero VAD) supersedes RMS --trim when enabled.
-    std::string slice_flags = vad ? " --vad --vad-dir '" + g.models + "/vad'" : " --trim";
-    int rc = sh("'" + g.build + "/vc_preprocess' --input '" + src + "' --output-dir '" + clips +
-                "' --sr 40000 --seg-sec 3.0" + slice_flags + sep_flags +
-                " 2>&1 | grep --line-buffered -E 'clip|Wrote|error|skip|separation|reverb|noise|speech|enabled'");
-    if (rc != 0) { finish("error", true); return; }
-
-    set_stage("training");
-    std::string t = "'" + g.build + "/vc_train'";
-    if (mode == "gan") t += " --gan --dmodel '" + g.dmodel + "'";
-    t += " --hubert '" + g.hubert + "' --rmvpe '" + g.rmvpe + "' --pretrained '" + g.gmodel +
-         "' --target '" + clips + "' --out '" + model + "'" +
-         (epochs > 0 ? " --epochs " + std::to_string(epochs) : " --steps " + std::to_string(steps)) +
-         " --seg " + std::to_string(seg) +
-         " 2>&1 | grep --line-buffered -E 'step|mel|Device|frames|Epochs|Exported|clips|done|error|GAN'";
-    rc = sh(t);
-    if (rc != 0) { finish("error", true); return; }
-
-    set_stage("indexing");
-    sh("'" + g.build + "/build_index' --hubert '" + g.hubert + "' --input-dir '" + clips +
-       "' --output '" + index + "' 2>&1 | grep --line-buffered -E 'Wrote|index|error|frames'");
-
-    std::ofstream(log, std::ios::app) << "[serve] done.\n";
-    finish("done", false);
-}
-
-std::string voices_json() {
-    std::string j = "{\"base\":\"base (pretrained)\",\"voices\":[";
-    bool first = true;
-    if (fs::is_directory(g.runs)) {
-        std::vector<std::string> names;
-        for (auto& e : fs::directory_iterator(g.runs))
-            if (e.is_directory() && fs::exists(e.path() / "model.safetensors"))
-                names.push_back(e.path().filename().string());
-        std::sort(names.begin(), names.end());
-        for (auto& n : names) { if (!first) j += ","; j += "\"" + json_escape(n) + "\""; first = false; }
-    }
-    { std::lock_guard<std::mutex> lk(g_job.mu);
-      j += "],\"training\":{\"running\":" + std::string(g_job.running ? "true" : "false") +
-           ",\"name\":\"" + json_escape(g_job.name) + "\",\"stage\":\"" + json_escape(g_job.stage) + "\"}}"; }
-    return j;
-}
-
-// Installed separation models grouped by stage, for the WebUI per-stage picker.
-std::string sep_models_json() {
-    auto models = voxmutatio::separation::list_sep_models(g.models + "/separation");
-    std::string j = "{";
-    bool first_task = true;
-    for (const auto& task : voxmutatio::separation::sep_tasks()) {
-        if (!first_task) j += ",";
-        first_task = false;
-        j += "\"" + json_escape(task) + "\":[";
-        bool first = true;
-        for (const auto& m : models) {
-            if (m.task != task) continue;
-            if (!first) j += ",";
-            first = false;
-            j += "{\"name\":\"" + json_escape(m.name) + "\",\"label\":\"" + json_escape(m.label) + "\"}";
+        if (argument != "--host" && argument != "--port" && argument != "--webroot" &&
+            argument != "--repo" && argument != "--auth-token") {
+            std::fprintf(stderr, "Unknown argument: %s\n", argument.c_str());
+            exit_code = 1;
+            return false;
         }
-        j += "]";
-    }
-    j += "}";
-    return j;
-}
-
-void run_step(std::string name, std::string step, std::string model) {
-    std::lock_guard<std::mutex> gpu_lk(g_gpu_mu);  // serialise GPU use
-    std::string dir = g.runs + "/" + name, work = dir + "/work", tmp = dir + "/work_tmp", log = dir + "/train.log";
-    std::ofstream(log, std::ios::app) << "[serve] preprocess step '" << step << "'"
-        << (model.empty() ? "" : " model '" + model + "'") << " on '" << name << "'\n";
-    set_stage("step:" + step);
-    fs::remove_all(tmp); fs::create_directories(tmp);
-    std::string flag = step == "separate" ? "--separate" : step == "dereverb" ? "--dereverb"
-                     : step == "deecho" ? "--deecho"
-                     : step == "deharmony" ? "--deharmony" : "--denoise";
-    std::string model_flag = model.empty() ? "" : (" --" + step + "-model '" + model + "'");
-    int rc = std::system(("{ '" + g.build + "/vc_preprocess' --input '" + work + "' --output-dir '" + tmp +
-        "' --sr 44100 --no-slice " + flag + model_flag + " --sep-dir '" + g.models + "/separation' 2>&1 | " +
-        "grep --line-buffered -E 'processed|error|enabled' ; } >> '" + log + "' 2>&1").c_str());
-    if (rc != 0 || fs::is_empty(tmp)) { fs::remove_all(tmp); finish("error", true); return; }
-    fs::remove_all(work); fs::rename(tmp, work);
-    std::ofstream(dir + "/steps.txt", std::ios::app) << step << "\n";
-    finish("step-done", false);
-}
-
-// POST /api/material : multipart {name, files[]} -> store raw + init work set.
-void handle_material(int fd, const Request& req) {
-    size_t b = req.content_type.find("boundary="); if (b == std::string::npos) { send_response(fd, 400, "Bad Request", "text/plain", "no boundary"); return; }
-    std::string boundary = req.content_type.substr(b + 9);
-    if (!boundary.empty() && boundary.front() == '"') boundary = boundary.substr(1, boundary.size() - 2);
-    auto parts = parse_multipart(req.body, boundary);
-    std::string name = field(parts, "name", "");
-    if (!safe_name(name)) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"invalid name\"}"); return; }
-    std::string dir = g.runs + "/" + name, raw = dir + "/raw", work = dir + "/work";
-    fs::remove_all(work); fs::remove_all(raw); fs::create_directories(raw); fs::create_directories(work);
-    fs::remove(dir + "/steps.txt");
-    int nfiles = 0;
-    for (auto& p : parts)
-        if (!p.filename.empty() && !p.data.empty()) {
-            std::string fn = safe_filename(p.filename);
-            { std::ofstream o(raw + "/" + fn, std::ios::binary); o.write(p.data.data(), p.data.size()); }
-            fs::copy_file(raw + "/" + fn, work + "/" + fn, fs::copy_options::overwrite_existing);
-            ++nfiles;
+        if (index + 1 >= argc) {
+            std::fprintf(stderr, "Missing value for %s\n", argument.c_str());
+            exit_code = 1;
+            return false;
         }
-    if (nfiles == 0) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"no audio files\"}"); return; }
-    send_json(fd, "{\"name\":\"" + json_escape(name) + "\",\"files\":" + std::to_string(nfiles) + "}");
-}
-
-// POST /api/step : multipart {name, step} -> apply one separation step to the work set.
-void handle_step(int fd, const Request& req) {
-    if (g_job.running) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"busy\"}"); return; }
-    size_t b = req.content_type.find("boundary="); if (b == std::string::npos) { send_response(fd, 400, "Bad Request", "text/plain", "no boundary"); return; }
-    std::string boundary = req.content_type.substr(b + 9);
-    if (!boundary.empty() && boundary.front() == '"') boundary = boundary.substr(1, boundary.size() - 2);
-    auto parts = parse_multipart(req.body, boundary);
-    std::string name = field(parts, "name", ""), step = field(parts, "step", "");
-    if (!safe_name(name) || !fs::exists(g.runs + "/" + name + "/work")) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"upload material first\"}"); return; }
-    if (step != "separate" && step != "dereverb" && step != "deecho" && step != "denoise" && step != "deharmony") { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown step\"}"); return; }
-    std::string model = field(parts, "model", "");
-    if (!model.empty() &&
-        !voxmutatio::separation::sep_model_available(g.models + "/separation", step, model)) {
-        send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown model\"}"); return;
-    }
-    bool expected = false;
-    if (!g_job.running.compare_exchange_strong(expected, true)) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"busy\"}"); return; }
-    { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "step:" + step; g_job.done = false; g_job.error = false; }
-    std::thread(run_step, name, step, model).detach();
-    send_json(fd, "{\"step\":\"" + json_escape(step) + "\"}");
-}
-
-// GET /api/preview?name=X : return the first work-set file as WAV for listening.
-void handle_preview(int fd, const Request& req) {
-    std::string name = query_get(req.query, "name");
-    if (!safe_name(name)) { send_response(fd, 400, "Bad Request", "text/plain", "bad name"); return; }
-    std::string work = g.runs + "/" + name + "/work";
-    if (!fs::exists(work)) { send_response(fd, 404, "Not Found", "text/plain", "no material"); return; }
-    std::string first;
-    for (auto& e : fs::directory_iterator(work)) { std::string ext = e.path().extension().string();
-        if (ext == ".wav" || ext == ".flac") { first = e.path().string(); break; } }
-    if (first.empty()) { send_response(fd, 404, "Not Found", "text/plain", "empty"); return; }
-    send_response(fd, 200, "OK", "audio/wav", read_file(first));
-}
-
-void handle_train(int fd, const Request& req) {
-    if (g_job.running) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"a training job is already running\"}"); return; }
-    size_t b = req.content_type.find("boundary="); if (b == std::string::npos) { send_response(fd, 400, "Bad Request", "text/plain", "no boundary"); return; }
-    std::string boundary = req.content_type.substr(b + 9);
-    if (!boundary.empty() && boundary.front() == '"') boundary = boundary.substr(1, boundary.size() - 2);
-    auto parts = parse_multipart(req.body, boundary);
-
-    std::string name = field(parts, "name", ""), mode = field(parts, "mode", "decoder");
-    int steps = std::atoi(field(parts, "steps", "300").c_str());
-    int seg = std::atoi(field(parts, "seg", "40").c_str());
-    int epochs = std::atoi(field(parts, "epochs", "0").c_str());
-    bool separate = field(parts, "separate", "0") == "1";
-    bool dereverb = field(parts, "dereverb", "0") == "1";
-    bool deecho = field(parts, "deecho", "0") == "1";
-    bool denoise = field(parts, "denoise", "0") == "1";
-    bool deharmony = field(parts, "deharmony", "0") == "1";
-    bool vad = field(parts, "vad", "0") == "1";
-    if (!safe_name(name)) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"invalid voice name (letters, digits, _ or - only)\"}"); return; }
-    if (mode != "decoder" && mode != "gan") mode = "decoder";
-    steps = std::max(1, std::min(steps, 100000));
-    seg = std::max(8, std::min(seg, 200));
-    epochs = std::max(0, std::min(epochs, 2000));
-
-    std::string raw = g.runs + "/" + name + "/raw";
-    fs::create_directories(raw);
-    int nfiles = 0;
-    for (auto& p : parts)
-        if (!p.filename.empty() && !p.data.empty()) {
-            std::ofstream o(raw + "/" + safe_filename(p.filename), std::ios::binary);
-            o.write(p.data.data(), p.data.size()); ++nfiles;
-        }
-    bool has_work = fs::exists(g.runs + "/" + name + "/work") && !fs::is_empty(g.runs + "/" + name + "/work");
-    if (nfiles == 0 && !has_work) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"no audio files uploaded\"}"); return; }
-
-    bool expected = false;
-    if (!g_job.running.compare_exchange_strong(expected, true)) {
-        send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"a training job is already running\"}"); return; }
-    { std::lock_guard<std::mutex> lk(g_job.mu); g_job.name = name; g_job.stage = "queued"; g_job.done = false; g_job.error = false; }
-    std::thread(run_training, name, mode, steps, seg, epochs, separate, dereverb, deecho, denoise, deharmony, vad).detach();
-    send_json(fd, "{\"job\":\"" + json_escape(name) + "\",\"files\":" + std::to_string(nfiles) + "}");
-}
-
-void handle_status(int fd, const Request& req) {
-    std::string qn = query_get(req.query, "name");
-    std::string stage, jname; bool running, done, error;
-    { std::lock_guard<std::mutex> lk(g_job.mu); stage = g_job.stage; jname = g_job.name; running = g_job.running; done = g_job.done; error = g_job.error; }
-    std::string which = qn.empty() ? jname : qn, logtail;
-    if (safe_name(which)) {
-        std::string all = read_file(g.runs + "/" + which + "/train.log");
-        if (all.size() > 4000) all = all.substr(all.size() - 4000);
-        logtail = all;
-    }
-    send_json(fd, std::string("{\"name\":\"") + json_escape(jname) + "\",\"stage\":\"" + json_escape(stage) +
-        "\",\"running\":" + (running ? "true" : "false") + ",\"done\":" + (done ? "true" : "false") +
-        ",\"error\":" + (error ? "true" : "false") + ",\"log\":\"" + json_escape(logtail) + "\"}");
-}
-
-// Apply selected SOTA input preprocessing (vocal/deharmony/dereverb/denoise) to
-// `in`, writing a cleaned full-length WAV path to `cleaned`. cleaned=in if none.
-bool preprocess_audio_file(const std::string& in, const std::string& tag, bool sep,
-                           bool deharm, bool derev, bool deecho, bool denoise, std::string& cleaned) {
-    if (!(sep || deharm || derev || deecho || denoise)) { cleaned = in; return true; }
-    std::string outdir = "/tmp/vcserve_pp_" + tag;
-    fs::remove_all(outdir); fs::create_directories(outdir);
-    std::string flags;
-    if (sep) flags += " --separate";
-    if (deharm) flags += " --deharmony";
-    if (derev) flags += " --dereverb";
-    if (deecho) flags += " --deecho";
-    if (denoise) flags += " --denoise";
-    std::string cmd = "'" + g.build + "/vc_preprocess' --input '" + in + "' --output-dir '" + outdir +
-        "' --sr 40000 --no-slice" + flags + " --sep-dir '" + g.models + "/separation'" +
-        " > /tmp/vcserve_pp.log 2>&1";
-    if (std::system(cmd.c_str()) != 0) return false;
-    for (auto& e : fs::directory_iterator(outdir))
-        if (e.path().extension() == ".wav") { cleaned = e.path().string(); return true; }
-    return false;
-}
-
-// POST /api/preprocess : multipart {audio, pp_*} -> cleaned WAV (preview, no conversion).
-void handle_preprocess(int fd, const Request& req) {
-    size_t b = req.content_type.find("boundary="); if (b == std::string::npos) { send_response(fd, 400, "Bad Request", "text/plain", "no boundary"); return; }
-    std::string boundary = req.content_type.substr(b + 9);
-    if (!boundary.empty() && boundary.front() == '"') boundary = boundary.substr(1, boundary.size() - 2);
-    auto parts = parse_multipart(req.body, boundary);
-    const Part* audio = nullptr;
-    for (auto& p : parts) if (!p.filename.empty()) { audio = &p; break; }
-    if (!audio) { send_response(fd, 400, "Bad Request", "text/plain", "no audio"); return; }
-    std::unique_lock<std::mutex> gpu_lk(g_gpu_mu, std::try_to_lock);
-    if (!gpu_lk.owns_lock()) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"GPU 忙（正在训练或转换），请稍候重试\"}"); return; }
-    std::string in = "/tmp/vcserve_ppin.wav", cleaned;
-    { std::ofstream o(in, std::ios::binary); o.write(audio->data.data(), audio->data.size()); }
-    bool sep = field(parts, "pp_separate", "0") == "1", deharm = field(parts, "pp_deharmony", "0") == "1";
-    bool derev = field(parts, "pp_dereverb", "0") == "1", denoise = field(parts, "pp_denoise", "0") == "1";
-    bool deecho = field(parts, "pp_deecho", "0") == "1";
-    if (!preprocess_audio_file(in, "preview", sep, deharm, derev, deecho, denoise, cleaned)) {
-        send_response(fd, 500, "Internal Server Error", "text/plain", "预处理失败：" + log_tail("/tmp/vcserve_pp.log")); return; }
-    send_response(fd, 200, "OK", "audio/wav", read_file(cleaned));
-}
-
-void handle_convert(int fd, const Request& req) {
-    size_t b = req.content_type.find("boundary="); if (b == std::string::npos) { send_response(fd, 400, "Bad Request", "text/plain", "no boundary"); return; }
-    std::string boundary = req.content_type.substr(b + 9);
-    if (!boundary.empty() && boundary.front() == '"') boundary = boundary.substr(1, boundary.size() - 2);
-    auto parts = parse_multipart(req.body, boundary);
-    const Part* audio = nullptr;
-    for (auto& p : parts) if (!p.filename.empty()) { audio = &p; break; }
-
-    // Preprocessed input may come from a cascade work-set (session) instead of a fresh upload.
-    std::string session = field(parts, "session", "");
-    std::string conv_in;
-    if (!session.empty() && safe_name(session)) {
-        std::string work = g.runs + "/" + session + "/work";
-        if (fs::exists(work))
-            for (auto& e : fs::directory_iterator(work)) {
-                std::string ext = e.path().extension().string();
-                if (ext == ".wav" || ext == ".flac") { conv_in = e.path().string(); break; }
+        const std::string value = argv[++index];
+        if (argument == "--host") {
+            config.host = value;
+        } else if (argument == "--port") {
+            if (!resonantia::web::parse_int_field(value, 1, 65535, config.port)) {
+                std::fprintf(stderr, "Invalid port: %s\n", value.c_str());
+                exit_code = 1;
+                return false;
             }
+        } else if (argument == "--webroot") {
+            config.webroot = value;
+        } else if (argument == "--repo") {
+            config.repo = value;
+        } else {
+            config.auth_token = value;
+        }
     }
-    if (conv_in.empty() && !audio) { send_response(fd, 400, "Bad Request", "text/plain", "no audio"); return; }
-    std::unique_lock<std::mutex> gpu_lk(g_gpu_mu, std::try_to_lock);
-    if (!gpu_lk.owns_lock()) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"GPU 忙（正在训练或转换），请稍候重试\"}"); return; }
-
-    std::string voice = field(parts, "voice", "base");
-    int pitch = std::atoi(field(parts, "f0_up_key", "0").c_str());
-    double index_rate = std::atof(field(parts, "index_rate", "0").c_str());
-    double rms = std::atof(field(parts, "rms_mix_rate", "0.5").c_str());
-    double protect = std::atof(field(parts, "protect", "0.5").c_str());
-    int filter_radius = std::atoi(field(parts, "filter_radius", "3").c_str());
-    bool pp_sep = field(parts, "pp_separate", "0") == "1", pp_deharm = field(parts, "pp_deharmony", "0") == "1";
-    bool pp_derev = field(parts, "pp_dereverb", "0") == "1", pp_denoise = field(parts, "pp_denoise", "0") == "1";
-    bool pp_deecho = field(parts, "pp_deecho", "0") == "1";
-
-    std::string model = g.gmodel, index;
-    if (voice != "base" && voice != "base (pretrained)") {
-        if (!safe_name(voice)) { send_response(fd, 400, "Bad Request", "text/plain", "bad voice"); return; }
-        std::string vm = g.runs + "/" + voice + "/model.safetensors";
-        if (fs::exists(vm)) model = vm;
-        std::string vi = g.runs + "/" + voice + "/model.index";
-        if (fs::exists(vi)) index = vi;
+    if (config.auth_token.size() > 4096) {
+        std::fprintf(stderr, "Auth token is too long\n");
+        exit_code = 1;
+        return false;
     }
-
-    std::string in = "/tmp/vcserve_in.wav", out = "/tmp/vcserve_out.wav";
-    if (conv_in.empty()) {
-        { std::ofstream o(in, std::ios::binary); o.write(audio->data.data(), audio->data.size()); }
-        if (!preprocess_audio_file(in, "conv", pp_sep, pp_deharm, pp_derev, pp_deecho, pp_denoise, conv_in)) {
-            send_response(fd, 500, "Internal Server Error", "text/plain", "输入预处理失败：" + log_tail("/tmp/vcserve_pp.log")); return; }
+    if (!resonantia::web::valid_ipv4_address(config.host)) {
+        std::fprintf(stderr, "Invalid IPv4 address: %s\n", config.host.c_str());
+        exit_code = 1;
+        return false;
     }
-    std::string cmd = "'" + g.build + "/vc_convert' --hubert '" + g.hubert + "' --rmvpe '" + g.rmvpe +
-        "' --model '" + model + "' --input '" + conv_in + "' --output '" + out +
-        "' --version v2 --speakers 109 --sr 40000 --pitch " + std::to_string(pitch) +
-        " --rms-mix " + std::to_string(rms) + " --protect " + std::to_string(protect) +
-        " --filter-radius " + std::to_string(filter_radius);
-    if (!index.empty()) cmd += " --index '" + index + "' --index-rate " + std::to_string(index_rate);
-    cmd += " > /tmp/vcserve_convert.log 2>&1";
-    int rc = std::system(cmd.c_str());
-    std::string wav = read_file(out);
-    if (rc != 0 || wav.empty()) { send_response(fd, 500, "Internal Server Error", "text/plain", "转换失败：" + log_tail("/tmp/vcserve_convert.log")); return; }
-    printf("[vc_serve] convert voice=%s -> %zu bytes\n", voice.c_str(), wav.size());
-    send_response(fd, 200, "OK", "audio/wav", wav);
+    return true;
 }
 
-// One worker thread per connection: light requests (static/voices/status) stay
-// responsive while a heavy GPU op runs; a recv timeout frees stalled clients.
-void handle_connection(int fd) {
-    timeval tv{60, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    Request req;
-    if (read_request(fd, req)) {
-        if (req.method == "GET" && req.path == "/api/voices") send_json(fd, voices_json());
-        else if (req.method == "GET" && req.path == "/api/sep-models") send_json(fd, sep_models_json());
-        else if (req.method == "GET" && req.path == "/api/train/status") handle_status(fd, req);
-        else if (req.method == "POST" && req.path == "/api/train") handle_train(fd, req);
-        else if (req.method == "POST" && req.path == "/api/material") handle_material(fd, req);
-        else if (req.method == "POST" && req.path == "/api/step") handle_step(fd, req);
-        else if (req.method == "GET" && req.path == "/api/preview") handle_preview(fd, req);
-        else if (req.method == "POST" && req.path == "/api/preprocess") handle_preprocess(fd, req);
-        else if (req.method == "POST" && req.path == "/api/convert") handle_convert(fd, req);
-        else if (req.method == "GET") serve_static(fd, req.path);
-        else send_response(fd, 405, "Method Not Allowed", "text/plain", "no");
+bool resolve_paths(const StartupConfig& config, resonantia::web::Paths& paths) {
+    std::error_code error;
+    const fs::path canonical_webroot = fs::canonical(fs::absolute(config.webroot), error);
+    if (error || !fs::is_directory(canonical_webroot)) {
+        std::fprintf(stderr, "Invalid webroot: %s\n", config.webroot.c_str());
+        return false;
     }
-    close(fd);
+
+    paths.webroot = canonical_webroot.string();
+    paths.repo = config.repo.empty() ? canonical_webroot.parent_path().string()
+                                     : fs::absolute(config.repo).string();
+    paths.models = paths.repo + "/models";
+    paths.build = paths.repo + "/build";
+    paths.runs = paths.repo + "/runs";
+    paths.hubert = paths.models + "/hubert_base/model.safetensors";
+    paths.rmvpe = paths.models + "/rmvpe.safetensors";
+    paths.gmodel = paths.models + "/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+    paths.dmodel = paths.models + "/pretrained_v2/pretrained_v2/f0D40k.safetensors";
+
+    fs::create_directories(paths.runs, error);
+    if (error) {
+        std::fprintf(stderr, "Cannot create runs directory: %s\n", error.message().c_str());
+        return false;
+    }
+    return true;
+}
+
+int run_server(int argc, char** argv) {
+    StartupConfig config;
+    int exit_code = 0;
+    if (!parse_startup_config(argc, argv, config, exit_code)) return exit_code;
+
+    resonantia::web::Paths paths;
+    if (!resolve_paths(config, paths)) return 1;
+    const std::string repo = paths.repo;
+
+    auto process_runner = std::make_shared<resonantia::web::PosixProcessRunner>();
+    auto service = std::make_shared<resonantia::web::WebService>(
+        std::move(paths), std::move(process_runner));
+    resonantia::web::HttpTransport transport({config.host, config.port, config.auth_token});
+
+    return transport.serve(
+        [service](int fd, const resonantia::web::Request& request) {
+            service->handle_request(fd, request);
+        },
+        [&config, &repo] {
+            std::printf("Resonantia WebUI on http://%s:%d\n  repo=%s\n  authentication=%s\n",
+                        config.host.c_str(), config.port, repo.c_str(),
+                        config.auth_token.empty() ? "disabled" : "enabled");
+            if (config.host == "0.0.0.0" && config.auth_token.empty()) {
+                std::fprintf(stderr,
+                             "[vc_serve] warning: listening on all IPv4 interfaces without "
+                             "authentication\n");
+            }
+        });
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    int port = 8080;
-    std::string webroot = "webui", repo;
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto nx = [&]() { return (i + 1 < argc) ? argv[++i] : ""; };
-        if (a == "--port") port = std::atoi(nx());
-        else if (a == "--webroot") webroot = nx();
-        else if (a == "--repo") repo = nx();
-        else { fprintf(stderr, "Unknown argument: %s\n", a.c_str()); return 1; }
+    try {
+        return run_server(argc, argv);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "vc_serve fatal error: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "vc_serve fatal error\n");
     }
-    g.webroot = fs::absolute(webroot).string();
-    g.repo = repo.empty() ? fs::path(g.webroot).parent_path().string() : fs::absolute(repo).string();
-    g.models = g.repo + "/models";
-    g.build = g.repo + "/build";
-    g.runs = g.repo + "/runs";
-    g.hubert = g.models + "/hubert_base/model.safetensors";
-    g.rmvpe = g.models + "/rmvpe.safetensors";
-    g.gmodel = g.models + "/pretrained_v2/pretrained_v2/f0G40k.safetensors";
-    g.dmodel = g.models + "/pretrained_v2/pretrained_v2/f0D40k.safetensors";
-    fs::create_directories(g.runs);
-
-    std::signal(SIGPIPE, SIG_IGN);
-    int srv = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(port);
-    if (bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) { fprintf(stderr, "bind failed on %d\n", port); return 1; }
-    if (listen(srv, 16) < 0) { fprintf(stderr, "listen failed\n"); return 1; }
-    printf("Resonantia WebUI on http://localhost:%d\n  repo=%s\n", port, g.repo.c_str());
-
-    for (;;) {
-        int fd = accept(srv, nullptr, nullptr);
-        if (fd < 0) continue;
-        std::thread(handle_connection, fd).detach();
-    }
-    return 0;
+    return 1;
 }

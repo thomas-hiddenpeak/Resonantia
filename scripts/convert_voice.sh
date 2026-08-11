@@ -36,9 +36,21 @@ done
 
 [[ -n "$MODEL" && -n "$INPUT" && -n "$OUTPUT" ]] || {
   echo "error: --model, --input, --output are required" >&2; exit 1; }
+[[ -f "$INPUT" ]] || { echo "error: input does not exist: $INPUT" >&2; exit 1; }
+[[ "${INPUT,,}" == *.wav ]] || { echo "error: only WAV input is supported: $INPUT" >&2; exit 1; }
+[[ "${OUTPUT,,}" == *.wav ]] || { echo "error: output must be WAV: $OUTPUT" >&2; exit 1; }
+[[ -f "$MODEL" ]] || { echo "error: model does not exist: $MODEL" >&2; exit 1; }
+[[ -x "$BUILD/vc_convert" ]] || { echo "error: missing executable: $BUILD/vc_convert" >&2; exit 1; }
 
 HUBERT="$MODELS/hubert_base/model.safetensors"
 RMVPE="$MODELS/rmvpe.safetensors"
+for f in "$HUBERT" "$RMVPE"; do
+  [[ -f "$f" ]] || { echo "error: missing model: $f" >&2; exit 1; }
+done
+if [[ -n "$INDEX" && ! -f "$INDEX" ]]; then
+  echo "error: index does not exist: $INDEX" >&2
+  exit 1
+fi
 
 ARGS=(--hubert "$HUBERT" --model "$MODEL" --rmvpe "$RMVPE"
       --input "$INPUT" --output "$OUTPUT"

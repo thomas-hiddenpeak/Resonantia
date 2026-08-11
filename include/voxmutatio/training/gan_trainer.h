@@ -40,7 +40,7 @@ class GANTrainer {
                          const std::vector<float>& logs_p, int T, int L);
 
   bool export_model(const std::string& src, const std::string& out) {
-    return gen_.export_model(src, out);
+    return initialized_ && gen_.export_model(src, out);
   }
   GeneratorTrainer& generator() { return gen_; }
 
@@ -60,6 +60,7 @@ class GANTrainer {
   std::unique_ptr<autograd::AdamW> g_opt_, d_opt_;
   int n_mels_ = 80;
   int n_spec_ = 1025;
+  bool initialized_ = false;
 };
 
 }  // namespace voxmutatio::training
