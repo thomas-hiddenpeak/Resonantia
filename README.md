@@ -10,8 +10,8 @@ Resonantia 是面向 Jetson Orin（SM87）的 RVC 风格 C++20/CUDA 声音转换
 
 | 能力 | 当前状态 | 关键边界 |
 |---|---|---|
-| 离线声音转换 | **已实现** | CUDA FP32、WAV、F0 RVC v1/v2、当前仅兼容 40 kHz synthesizer |
-| Flat Index 检索 | **已实现** | host mmap 精确检索；非零 `index_rate` 缺失、错维或检索失败时 fail-closed |
+| 离线声音转换 | **已实现** | HuBERT CLI/batch 使用有界 file path；WavLM 与 legacy library APIs 仍为 owning/unbounded；CUDA FP32、WAV、40 kHz |
+| Flat Index 检索 | **已实现** | private unlinked filesystem snapshot 上 host mmap exact retrieval；非零 `index_rate` fail-closed |
 | 训练 | **实验性** | `vc_train` 提供 decoder/GAN 工程路径；无 resume、生产稳定性或音色质量保证 |
 | 声源分离与清理 | **实验性、资产门控** | UMX、MelBand-RoFormer、Silero VAD；权重与 reference 不随 Git 分发 |
 | Web 编排 | **已实现、验收部分** | `vc_serve` 调用 CLI；默认监听 `0.0.0.0` 且默认无认证；非实时、无 TLS |
@@ -26,6 +26,10 @@ WAV -> mono float32 -> 16 kHz -> HuBERT -> optional Flat Index
 
 WavLM 只有在 synthesizer 以相同特征空间训练时才兼容。CPU、FP16、PM F0、
 non-F0、formant shift、FLAC/MP3，以及独立目标采样率转换均不支持并应明确失败。
+`vc_convert`/`vc_batch` 对 HuBERT v1/v2（RMVPE/FCPE）使用 bounded spool/window/atomic writer；
+WavLM 在匹配的 WavLM-trained VITS 完成资格化前保留 legacy file path，不会静默换 encoder。
+bounded working set 不随总时长保存全段音频，但临时磁盘仍为 `O(duration)`；旧
+`convert_buffer`/`convert_file` 继续返回完整 owning audio，不获得这一资源承诺。
 完整的当前状态与最近验证记录见
 [`specs/PROJECT_STATE.md`](specs/PROJECT_STATE.md)。
 
@@ -84,6 +88,9 @@ scripts/convert_voice.sh \
 
 以进程退出码和库的 `VCResult::success` 判断成功，不能只看旧输出文件是否存在。
 CLI 参数、默认值和错误行为见 [`docs/CLI.md`](docs/CLI.md) 与各命令的 `--help`。
+使用 Index 时，runtime 会建立 private、已 unlink 的 filesystem-backed snapshot；不支持
+`FICLONE` 时需要约一份 Index 的临时 filesystem 容量，空间或权限不足会明确失败而不是
+退化为 no-index。
 
 ## 测试
 

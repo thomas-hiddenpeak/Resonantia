@@ -60,7 +60,10 @@ rows 上限、backend 和 fallback trigger 必须由 target evidence 决定，�
 
 实现 WAV 解析、同目录 staging + atomic rename 写入、声道下混、线性重采样和
 safetensors 加载。WAV 发布在完整写入、`fsync` 和 close 后提交；失败保留旧目标并清理
-staging。音频 API 目前不提供 FLAC/MP3 解码器。
+staging。private bounded seam 另提供 checked `pread` WAV reader、mode-0600 raw spool 与
+incremental atomic WAV writer；源文件身份漂移、short read、长度/字节数溢出均 fail-closed。
+通用 `SafetensorsLoader::load` 仍是 file-backed mapping；只有 VITS consumer 选择下述 anonymous
+snapshot。音频 API 目前不提供 FLAC/MP3 解码器。
 
 ### `content/`
 
@@ -79,33 +82,71 @@ staging。音频 API 目前不提供 FLAC/MP3 解码器。
 
 ### `index/`
 
-产品实现是内存映射 host Flat Index，执行精确加权 k-NN 检索，不依赖 FAISS，也不会把整份
-索引复制到显存。索引文件头、维度、查询范围和 `k` 是输入边界的一部分。standalone R0
-probe 的 persistent-GPU exact retrieval 只用于诊断/对拍，未接入 CMake、CTest 或产品 backend，
+产品实现按 [ADR-0005](adr/0005-immutable-flat-index-snapshot.md) 把源 Flat Index 加载为
+private、已 unlink 的 filesystem-backed snapshot，再 mmap 执行原有 host exact weighted k-NN；
+不依赖 FAISS，也不会把整份索引复制到显存。loader 以 nonblocking fd 拒绝 FIFO/非 regular
+输入，校验 header/精确字节数/有限值，优先在源目录 `O_TMPFILE` + `FICLONE`，否则在已 unlink
+临时文件上以 1 MiB buffer 复制和复核。copy fallback 需要约 `O(Index bytes)` 的临时 filesystem
+容量；tmpfs 可计入内存/swap，ENOSPC/权限/快照失败使 required Index fail-closed。成功后源路径
+replacement/truncate/overwrite 不会改变 active bytes 或触发 SIGBUS。`build_index` 对 WAV 路径
+确定排序，并以同目录 staging、file `fsync`/close、rename 原子发布，父目录 fsync best-effort。
+standalone R0 probe 的 persistent-GPU exact retrieval 仍只用于诊断/对拍，不是产品 backend，
 也不定义 qualified rows/rate/batch 上限。
 
 ### `synthesizer/`
 
 实现 F0 VITS v1/v2 的 TextEncoder、Flow、NSF/HiFi-GAN 生成器。初始化逐项校验所有运行时
 已用 tensor 的 F32 dtype、精确 shape/nbytes、可读对齐和有限值；weight-norm 的 `g/v` 还要求
-每个 `v` row 非退化，并以 double 次序验证重建结果有限且可表示为 FP32。每个 Synthesizer
-实例持有本次验证的 const 只读 mmap，不复用按路径共享的全局 loader；初始化把调用方路径
-固定为 absolute + lexically-normal 路径（不解析 symlink），加载前后记录
-device/inode/size/mtime/ctime 文件身份，公开调用若发现该路径所指 checkpoint 已改变或被替换即
-返回空结果，且不受后续 current-working-directory 改变影响。`infer`/`infer_stream` 及公开
+每个 `v` row 非退化，并以 double 次序验证重建结果有限且可表示为 FP32。Synthesizer
+checkpoint 上限为 256 MiB；初始化从单一 `O_CLOEXEC|O_NONBLOCK` 只读 fd 复制到
+`MAP_ANONYMOUS` mapping，复制前后复验 fd 的 device/inode/size/mtime/ctime，随后 `mprotect`
+为 read-only。Synthesizer copies 共享这份 immutable snapshot，成功初始化会让约 checkpoint
+文件大小常驻 host memory；源文件后续 truncate 不会破坏 active bytes。初始化同时把调用方
+路径固定为 absolute + lexically-normal 路径（不解析 symlink），公开调用若发现该路径身份已
+改变或被替换仍返回空结果，且不受后续 current-working-directory 改变影响。该 anonymous
+snapshot 是 VITS 专用选择，不代表 RMVPE/FCPE/WavLM 等消费者都复制权重。`infer`/`infer_stream` 及公开
 `debug_*` 在读取调用方数组前检查各自最宽中间尺寸乘积，拒绝对应输入的 NaN/Inf，并在返回前
 拒绝非有限的可观察输出；`infer` 还显式约束 attention 的 `2*T*T`。VITS 算子的临时 device buffer 由
-`core::CudaBuffer` 管理。legacy `infer_stream` 仍实际执行完整 `infer` 后裁剪，repeated call
+`core::CudaBuffer` 管理。Synthesizer 的公开 init/infer/infer_stream/debug 边界捕获 host
+allocation、model/I/O、CUDA、标准及未知内部异常并返回既定空/false 结果。legacy
+`infer_stream` 仍实际执行完整 `infer` 后裁剪，repeated call
 会重置 NSF phase；characterization 已冻结该事实，但它不是 stateful session。non-F0
 合成器不是当前能力。
 
 ### `pipeline/`
 
-编排 HuBERT、RMVPE、可选 Index 和 Synthesizer，负责长音频分块、protect 与 RMS 混合。仅接受
-已经实现的 CUDA FP32/F0/40 kHz 契约。`index_rate > 0` 时，Index 缺失、feature width
-不匹配或 lookup failure 均显式失败，不再静默旁路检索。HuBERT、Index 与 VITS 按块执行；
-F0 为保持全局一致性仍对整段 padded clip 一次计算，file/buffer 路径也保留整段 host 输入、
-前处理和输出，因此 host 内存与 F0 CPU/GPU working set 都随时长增长。
+编排 HuBERT/WavLM、RMVPE/FCPE、可选 Index 和 Synthesizer，负责 protect、RMS、分块与拼接。
+仅接受 CUDA FP32/F0/40 kHz 契约。`index_rate > 0` 时，Index 缺失、feature width 不匹配或
+lookup failure 均显式失败，不静默旁路检索。
+
+`convert_file_bounded` 是同步 seekable-WAV file-to-file API：稳定 16 kHz source spool、全局
+double forward/reverse high-pass、一次一个 quiet core、独立 F0 windows、raw synth/RMS spool
+和 incremental atomic writer 都不在内存保留全段音频。对 checked 16 kHz samples `C/Q/P` 与
+source `N>=2`：
+
+```text
+Qeff = max(Q, 160)
+Peff = min(max(P, 160), N - 1)
+Ceff = min(max(C, 160), 640000 - (2*Qeff + 2*Peff + 160))
+core <= Ceff + 2*Qeff
+content/Index/VITS <= Ceff + 2*Qeff + 2*Peff + 160
+F0 input <= 128000 + 2*F
+```
+
+RMVPE/FCPE 的单侧 `F` 分别为 64000/32000，所以 F0 hard input 分别为 256000/192000，和
+content segment bound 独立。caller policy 将支持的 HuBERT v1/v2 + RMVPE/FCPE 配置送入
+bounded 实现；直接 bounded E2E matrix 是 RMVPE/v2 与 FCPE/v1，另有两种 F0 的独立 window
+profile，因此没有把未直接执行的另外两个 Cartesian pairing 伪称为独立 E2E 用例。
+`vc_convert`/`vc_batch` 对 HuBERT 使用该 API，对 WavLM 使用 legacy `convert_file`，因为仓库
+没有匹配的 WavLM-trained VITS 资产可完成 bounded qualification。`convert_buffer` 和旧
+`convert_file` 仍返回完整 owning audio、执行 legacy whole-clip F0，working set 随时长增长。
+可恢复的 model/I/O/CUDA/runtime 异常以 `VCResult` 失败返回；持续 `std::bad_alloc` 在连结果
+都无法构造时可传播。同一 pipeline instance 不是 thread-safe。
+
+focused Orin/CC 8.7 Release resource gate 对 17.565/35.130 秒真实语音记录 peak RSS
+`1342624`/`1354844 KiB` 与 device growth `892334080`/`851812352` bytes；这是两个时长点，
+必须与 hard bounds 联合解释。临时磁盘仍为 `O(duration)`，且当前没有独立冻结的
+click/transient 边界指标；这些限制不能被 `>0.98` phase-invariant spectrum gate 掩盖。
 
 ### `training/`
 
@@ -156,11 +197,19 @@ socket、HTTP、鉴权和资源 reservation，`workflow_support.*` 负责文件/
    子进程与真实 HTTP socket 测试。
 2. 可选 `integration`：配置 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON`；只有所需资产存在的用例才进入 CTest。
 
-测试内部“找不到文件就 return”不是可信的通过证据，因此 CMake 在注册前检查资产。
-2026-08-12 的 Release/SM87 current-tip 完整运行在资产齐全环境中为 30/30 passed
-（11 contract + 19 integration、0 failures，`Total Test time (real) = 356.41 sec`）。其中
-realtime 报告 validator 与 legacy VITS characterization 只证明 R0 scaffold 和既有 suite
-未回退，不证明 realtime session、目标声线质量或 10-minute SLO。
+测试内部“找不到文件就 return”不是可信的通过证据，因此 CMake 在注册前检查资产。当前
+资产齐全配置注册 39 个 distinct tests：16 contract-labelled、24 integration-labelled；
+`test_bounded_file_wavlm_preflight` 同时属于两类。2026-08-12 的 fresh Release/SM87
+build `/tmp/resonantia-nonrt-final.a8O1Ay` 已实际执行并通过 39/39（0 失败，
+`Total Test time (real) = 1297.94 sec`）。加固前 Release/SM87 30/30（11 contract +
+19 integration，356.41 秒）只保留为历史基线。新增门禁包括 bounded
+I/O/DSP/resource/F0/caller、immutable Index/build-index、VITS snapshot 和代表性 CUDA
+failure injection；注册或 focused pass 本身不是全量证据，本次当前工作树 39/39
+是对它们的独立收口。
+
+CUDA fault seam 只编入私有测试 target，覆盖 RMVPE/VITS 代表性 allocation、H2D/D2H copy、
+pre-launch、observable synchronization，以及 Synthesizer public fail-closed 边界；production
+不导出 seam 符号，也不据此宣称每个 cuBLAS/cuFFT/CUDA 调用或真实系统 OOM 已被注入。
 
 ## 5. 构建原则
 

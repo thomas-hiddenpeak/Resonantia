@@ -8,6 +8,7 @@
 #include "voxmutatio/io/audio_io.h"
 #include "voxmutatio/io/safetensors.h"
 #include "voxmutatio/core/types.h"
+#include "subprocess_test.h"
 
 #include <algorithm>
 #include <array>
@@ -15,9 +16,11 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <signal.h>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -93,6 +96,25 @@ bool write_binary(const std::string& path, const std::vector<std::uint8_t>& byte
     file.write(reinterpret_cast<const char*>(bytes.data()),
                static_cast<std::streamsize>(bytes.size()));
     return static_cast<bool>(file);
+}
+
+bool identity_matches_path(
+    const voxmutatio::io::SafetensorsSourceIdentity& identity,
+    const std::string& path) {
+    struct stat status {};
+    return ::stat(path.c_str(), &status) == 0 && S_ISREG(status.st_mode) &&
+           identity.device == static_cast<std::uintmax_t>(status.st_dev) &&
+           identity.inode == static_cast<std::uintmax_t>(status.st_ino) &&
+           identity.mode == static_cast<std::uintmax_t>(status.st_mode) &&
+           identity.size == static_cast<std::uintmax_t>(status.st_size) &&
+           identity.modified_seconds ==
+               static_cast<std::int64_t>(status.st_mtim.tv_sec) &&
+           identity.modified_nanoseconds ==
+               static_cast<std::int64_t>(status.st_mtim.tv_nsec) &&
+           identity.changed_seconds ==
+               static_cast<std::int64_t>(status.st_ctim.tv_sec) &&
+           identity.changed_nanoseconds ==
+               static_cast<std::int64_t>(status.st_ctim.tv_nsec);
 }
 
 std::vector<std::uint8_t> read_binary(const std::string& path) {
@@ -482,4 +504,156 @@ TEST_CASE("Safetensors validates dtype shape offsets and payload range",
     REQUIRE_FALSE(moved.load(invalid_file.path));
     REQUIRE_FALSE(moved.valid());
     REQUIRE(moved.data("x") == nullptr);
+
+    // A failed snapshot reload invalidates and releases the prior anonymous
+    // mapping. A valid file just one byte over the caller's bound isolates the
+    // pre-allocation size rejection from format validation failures.
+    SafetensorsLoader snapshot;
+    const auto valid_size = std::filesystem::file_size(valid_file.path);
+    REQUIRE(valid_size > 0);
+    REQUIRE(valid_size <= std::numeric_limits<std::size_t>::max());
+    REQUIRE(snapshot.load_snapshot(
+        valid_file.path, static_cast<std::size_t>(valid_size)));
+    REQUIRE(snapshot.valid());
+    REQUIRE(snapshot.source_identity() != nullptr);
+    REQUIRE(identity_matches_path(*snapshot.source_identity(), valid_file.path));
+    REQUIRE_FALSE(snapshot.load_snapshot(
+        valid_file.path, static_cast<std::size_t>(valid_size - 1)));
+    REQUIRE_FALSE(snapshot.valid());
+    REQUIRE(snapshot.source_identity() == nullptr);
+    REQUIRE(snapshot.data("x") == nullptr);
+}
+
+TEST_CASE("Safetensors snapshot identity follows the opened file across path ABA",
+          "[io][safetensors][snapshot][identity][boundary]") {
+    TempDir directory;
+    const std::string active = directory.path + "/active.safetensors";
+    const std::string source_b = directory.path + "/source-b.safetensors";
+    const std::string staged_a = directory.path + "/staged-a.safetensors";
+    const std::string header =
+        R"({"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})";
+    REQUIRE(write_binary(source_b, make_safetensors(header, float_payload({-2.5f}))));
+    REQUIRE(write_binary(staged_a, make_safetensors(header, float_payload({1.25f}))));
+    REQUIRE(::link(source_b.c_str(), active.c_str()) == 0);
+
+    voxmutatio::io::SafetensorsLoader loader;
+    REQUIRE(loader.load_snapshot(active, 1024U));
+    const auto* opened_identity = loader.source_identity();
+    REQUIRE(opened_identity != nullptr);
+    REQUIRE(identity_matches_path(*opened_identity, active));
+    REQUIRE(identity_matches_path(*opened_identity, source_b));
+
+    // Atomically restore path A after snapshotting B. The snapshot continues
+    // to expose B, but its fd-derived identity must never be rebound to A.
+    REQUIRE(::rename(staged_a.c_str(), active.c_str()) == 0);
+    REQUIRE_FALSE(identity_matches_path(*opened_identity, active));
+    const auto* value = reinterpret_cast<const float*>(loader.data("x"));
+    REQUIRE(value != nullptr);
+    REQUIRE(value[0] == Catch::Approx(-2.5f));
+}
+
+TEST_CASE("Safetensors source truncation subprocess helper",
+          "[.][safetensors-snapshot-helper]") {
+    // Larger than the loader's copy chunk so the contract exercises multiple
+    // pread calls as well as access to a page wholly beyond the truncated EOF.
+    constexpr std::size_t kElements = 300'000;
+    std::vector<std::uint8_t> payload(kElements * sizeof(float), 0);
+    const float tail = -2.5f;
+    std::memcpy(payload.data() + (kElements - 1) * sizeof(float),
+                &tail, sizeof(tail));
+    TempFile source(".safetensors");
+    REQUIRE(write_binary(
+        source.path,
+        make_safetensors(
+            R"({"x":{"dtype":"F32","shape":[300000],"data_offsets":[0,1200000]}})",
+            payload)));
+
+    voxmutatio::io::SafetensorsLoader loader;
+    REQUIRE(loader.load_snapshot(source.path, 2U * 1024U * 1024U));
+    REQUIRE(::truncate(source.path.c_str(), 8) == 0);
+
+    struct sigaction default_action {};
+    default_action.sa_handler = SIG_DFL;
+    REQUIRE(::sigemptyset(&default_action.sa_mask) == 0);
+    REQUIRE(::sigaction(SIGBUS, &default_action, nullptr) == 0);
+
+    const auto* values = reinterpret_cast<const float*>(loader.data("x"));
+    REQUIRE(values != nullptr);
+    const volatile float observed = values[kElements - 1];
+    REQUIRE(observed == Catch::Approx(tail));
+}
+
+TEST_CASE("Safetensors read-only snapshot subprocess helper",
+          "[.][safetensors-readonly-helper]") {
+    TempFile source(".safetensors");
+    REQUIRE(write_binary(
+        source.path,
+        make_safetensors(
+            R"({"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})",
+            float_payload({1.25f}))));
+
+    voxmutatio::io::SafetensorsLoader loader;
+    REQUIRE(loader.load_snapshot(source.path, 1024U));
+
+    struct sigaction default_action {};
+    default_action.sa_handler = SIG_DFL;
+    REQUIRE(::sigemptyset(&default_action.sa_mask) == 0);
+    REQUIRE(::sigaction(SIGSEGV, &default_action, nullptr) == 0);
+
+    auto* bytes = const_cast<volatile std::uint8_t*>(loader.data("x"));
+    REQUIRE(bytes != nullptr);
+    bytes[0] ^= 1U;
+    FAIL("read-only snapshot was writable");
+}
+
+TEST_CASE("Safetensors snapshot remains readable after source truncation",
+          "[io][safetensors][snapshot][boundary]") {
+    const auto child = resonantia_test::run_self_test(
+        "Safetensors source truncation subprocess helper");
+    INFO("launch_error=" << child.launch_error << " wait_error=" << child.wait_error
+         << " status=" << child.status);
+    REQUIRE(child.exited_with(0));
+}
+
+TEST_CASE("Safetensors snapshot mapping is read-only",
+          "[io][safetensors][snapshot][boundary]") {
+    const auto child = resonantia_test::run_self_test(
+        "Safetensors read-only snapshot subprocess helper");
+    INFO("launch_error=" << child.launch_error << " wait_error=" << child.wait_error
+         << " status=" << child.status);
+    REQUIRE(child.killed_by(SIGSEGV));
+}
+
+TEST_CASE("Safetensors no-writer FIFO subprocess helper",
+          "[.][safetensors-fifo-helper]") {
+    const char* fifo_path = std::getenv("RESONANTIA_TEST_SAFETENSORS_FIFO");
+    REQUIRE(fifo_path != nullptr);
+    REQUIRE(*fifo_path != '\0');
+
+    voxmutatio::io::SafetensorsLoader mapped;
+    REQUIRE_FALSE(mapped.load(fifo_path));
+    REQUIRE_FALSE(mapped.valid());
+
+    voxmutatio::io::SafetensorsLoader snapshot;
+    REQUIRE_FALSE(snapshot.load_snapshot(fifo_path, 1024U));
+    REQUIRE_FALSE(snapshot.valid());
+    REQUIRE(snapshot.source_identity() == nullptr);
+}
+
+TEST_CASE("Safetensors loaders promptly reject a no-writer FIFO",
+          "[io][safetensors][fifo][boundary]") {
+    TempDir directory;
+    const std::string fifo_path = directory.path + "/checkpoint.safetensors";
+    REQUIRE(::mkfifo(fifo_path.c_str(), 0600) == 0);
+    REQUIRE(::setenv("RESONANTIA_TEST_SAFETENSORS_FIFO",
+                     fifo_path.c_str(), 1) == 0);
+
+    const auto child = resonantia_test::run_self_test(
+        "Safetensors no-writer FIFO subprocess helper", 2'000);
+    const int unset_result = ::unsetenv("RESONANTIA_TEST_SAFETENSORS_FIFO");
+    INFO("launch_error=" << child.launch_error << " wait_error=" << child.wait_error
+         << " timed_out=" << child.timed_out << " status=" << child.status);
+    REQUIRE(unset_result == 0);
+    REQUIRE_FALSE(child.timed_out);
+    REQUIRE(child.exited_with(0));
 }

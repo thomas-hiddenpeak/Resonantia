@@ -24,6 +24,14 @@ ADR 记录会长期影响模块边界、依赖、持久格式、运行时、部�
 - [`ADR-0003`](0003-retire-legacy-embedded-webserver.md)：退役不可工作的旧嵌入式
   `WebServer` 公共表面（`Accepted`，2026-08-11；`vc_serve` 为唯一受支持 Web 入口，旧声明
   保留一个兼容窗口并 deprecated，`start()` 改为带迁移指引的 fail-fast）。
+- [`ADR-0004`](0004-bounded-offline-file-conversion.md)：有界离线文件转换与兼容 buffer
+  路径（`Accepted`，2026-08-12；采用 additive `convert_file_bounded` 并保留现有
+  `convert_buffer`/`convert_file` 行为；R1–R5 已实施，HuBERT caller 走 bounded 路径，
+  WavLM 在匹配资产资格化前保留 legacy 路径；当前树的 Release/SM87
+  全量 CTest 已 39/39 通过）。
+- [`ADR-0005`](0005-immutable-flat-index-snapshot.md)：Flat Index 私有快照与原子发布
+  （`Accepted`，2026-08-12；active exact-scan mmap 改为私有、已 unlink 的 filesystem-backed
+  snapshot，优先 `FICLONE`、否则 bounded copy；`build_index` 确定排序并原子发布）。
 
 ## 最小模板
 

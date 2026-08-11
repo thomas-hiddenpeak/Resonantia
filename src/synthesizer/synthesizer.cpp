@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <initializer_list>
 #include <limits>
@@ -46,7 +47,7 @@ struct Weights {
     std::string prefix = "model.";
     bool load(const std::string& p) {
         auto staged = std::make_shared<io::SafetensorsLoader>();
-        if (!staged->load(p)) return false;
+        if (!staged->load_snapshot(p, Synthesizer::kMaxCheckpointBytes)) return false;
         loader = std::move(staged);
         return true;
     }
@@ -61,24 +62,7 @@ struct Weights {
     bool has(const std::string& n) const { return meta(n) != nullptr; }
 };
 
-struct CheckpointIdentity {
-    std::uintmax_t device = 0;
-    std::uintmax_t inode = 0;
-    std::uintmax_t size = 0;
-    std::int64_t modified_seconds = 0;
-    std::int64_t modified_nanoseconds = 0;
-    std::int64_t changed_seconds = 0;
-    std::int64_t changed_nanoseconds = 0;
-};
-
-bool operator==(const CheckpointIdentity& lhs, const CheckpointIdentity& rhs) {
-    return lhs.device == rhs.device && lhs.inode == rhs.inode &&
-           lhs.size == rhs.size &&
-           lhs.modified_seconds == rhs.modified_seconds &&
-           lhs.modified_nanoseconds == rhs.modified_nanoseconds &&
-           lhs.changed_seconds == rhs.changed_seconds &&
-           lhs.changed_nanoseconds == rhs.changed_nanoseconds;
-}
+using CheckpointIdentity = io::SafetensorsSourceIdentity;
 
 bool read_checkpoint_identity(const std::string& path, CheckpointIdentity& identity) {
     struct stat status {};
@@ -88,6 +72,7 @@ bool read_checkpoint_identity(const std::string& path, CheckpointIdentity& ident
     }
     identity.device = static_cast<std::uintmax_t>(status.st_dev);
     identity.inode = static_cast<std::uintmax_t>(status.st_ino);
+    identity.mode = static_cast<std::uintmax_t>(status.st_mode);
     identity.size = static_cast<std::uintmax_t>(status.st_size);
     identity.modified_seconds = static_cast<std::int64_t>(status.st_mtim.tv_sec);
     identity.modified_nanoseconds = static_cast<std::int64_t>(status.st_mtim.tv_nsec);
@@ -917,11 +902,17 @@ struct Synthesizer::ModelState {
     std::string resolved_path;
 };
 
-bool Synthesizer::init(const SynthesizerConfig& config) {
+void Synthesizer::reset() noexcept {
     initialized_ = false;
     model_state_.reset();
     num_speakers_ = 0;
     has_f0_ = false;
+}
+
+bool Synthesizer::init(const SynthesizerConfig& config) try {
+    // Reinitialization is deliberately invalidating: neither an ordinary
+    // validation failure nor an exception may retain the previous snapshot.
+    reset();
     if (!config.has_f0) {
         fprintf(stderr, "VITS: non-F0 checkpoints are not supported by this synthesizer\n");
         return false;
@@ -933,26 +924,28 @@ bool Synthesizer::init(const SynthesizerConfig& config) {
 
     const int feature_dim = config.version == ModelVersion::kV1 ? 256 : 768;
     std::string resolved_path;
-    CheckpointIdentity identity_before;
-    CheckpointIdentity identity_loaded;
-    CheckpointIdentity identity_validated;
     Weights weights;
     int checkpoint_speakers = 0;
     if (!resolve_checkpoint_path(config.model_path, resolved_path) ||
-        !read_checkpoint_identity(resolved_path, identity_before) ||
-        !weights.load(resolved_path) ||
-        !read_checkpoint_identity(resolved_path, identity_loaded) ||
-        !(identity_before == identity_loaded) ||
+        !weights.load(resolved_path)) {
+        fprintf(stderr, "VITS: checkpoint validation failed for '%s'\n",
+                config.model_path.c_str());
+        return false;
+    }
+    const CheckpointIdentity* snapshot_identity =
+        weights.loader->source_identity();
+    CheckpointIdentity current_identity;
+    if (!snapshot_identity ||
         !validate_checkpoint(weights, feature_dim, checkpoint_speakers) ||
-        !read_checkpoint_identity(resolved_path, identity_validated) ||
-        !(identity_loaded == identity_validated)) {
+        !read_checkpoint_identity(resolved_path, current_identity) ||
+        !(current_identity == *snapshot_identity)) {
         fprintf(stderr, "VITS: checkpoint validation failed for '%s'\n",
                 config.model_path.c_str());
         return false;
     }
     auto staged_state = std::make_shared<ModelState>();
     staged_state->loader = weights.loader;
-    staged_state->identity = identity_validated;
+    staged_state->identity = *snapshot_identity;
     staged_state->resolved_path = std::move(resolved_path);
 
     config_ = config;
@@ -965,6 +958,12 @@ bool Synthesizer::init(const SynthesizerConfig& config) {
     model_state_ = std::move(staged_state);
     initialized_ = true;
     return true;
+} catch (const std::exception&) {
+    reset();
+    return false;
+} catch (...) {
+    reset();
+    return false;
 }
 
 bool Synthesizer::checkpoint_current() const {
@@ -974,7 +973,7 @@ bool Synthesizer::checkpoint_current() const {
 }
 
 std::vector<float> Synthesizer::debug_text_encoder(const float* features, int frames,
-                                                   const int* pitch_coarse) {
+                                                   const int* pitch_coarse) try {
     if (!initialized_ || !checkpoint_current() ||
         !valid_features(features, frames, feature_dim_) ||
         !valid_coarse_pitch(pitch_coarse, frames)) return {};
@@ -982,10 +981,14 @@ std::vector<float> Synthesizer::debug_text_encoder(const float* features, int fr
     w.loader = model_state_->loader;
     auto result = text_encoder(w, features, frames, feature_dim_, pitch_coarse, nullptr);
     return all_finite(result) ? result : std::vector<float>{};
+} catch (const std::exception&) {
+    return {};
+} catch (...) {
+    return {};
 }
 
 std::vector<float> Synthesizer::debug_flow(const float* features, int frames,
-                                           const int* pitch_coarse, int speaker_id) {
+                                           const int* pitch_coarse, int speaker_id) try {
     if (!initialized_ || !checkpoint_current() ||
         !valid_features(features, frames, feature_dim_) ||
         !valid_coarse_pitch(pitch_coarse, frames) ||
@@ -998,9 +1001,13 @@ std::vector<float> Synthesizer::debug_flow(const float* features, int frames,
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
     auto result = flow_reverse(w, std::move(m_p), frames, g.data());
     return all_finite(result) ? result : std::vector<float>{};
+} catch (const std::exception&) {
+    return {};
+} catch (...) {
+    return {};
 }
 
-std::vector<float> Synthesizer::debug_har(const float* f0, int frames) {
+std::vector<float> Synthesizer::debug_har(const float* f0, int frames) try {
     if (!initialized_ || !checkpoint_current() ||
         !valid_float_input(f0, frames, 1, 400, false)) return {};
     for (int frame = 0; frame < frames; ++frame) {
@@ -1010,9 +1017,14 @@ std::vector<float> Synthesizer::debug_har(const float* f0, int frames) {
     w.loader = model_state_->loader;
     auto result = sine_source(f0, frames, 400, sample_rate_, w);
     return all_finite(result) ? result : std::vector<float>{};
+} catch (const std::exception&) {
+    return {};
+} catch (...) {
+    return {};
 }
 
-std::vector<float> Synthesizer::debug_convpre(const float* z, int frames, int speaker_id) {
+std::vector<float> Synthesizer::debug_convpre(const float* z, int frames,
+                                              int speaker_id) try {
     if (!initialized_ || !checkpoint_current() ||
         !valid_float_input(z, frames, kInter, 512, false) ||
         !valid_speaker(speaker_id, num_speakers_)) return {};
@@ -1032,10 +1044,15 @@ std::vector<float> Synthesizer::debug_convpre(const float* z, int frames, int sp
         for (int t = 0; t < frames; ++t) xc[c * frames + t] += s;
     }
     return all_finite(xc) ? xc : std::vector<float>{};
+} catch (const std::exception&) {
+    return {};
+} catch (...) {
+    return {};
 }
 
 std::vector<float> Synthesizer::debug_gen_stage0(const float* z, const float* f0,
-                                                 int frames, int speaker_id, int which) {
+                                                 int frames, int speaker_id,
+                                                 int which) try {
     if (!initialized_ || !checkpoint_current() ||
         !valid_float_input(z, frames, kInter, 2'560, false) ||
         !valid_float_input(f0, frames, 1, 400, false) ||
@@ -1094,10 +1111,14 @@ std::vector<float> Synthesizer::debug_gen_stage0(const float* z, const float* f0
     }
     for (auto& v : acc) v /= 3.0f;
     return all_finite(acc) ? acc : std::vector<float>{};
+} catch (const std::exception&) {
+    return {};
+} catch (...) {
+    return {};
 }
 
 std::vector<float> Synthesizer::debug_decode(const float* z, const float* f0,
-                                             int frames, int speaker_id) {
+                                             int frames, int speaker_id) try {
     if (!initialized_ || !checkpoint_current() ||
         !valid_float_input(z, frames, kInter, 12'800, false) ||
         !valid_float_input(f0, frames, 1, 400, false) ||
@@ -1113,10 +1134,15 @@ std::vector<float> Synthesizer::debug_decode(const float* z, const float* f0,
     std::vector<float> x(z, z + kInter * frames);
     auto result = generator(w, std::move(x), frames, f0, g.data(), sample_rate_);
     return all_finite(result) ? result : std::vector<float>{};
+} catch (const std::exception&) {
+    return {};
+} catch (...) {
+    return {};
 }
 
 std::vector<float> Synthesizer::debug_encp(const float* features, int frames,
-                                           const int* pitch_coarse, bool want_logs) {
+                                           const int* pitch_coarse,
+                                           bool want_logs) try {
     if (!initialized_ || !checkpoint_current() ||
         !valid_features(features, frames, feature_dim_) ||
         !valid_coarse_pitch(pitch_coarse, frames)) return {};
@@ -1127,9 +1153,14 @@ std::vector<float> Synthesizer::debug_encp(const float* features, int frames,
                             want_logs ? &logs : nullptr);
     if (want_logs) m_p.insert(m_p.end(), logs.begin(), logs.end());  // [m_p ; logs_p]
     return all_finite(m_p) ? m_p : std::vector<float>{};
+} catch (const std::exception&) {
+    return {};
+} catch (...) {
+    return {};
 }
 
-std::vector<float> Synthesizer::debug_flow_reverse(const float* x, int frames, int speaker_id) {
+std::vector<float> Synthesizer::debug_flow_reverse(const float* x, int frames,
+                                                   int speaker_id) try {
     if (!initialized_ || !checkpoint_current() ||
         !valid_float_input(x, frames, kInter, kFilter, false) ||
         !valid_speaker(speaker_id, num_speakers_)) return {};
@@ -1141,11 +1172,15 @@ std::vector<float> Synthesizer::debug_flow_reverse(const float* x, int frames, i
     std::vector<float> in(x, x + kInter * frames);
     auto result = flow_reverse(w, std::move(in), frames, g.data());
     return all_finite(result) ? result : std::vector<float>{};
+} catch (const std::exception&) {
+    return {};
+} catch (...) {
+    return {};
 }
 
 AudioBuffer Synthesizer::infer(const float* features, int frames,
                                const float* pitch, const float* pitchf,
-                               int speaker_id) {
+                               int speaker_id) try {
     AudioBuffer result;
     result.sample_rate = sample_rate_;
 
@@ -1180,11 +1215,20 @@ AudioBuffer Synthesizer::infer(const float* features, int frames,
 
     result.data = std::move(audio);
     return result;
+} catch (const std::exception&) {
+    AudioBuffer result;
+    result.sample_rate = sample_rate_;
+    return result;
+} catch (...) {
+    AudioBuffer result;
+    result.sample_rate = sample_rate_;
+    return result;
 }
 
 AudioBuffer Synthesizer::infer_stream(const float* features, int frames,
                                       const float* pitch, const float* pitchf,
-                                      int speaker_id, int skip_head, int return_length) {
+                                      int speaker_id, int skip_head,
+                                      int return_length) try {
     AudioBuffer result;
     result.sample_rate = sample_rate_;
     if (!initialized_ || skip_head < 0 || return_length <= 0 || skip_head > frames ||
@@ -1201,6 +1245,14 @@ AudioBuffer Synthesizer::infer_stream(const float* features, int frames,
     }
     result.data.assign(full.data.begin() + static_cast<std::ptrdiff_t>(begin),
                        full.data.begin() + static_cast<std::ptrdiff_t>(begin + count));
+    return result;
+} catch (const std::exception&) {
+    AudioBuffer result;
+    result.sample_rate = sample_rate_;
+    return result;
+} catch (...) {
+    AudioBuffer result;
+    result.sample_rate = sample_rate_;
     return result;
 }
 

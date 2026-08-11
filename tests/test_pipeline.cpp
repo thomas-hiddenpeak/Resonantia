@@ -9,16 +9,20 @@
 #include "voxmutatio/core/types.h"
 #include "voxmutatio/io/audio_io.h"
 #include "test_artifacts.h"
+#include "subprocess_test.h"
 #include "vits_checkpoint_fixture.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <cmath>
 #include <limits>
+#include <sstream>
 #include <system_error>
 #include <utility>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -32,6 +36,28 @@ TEST_CASE("Pipeline initialization", "[pipeline][init]") {
     bool result = pipeline.init(config);
     
     REQUIRE_FALSE(result);
+}
+
+TEST_CASE("Bounded file conversion rejects before touching the target when uninitialized",
+          "[pipeline][bounded-file]") {
+    resonantia_test::ScopedArtifact output(
+        resonantia_test::unique_artifact_path("bounded-uninitialized", ".wav"));
+    const std::array<char, 8> sentinel = {'o', 'l', 'd', '-', 'd', 'a', 't', 'a'};
+    {
+        std::ofstream stream(output.path(), std::ios::binary | std::ios::trunc);
+        REQUIRE(stream.write(sentinel.data(), sentinel.size()));
+    }
+
+    voxmutatio::pipeline::VoiceConversionPipeline pipeline;
+    const auto result = pipeline.convert_file_bounded(
+        "/definitely/missing/input.wav", output.path().string(), 0);
+    CHECK_FALSE(result.success);
+    CHECK(result.error_message == "pipeline not initialized");
+
+    std::ifstream persisted(output.path(), std::ios::binary);
+    const std::vector<char> bytes{
+        std::istreambuf_iterator<char>(persisted), std::istreambuf_iterator<char>()};
+    CHECK(bytes == std::vector<char>(sentinel.begin(), sentinel.end()));
 }
 
 namespace {
@@ -78,6 +104,31 @@ public:
 private:
     fs::path original_;
 };
+
+std::size_t mapped_path_count(const fs::path& path) {
+    std::ifstream maps("/proc/self/maps");
+    if (!maps) return std::numeric_limits<std::size_t>::max();
+    const std::string needle = fs::absolute(path).lexically_normal().string();
+    std::size_t count = 0;
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find(needle) != std::string::npos) ++count;
+    }
+    return count;
+}
+
+std::size_t resident_set_kib() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmRSS:", 0) != 0) continue;
+        std::istringstream values(line.substr(6));
+        std::size_t kib = 0;
+        values >> kib;
+        return values ? kib : 0;
+    }
+    return 0;
+}
 
 }  // namespace
 
@@ -235,6 +286,32 @@ TEST_CASE("Pipeline reports a runtime index lookup failure instead of bypassing 
     CHECK_FALSE(result.success);
     CHECK(result.error_message == "index retrieval failed");
     CHECK(result.index_ms > 0.0);
+
+    resonantia_test::ScopedArtifact bounded_input(
+        resonantia_test::unique_artifact_path("overflowing-index-input", ".wav"));
+    resonantia_test::ScopedArtifact bounded_target(
+        resonantia_test::unique_artifact_path("overflowing-index-target", ".wav"));
+    REQUIRE(voxmutatio::io::write_audio(
+        bounded_input.path().string(), input->data.data(),
+        static_cast<int>(input->data.size()), input->sample_rate));
+    const std::array<char, 10> sentinel = {
+        'o', 'l', 'd', '-', 't', 'a', 'r', 'g', 'e', 't'};
+    {
+        std::ofstream stream(
+            bounded_target.path(), std::ios::binary | std::ios::trunc);
+        REQUIRE(stream.write(sentinel.data(), sentinel.size()));
+    }
+
+    const auto bounded = pipeline.convert_file_bounded(
+        bounded_input.path().string(), bounded_target.path().string(), 0);
+    CHECK_FALSE(bounded.success);
+    CHECK(bounded.error_message == "index retrieval failed");
+    CHECK(bounded.index_ms > 0.0);
+    std::ifstream persisted(bounded_target.path(), std::ios::binary);
+    const std::vector<char> bytes{
+        std::istreambuf_iterator<char>(persisted),
+        std::istreambuf_iterator<char>()};
+    CHECK(bytes == std::vector<char>(sentinel.begin(), sentinel.end()));
 }
 
 TEST_CASE("Pipeline rejects a nonzero index rate without a usable index",
@@ -311,6 +388,7 @@ TEST_CASE("Synthesizer fail-closes checkpoint and public numerical boundaries",
     REQUIRE(synth.init(config));
     REQUIRE(synth.initialized());
     REQUIRE(synth.num_speakers() == 1);
+    REQUIRE(mapped_path_count(checkpoint_path.path()) == 0);
 
     const auto require_config_rejected = [&](SynthesizerConfig rejected) {
         Synthesizer invalid;
@@ -375,7 +453,14 @@ TEST_CASE("Synthesizer fail-closes checkpoint and public numerical boundaries",
     }
     REQUIRE(after_cwd_change.data.size() == 400);
 
+    const std::size_t rss_before_copy = resident_set_kib();
+    REQUIRE(rss_before_copy > 0);
     Synthesizer copied = synth;
+    const std::size_t rss_after_copy = resident_set_kib();
+    REQUIRE(rss_after_copy > 0);
+    INFO("rss_before_copy_kib=" << rss_before_copy
+         << " rss_after_copy_kib=" << rss_after_copy);
+    CHECK(rss_after_copy <= rss_before_copy + 8U * 1024U);
     REQUIRE(copied.initialized());
     REQUIRE(copied.infer(features.data(), 1, &pitch, &f0, 0).data.size() == 400);
     Synthesizer moved = std::move(copied);
@@ -501,6 +586,40 @@ TEST_CASE("Synthesizer fail-closes checkpoint and public numerical boundaries",
     CHECK(synth.infer(features.data(), 1, &pitch, &f0, 0).data.empty());
     CHECK_FALSE(synth.init(config));
     CHECK_FALSE(synth.initialized());
+}
+
+TEST_CASE("Synthesizer truncated checkpoint subprocess helper",
+          "[.][vits-snapshot-helper]") {
+    using voxmutatio::ModelVersion;
+    using voxmutatio::synthesizer::Synthesizer;
+    using voxmutatio::synthesizer::SynthesizerConfig;
+
+    resonantia_test::ScopedArtifact checkpoint_path(
+        resonantia_test::unique_artifact_path("vits-truncated", ".safetensors"));
+    resonantia_test::vits_fixture::SparseCheckpoint checkpoint;
+    REQUIRE(resonantia_test::vits_fixture::create_sparse_checkpoint(
+        checkpoint_path.path(), checkpoint));
+
+    SynthesizerConfig config;
+    config.model_path = checkpoint_path.path().string();
+    config.version = ModelVersion::kV2;
+    Synthesizer synth;
+    REQUIRE(synth.init(config));
+    REQUIRE(::truncate(checkpoint_path.path().c_str(), 8) == 0);
+
+    std::vector<float> features(static_cast<std::size_t>(synth.feature_dim()), 0.0f);
+    float pitch = 1.0f;
+    float f0 = 110.0f;
+    CHECK(synth.infer(features.data(), 1, &pitch, &f0, 0).data.empty());
+}
+
+TEST_CASE("Synthesizer isolates checkpoint bytes but preserves path fail-closed",
+          "[synthesizer][snapshot][boundary]") {
+    const auto child = resonantia_test::run_self_test(
+        "Synthesizer truncated checkpoint subprocess helper");
+    INFO("launch_error=" << child.launch_error << " wait_error=" << child.wait_error
+         << " status=" << child.status);
+    REQUIRE(child.exited_with(0));
 }
 
 TEST_CASE("Pipeline rejects malformed direct audio buffers", "[pipeline][contract]") {

@@ -40,9 +40,11 @@ validated only when the corresponding local model and reference fixture are avai
 
 ### Feature retrieval
 
-**Current decision**: a memory-mapped Flat Index performs exact weighted k-NN retrieval.
-This avoids a FAISS runtime dependency and keeps the index on host memory. File header,
-dimension, query range and `k` are contract boundaries.
+**Current decision**: a private, unlinked filesystem-backed Flat Index snapshot is memory-mapped
+for exact weighted k-NN retrieval. This avoids a FAISS runtime dependency, keeps the exact hot
+path on host memory and isolates active bytes from source truncate/overwrite. `FICLONE` is preferred;
+copy fallback needs index-sized temporary filesystem capacity. File header, dimension, query range
+and `k` remain contract boundaries.
 
 ### Synthesizer
 
@@ -85,6 +87,11 @@ Earlier notes contained isolated latency and speedup numbers. They are **superse
 status claims** because hardware state, clocks, model, input duration, warm-up, compiler flags
 and measurement method were not recorded consistently. Future benchmark reports must include
 all of that metadata and separate component latency from end-to-end latency.
+
+The bounded offline migration now has a two-point 17.565/35.130-second Orin resource gate plus
+structural core/F0 bounds. It is evidence for the qualified HuBERT profiles, not a cross-machine
+benchmark, an arbitrary-duration empirical proof, or a realtime result; WavLM remains on the
+legacy file path pending a matching trained synthesizer.
 
 ## Open Research
 

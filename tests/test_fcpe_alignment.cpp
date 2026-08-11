@@ -22,6 +22,7 @@
 #include "voxmutatio/io/audio_io.h"
 #include "voxmutatio/io/safetensors.h"
 #include "f0_checkpoint_fixture.h"
+#include "f0_window_profile.h"
 #include "test_artifacts.h"
 
 namespace {
@@ -110,6 +111,57 @@ TEST_CASE("FCPE aligns with torchfcpe reference", "[fcpe][f0][integration]") {
     CHECK(uv_frac > 0.95);
     CHECK(median < 0.5);   // Constitution VI: F0 < 0.5 Hz on voiced frames
     CHECK(mean < 1.0);
+}
+
+TEST_CASE("FCPE bounded-window profile preserves global-lattice centers",
+          "[fcpe][f0][bounded-window][integration]") {
+    using namespace voxmutatio;
+
+    auto fixture = io::read_audio(
+        "../tests/fixtures/speech_librispeech.wav", 16'000);
+    REQUIRE(fixture.has_value());
+    std::vector<float> tiled;
+    tiled.reserve(fixture->data.size() * 3);
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        tiled.insert(tiled.end(), fixture->data.begin(), fixture->data.end());
+    }
+
+    f0::FcpeConfig config;
+    config.model_path = "../models/fcpe/model.safetensors";
+    f0::FcpeExtractor extractor;
+    REQUIRE(extractor.init(config));
+    const auto profile = resonantia_test::profile_windowed_f0(
+        extractor, tiled, static_cast<int>(
+            pipeline::detail::f0_context_samples(F0Method::kFcpe)));
+    INFO(profile.error);
+    REQUIRE(profile.valid);
+    INFO("frames=" << profile.frames << " both_voiced=" << profile.both_voiced
+         << " uv=" << static_cast<double>(profile.uv_agree) / profile.frames
+         << " mean=" << profile.voiced_mean_hz
+         << " p95=" << profile.voiced_p95_hz
+         << " global_max=" << profile.voiced_max_hz
+         << " boundary_both_voiced=" << profile.boundary_both_voiced
+         << " maximum_input_samples=" << profile.maximum_input_samples
+         << " boundary_max=" << profile.boundary_max_hz);
+    std::cout << "fcpe_bounded_profile frames=" << profile.frames
+              << " both_voiced=" << profile.both_voiced
+              << " uv_agreement="
+              << static_cast<double>(profile.uv_agree) / profile.frames
+              << " mean_hz=" << profile.voiced_mean_hz
+              << " p95_hz=" << profile.voiced_p95_hz
+              << " global_max_hz=" << profile.voiced_max_hz
+              << " boundary_both_voiced=" << profile.boundary_both_voiced
+              << " boundary_max_hz=" << profile.boundary_max_hz
+              << " maximum_input_samples=" << profile.maximum_input_samples
+              << std::endl;
+    REQUIRE(profile.boundary_both_voiced > 0);
+    CHECK(profile.maximum_input_samples <=
+          pipeline::detail::kF0CoreSamples +
+              2 * pipeline::detail::kFcpeContextSamples);
+    CHECK(static_cast<double>(profile.uv_agree) / profile.frames > 0.95);
+    CHECK(profile.voiced_mean_hz < 0.5);
+    CHECK(profile.voiced_p95_hz < 0.5);
+    CHECK(profile.boundary_max_hz < 0.5);
 }
 
 TEST_CASE("FCPE initialization and inference failure boundaries",

@@ -9,6 +9,13 @@
 
 namespace voxmutatio::f0::ops {
 
+// Contract for all operations: borrowed data/weight pointers are non-null except
+// an explicitly optional bias. Dimensions and pooling kernels are positive; a
+// pooling kernel fits its input, and batch-normalization epsilon is finite and
+// positive. Invalid structural arguments throw std::invalid_argument,
+// unrepresentable tensor/index/grid sizes throw std::length_error, and CUDA
+// execution failures throw std::runtime_error before an output is returned.
+
 /// Conv2d with 3x3 kernel, stride 1, padding 1.
 /// input: [Cin, H, W], weight: [Cout, Cin, 3, 3], bias: [Cout] or nullptr.
 /// Returns [Cout, H, W].

@@ -7,6 +7,8 @@
 
 #include "voxmutatio/index/cuda_flat_index.h"
 
+#include "subprocess_test.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -15,6 +17,7 @@
 #include <limits>
 #include <string>
 #include <type_traits>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
 
@@ -52,6 +55,20 @@ std::vector<std::uint8_t> index_bytes(std::uint64_t ntotal,
     append_u64(bytes, ntotal);
     append_u64(bytes, dim);
     for (float value : values) append_float(bytes, value);
+    return bytes;
+}
+
+std::vector<std::uint8_t> repeated_index_bytes(std::uint64_t ntotal,
+                                               std::uint64_t dim,
+                                               float value) {
+    std::vector<std::uint8_t> bytes;
+    append_u64(bytes, ntotal);
+    append_u64(bytes, dim);
+    for (std::uint64_t row = 0; row < ntotal; ++row) {
+        for (std::uint64_t column = 0; column < dim; ++column) {
+            append_float(bytes, value);
+        }
+    }
     return bytes;
 }
 
@@ -257,4 +274,89 @@ TEST_CASE("CudaFlatIndex validates query bounds and supports move",
     REQUIRE_FALSE(moved.valid());
     REQUIRE(moved.total_vectors() == 0);
     REQUIRE(moved.dim() == 0);
+}
+
+TEST_CASE("hidden CudaFlatIndex FIFO rejection child",
+          "[.index-fifo-child]") {
+    TempIndex fifo;
+    REQUIRE(::mkfifo(fifo.path.c_str(), 0600) == 0);
+    voxmutatio::index::CudaFlatIndex index;
+    REQUIRE_FALSE(index.load(fifo.path));
+    REQUIRE_FALSE(index.valid());
+}
+
+TEST_CASE("CudaFlatIndex promptly rejects a no-writer FIFO",
+          "[index][cuda-flat][io-contract]") {
+    const auto child = resonantia_test::run_self_test(
+        "hidden CudaFlatIndex FIFO rejection child", 2'000);
+    INFO("timed_out=" << child.timed_out << " status=" << child.status
+                       << " launch_error=" << child.launch_error
+                       << " wait_error=" << child.wait_error);
+    REQUIRE(child.exited_with(0));
+}
+
+TEST_CASE("hidden CudaFlatIndex truncate rejection child",
+          "[.index-truncate-child]") {
+    TempIndex file;
+    REQUIRE(write_binary(file.path, repeated_index_bytes(4096, 2, 1.0f)));
+
+    voxmutatio::index::CudaFlatIndex index;
+    REQUIRE(index.load(file.path));
+    REQUIRE(::truncate(file.path.c_str(), 16) == 0);
+
+    const float query[] = {0.0f, 0.0f};
+    const auto [distances, indices] = index.search(query, 1, 1, 2);
+    REQUIRE(distances.size() == 1);
+    REQUIRE(indices.size() == 1);
+    REQUIRE(distances[0] == Catch::Approx(2.0f));
+}
+
+TEST_CASE("CudaFlatIndex snapshot survives source truncation",
+          "[index][cuda-flat][io-contract]") {
+    const auto child = resonantia_test::run_self_test(
+        "hidden CudaFlatIndex truncate rejection child", 2'000);
+    INFO("timed_out=" << child.timed_out << " status=" << child.status
+                       << " launch_error=" << child.launch_error
+                       << " wait_error=" << child.wait_error);
+    REQUIRE(child.exited_with(0));
+}
+
+TEST_CASE("CudaFlatIndex snapshot ignores later same-size source mutation",
+          "[index][cuda-flat][io-contract]") {
+    TempIndex file;
+    REQUIRE(write_binary(file.path,
+                         index_bytes(2, 2, {0.0f, 0.0f, 1.0f, 1.0f})));
+
+    voxmutatio::index::CudaFlatIndex index;
+    REQUIRE(index.load(file.path));
+    REQUIRE(write_binary(file.path,
+                         index_bytes(2, 2, {2.0f, 2.0f, 3.0f, 3.0f})));
+
+    const float query[] = {0.0f, 0.0f};
+    const auto [distances, indices] = index.search(query, 1, 1, 2);
+    REQUIRE(distances.size() == 1);
+    REQUIRE(indices.size() == 1);
+    REQUIRE(indices[0] == 0);
+    REQUIRE(distances[0] == Catch::Approx(0.0f));
+}
+
+TEST_CASE("CudaFlatIndex snapshot ignores later atomic path replacement",
+          "[index][cuda-flat][io-contract]") {
+    TempIndex file;
+    TempIndex replacement;
+    REQUIRE(write_binary(file.path,
+                         index_bytes(2, 2, {0.0f, 0.0f, 1.0f, 1.0f})));
+    REQUIRE(write_binary(replacement.path,
+                         index_bytes(2, 2, {4.0f, 4.0f, 5.0f, 5.0f})));
+
+    voxmutatio::index::CudaFlatIndex index;
+    REQUIRE(index.load(file.path));
+    REQUIRE(::rename(replacement.path.c_str(), file.path.c_str()) == 0);
+
+    const float query[] = {0.0f, 0.0f};
+    const auto [distances, indices] = index.search(query, 1, 1, 2);
+    REQUIRE(distances.size() == 1);
+    REQUIRE(indices.size() == 1);
+    REQUIRE(indices[0] == 0);
+    REQUIRE(distances[0] == Catch::Approx(0.0f));
 }

@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <initializer_list>
 #include <limits>
 #include <utility>
@@ -226,7 +227,7 @@ bool VoiceConversionPipeline::set_runtime_params(int f0_up_key, double formant_s
     return true;
 }
 
-bool VoiceConversionPipeline::init(const VCConfig& config) {
+bool VoiceConversionPipeline::init(const VCConfig& config) try {
     VoiceConversionPipeline staged;
     if (!staged.init_in_place(config)) {
         // Failed re-initialization invalidates and releases every old mmap,
@@ -236,6 +237,12 @@ bool VoiceConversionPipeline::init(const VCConfig& config) {
     }
     *this = std::move(staged);
     return true;
+} catch (...) {
+    // Public initialization is a fail-closed transaction even when a model or
+    // CUDA boundary throws instead of returning false.  Discard both a
+    // partially-built staging graph and any previously initialized graph.
+    *this = VoiceConversionPipeline{};
+    return false;
 }
 
 bool VoiceConversionPipeline::init_in_place(const VCConfig& config) {
@@ -541,7 +548,7 @@ VCResult VoiceConversionPipeline::convert_long(std::vector<float>& audio16k, int
 }
 
 VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
-                                                 int speaker_id) {
+                                                 int speaker_id) try {
     using clock = std::chrono::high_resolution_clock;
     VCResult result;
     auto t_start = clock::now();
@@ -665,11 +672,20 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
     result.success = true;
     result.total_ms = std::chrono::duration<double, std::milli>(clock::now() - t_start).count();
     return result;
+} catch (const std::exception& error) {
+    VCResult result;
+    result.error_message = "buffer conversion runtime exception: ";
+    result.error_message += error.what();
+    return result;
+} catch (...) {
+    VCResult result;
+    result.error_message = "buffer conversion failed with an unknown exception";
+    return result;
 }
 
 VCResult VoiceConversionPipeline::convert_file(const std::string& input_path,
                                                const std::string& output_path,
-                                               int speaker_id) {
+                                               int speaker_id) try {
     VCResult result;
     auto audio = io::read_audio(input_path, 16000);
     if (!audio.has_value()) {
@@ -691,6 +707,15 @@ VCResult VoiceConversionPipeline::convert_file(const std::string& input_path,
         result.success = false;
         result.error_message = "failed to write output: " + output_path;
     }
+    return result;
+} catch (const std::exception& error) {
+    VCResult result;
+    result.error_message = "file conversion runtime exception: ";
+    result.error_message += error.what();
+    return result;
+} catch (...) {
+    VCResult result;
+    result.error_message = "file conversion failed with an unknown exception";
     return result;
 }
 

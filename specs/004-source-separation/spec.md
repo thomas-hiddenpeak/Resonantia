@@ -111,10 +111,13 @@ Spec 003 的 `/api/sep-models` 提供模型发现，`/api/step` 对 material wor
 - `test_separation_roformer`；
 - `test_separation_vad`。
 
-2026-08-12 所有本地资产齐全的 current-tip 完整项目验证为 30/30 CTest（11 contract +
+2026-08-12 加固前所有本地资产齐全的完整项目验证为 30/30 CTest（11 contract +
 19 integration、0 fail，`Total Test time (real) = 356.41 sec`），通过项包含上述五个测试以及
-默认 CLI/HTTP/legacy Web contract。
-这份结果是该资产集和该环境的实现证据，不应外推为任意权重/任意录音的质量保证。
+默认 CLI/HTTP/legacy Web contract。当前 CMake 已扩展为 39 个 distinct tests（16
+contract-labelled、24 integration-labelled、WavLM preflight label overlap）；fresh Release/SM87
+当前工作树已 39/39 通过（0 失败，1297.94 秒）。旧 30/30 只是加固前历史。
+这些结果仅是对应资产集和环境的实现证据，不应外推为
+任意权重/任意录音的质量保证。
 默认 `test_cli_contract` 覆盖 `vc_preprocess` 数值、缺值、registry/default/task mismatch，
 `test_web_contract` 覆盖真实 `/api/step` busy、失败回滚和成功清理。`/api/sep-models` 的
 完整多模型响应与五任务真实权重执行仍不是默认门禁，因此完整工作流验收仍是部分状态。

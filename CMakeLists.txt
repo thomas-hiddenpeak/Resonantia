@@ -68,6 +68,7 @@ target_link_libraries(resonantia_core_obj PRIVATE CUDA::cudart)
 
 resonantia_add_component(resonantia_io_obj
     src/io/audio_io.cpp
+    src/io/bounded_audio_io.cpp
     src/io/safetensors.cpp
 )
 target_link_libraries(resonantia_io_obj PRIVATE resonantia_core_obj)
@@ -158,7 +159,11 @@ target_link_libraries(resonantia_training_obj PRIVATE
 )
 
 resonantia_add_component(resonantia_pipeline_obj
+    src/pipeline/bounded_pipeline.cpp
     src/pipeline/pipeline.cpp
+)
+target_include_directories(resonantia_pipeline_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(resonantia_pipeline_obj PRIVATE
     resonantia_core_obj

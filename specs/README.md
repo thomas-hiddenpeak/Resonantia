@@ -65,7 +65,7 @@ spec 写着 `Complete`，不等于当前提交已经构建并执行了对应测�
 | 修改 autograd、微调或 GAN | [002 spec](./002-voice-training/spec.md)、[训练追踪](./TRACEABILITY.md#训练) | `autograd/`、`training/`、`vc_train`、autograd/training CTest |
 | 修改 STFT、分离或 VAD | [004 spec](./004-source-separation/spec.md)、[分离追踪](./TRACEABILITY.md#声源分离与预处理) | `separation/`、`vc_preprocess`、可选 separation CTest 与资产清单 |
 | 修改 Web/API/上传 | [003 WebUI spec](./003-webui/spec.md)、[Web 追踪](./TRACEABILITY.md#web-服务) | `tools/vc_serve.cpp`、`tools/web/`、`webui/`、真实 HTTP/CLI 进程契约 |
-| 修改 WAV、safetensors、Index 或输入边界 | [I/O 与安全追踪](./TRACEABILITY.md#io输入边界与安全) | 公共头、`io/`、`index/`、默认 contract CTest |
+| 修改 WAV、safetensors、Index 或输入边界 | [I/O 与安全追踪](./TRACEABILITY.md#io输入边界与安全) | 公共头、`io/`、`index/`、[ADR-0004](../docs/adr/0004-bounded-offline-file-conversion.md)、[ADR-0005](../docs/adr/0005-immutable-flat-index-snapshot.md)、默认 contract CTest |
 | 修改构建、依赖或 CI | [构建追踪](./TRACEABILITY.md#构建与验证) | `CMakeLists.txt`、`cmake/ResonantiaTests.cmake`、CI workflow |
 | 纯重构 | [重构章程](../docs/REFACTORING_GUIDE.md) | 受影响需求行、依赖方向、迁移/回滚与全部相关门禁；改变架构边界时先写 [ADR](../docs/adr/README.md) |
 | 汇报项目状态 | [追踪表](./TRACEABILITY.md) | 当前支持矩阵和一份可复现测试运行记录；不要引用历史审计作现状 |
@@ -74,7 +74,7 @@ spec 写着 `Complete`，不等于当前提交已经构建并执行了对应测�
 
 | 文档 | 规范范围 | 使用说明 |
 |---|---|---|
-| [001 Voice Conversion](./001-voice-conversion-engine/spec.md) | 内容、F0、检索、合成、pipeline、转换工具 | 功能目标有效；顶部完成状态和内嵌历史数值需由当前追踪证据复核 |
+| [001 Voice Conversion](./001-voice-conversion-engine/spec.md) | 内容、F0、检索、合成、pipeline、bounded/legacy 文件转换与工具 | 功能目标有效；顶部完成状态和内嵌历史数值需由当前追踪证据复核 |
 | [001 data model](./001-voice-conversion-engine/data-model.md) | 核心数据结构意图 | 与 `core/types.h` 不一致时记录 drift，不由代码自动覆盖模型意图 |
 | [002 Voice Training](./002-voice-training/spec.md) | C++/CUDA 微调与 GAN | 断点续训、生产稳定性和音色效果等未验证项不得由已有训练 smoke 推断 |
 | [003 WebUI](./003-webui/spec.md) | Web/API、上传、训练与转换编排 | As-built baseline；默认开放、可选 token、WAV-only、非实时且服务本身无 TLS |

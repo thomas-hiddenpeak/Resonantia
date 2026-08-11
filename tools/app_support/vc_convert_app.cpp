@@ -11,6 +11,7 @@
 #include <string_view>
 
 #include "tools/app_support/cli_parse.h"
+#include "tools/app_support/file_conversion_policy.h"
 #include "voxmutatio/core/device.h"
 #include "voxmutatio/pipeline/pipeline.h"
 
@@ -244,8 +245,15 @@ int run_vc_convert(const VcConvertOptions& options) {
 
     std::cout << "Converting: " << options.input_path << " -> "
               << options.output_path << "\n";
-    const auto result = pipeline.convert_file(options.input_path, options.output_path,
-                                              options.speaker_id);
+    const bool use_bounded_file_path =
+        file_conversion_path_for(options.config.content_encoder) ==
+        FileConversionPath::kBounded;
+    std::cout << "File path: "
+              << (use_bounded_file_path ? "bounded HuBERT" : "legacy WavLM")
+              << "\n";
+    const auto result = convert_file_with_policy(
+        pipeline, options.config, options.input_path, options.output_path,
+        options.speaker_id);
     if (!result.success) {
         std::cerr << "Conversion failed: " << result.error_message << "\n";
         return 1;

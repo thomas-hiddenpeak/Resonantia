@@ -139,6 +139,9 @@ struct VCResult {
 Timing fields are per-call observations, not service-level guarantees. Callers must inspect
 `success`; on failure, `error_message` describes the boundary that failed.
 
+`convert_file_bounded` 成功时以目标 WAV 作为 delivery，`audio.data` 为空且
+`audio.sample_rate=40000`；旧 `convert_file`/`convert_buffer` 仍返回完整 owning audio。
+
 ## 5. Pipeline Data Flow
 
 ```text
@@ -155,10 +158,11 @@ Input WAV (supported PCM/float encoding, any accepted sample rate/channels)
     -> WAV
 ```
 
-长音频在 16 kHz 前端上进行全局 F0 处理，并按安静点分块；每块带上下文推理，
-裁剪后拼接。HuBERT、Index 与 VITS 受单块大小约束；F0 仍对整段 padded clip 一次执行，
-输入、全段前处理和完整输出也保留在 host memory，因此 host 与 F0 CPU/GPU working set
-都随时长增长。该状态模型不定义流式协议。
+HuBERT file callers 使用 bounded path：稳定 16 kHz spool、quiet core、windowed F0、逐块
+HuBERT/Index/VITS、全局 RMS 与 incremental atomic writer 不在内存保留全段音频。F0 单次
+输入硬上界为 `128000+2F`；content 上界使用 `Ceff/Qeff/Peff`，详见 Spec 001 migration。
+WavLM caller 与旧 `convert_file`/`convert_buffer` 保留 legacy whole-clip F0/owning result，
+working set 仍随时长增长。两者都不定义流式协议。
 
 ## 6. Tensor and Weight Conventions
 
@@ -182,3 +186,8 @@ Input WAV (supported PCM/float encoding, any accepted sample rate/channels)
 - 文件入口在目标同目录创建唯一 staging 文件，完整写入、`fsync` 和 close 成功后以
   rename 原子替换目标；失败清理 staging 并保留旧目标。调用方仍必须以
   `VCResult::success` 判断交付，不能仅以目标文件存在作为成功依据。
+- 可恢复的 Pipeline model/I/O/CUDA/runtime 异常转为失败 `VCResult`；持续 host allocation
+  failure 在连 reset/result 都无法构造时可传播。Synthesizer 自身的公开边界捕获内部异常并
+  返回 false/empty。
+- VITS checkpoint 以 256 MiB cap 复制到共享 read-only anonymous snapshot；Flat Index 使用
+  private unlinked filesystem snapshot。两者的容量与 resident-memory 取舍不同，不能混称。

@@ -1,7 +1,7 @@
 # Implementation Plan: Voice Training
 
 **Branch**: `002-voice-training`
-**Updated**: 2026-08-09
+**Updated**: 2026-08-12
 **Status**: Experimental / partially complete
 
 ## Delivery Strategy
@@ -47,7 +47,9 @@ decoder fine-tune，再扩展到 posterior/flow/discriminator 的完整 GAN step
 - [x] HuBERT + RMVPE + v2/40k 前端，随机固定长度片段。
 - [x] decoder 与 `--gan` 两种实验模式。
 - [x] step/loss 文本进度和最终 G 导出。
-- [x] 独立 `build_index` CLI。
+- [x] 独立 `build_index` CLI；输入 WAV 按确定路径顺序处理，最终 Index 以同目录唯一 staging、
+  `fsync`/close + rename 原子发布，失败保留旧目标。真实 HuBERT/语音 contract 已在
+  fresh Release/SM87 当前工作树 39/39 全量中通过。
 - [ ] 完整数据 catalog/cache/版本化与可重入预处理事务。
 - [ ] 稳定的机器可读事件协议。
 - [x] 严格解析 CLI 数值参数，并由真实进程门禁拒绝 malformed、非有限、溢出、空白、

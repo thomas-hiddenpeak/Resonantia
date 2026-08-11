@@ -5,37 +5,42 @@
 
 ## 证据口径
 
-- 默认门禁由 `VOXMUTATIO_BUILD_TESTS=ON` 注册，当前包括 core、audio I/O、content
-  kernels、F0 基础、Index 边界、pipeline smoke、autograd、真实 CLI 进程、真实 HTTP
-  socket 契约、legacy Web API 和 realtime 报告 validator，共 11 项。
+- 默认门禁由 `VOXMUTATIO_BUILD_TESTS=ON` 注册，asset-free 配置当前有 15 项，包括 core、
+  audio/bounded I/O、content kernels、F0、immutable Index、pipeline/bounded DSP、autograd、
+  两个私有 CUDA failure targets、真实 CLI/HTTP、legacy Web API 和 realtime 报告 validator。
 - 资产门禁仅在 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON` 时构建；每个测试还要通过
-  `cmake/ResonantiaTests.cmake` 的资产存在检查，当前完整资产环境注册 19 项。缺资产时
-  “不注册”不是“通过”。
-- 7 个 CUDA contract 与全部 19 个 integration 共用 `RESOURCE_LOCK voxmutatio_gpu`；CLI、
-  HTTP、legacy Web API 与 realtime 报告 validator 四个 host contract 不占 GPU lock。当前 CI 在普通 PR 只做
+  `cmake/ResonantiaTests.cmake` 的资产存在检查。完整资产配置当前共注册 39 个 distinct
+  tests：16 contract-labelled、24 integration-labelled；`test_bounded_file_wavlm_preflight`
+  同时属于两类，所以不能把 16+24 写成总数。缺资产时“不注册”不是“通过”。
+- GPU 测试共用 `RESOURCE_LOCK voxmutatio_gpu`；bounded I/O、CLI、HTTP、legacy Web API 与
+  realtime 报告 validator 等 host contract 不占 GPU lock。当前 CI 在普通 PR 只做
   仓库策略检查；ARM64/SM87 CUDA build 与默认 contract CTest 只在 `main` push 或手动触发。
-- `/tmp/resonantia-audit-final.VbIWW3` 的 Release/SM87、model-tests-enabled current tip
-  于 2026-08-12 成功构建并完整运行 **30/30 passed**（11 contract + 19 integration、
-  0 failures，`Total Test time (real) = 356.41 sec`）；`test_long_audio_chunking` 为
-  223.61 秒。未注册资产、standalone probe 与尚不存在的 realtime 产品验收不能计作通过。
+- 2026-08-12 的 fresh Release/SM87 build `/tmp/resonantia-nonrt-final.a8O1Ay` 已执行
+  39/39（0 失败，`Total Test time (real) = 1297.94 sec`）。关键耗时为
+  `test_cli_bounded_callers` 75.89 秒、`test_long_audio_chunking` 438.00 秒、
+  `test_bounded_file_resources` 326.92 秒、`test_bounded_file_fcpe_v1` 249.34 秒。
+  `/tmp/resonantia-audit-final.VbIWW3` 的加固前 30/30（11 contract + 19 integration、
+  356.41 秒）只保留为历史基线。未注册资产、focused pass、standalone probe 与尚不存在的
+  realtime 产品验收仍不能单独计作全量通过。
 
 ## VC 推理与转换
 
 | ID / 约束 | 当前实现位置 | CTest / 其他证据 | 状态与缺口 |
 |---|---|---|---|
-| VC-FR-001 WAV I/O | `io/audio_io.*`、`pipeline::convert_file` | `test_audio_io`（默认）；`test_e2e_conversion`（资产门禁） | **已实现·默认门禁**；FLAC/MP3 不支持 |
-| VC-FR-002 Resampling | `io::resample_linear`、`pipeline/pipeline.cpp` 的 16 kHz 前端与 40 kHz 模型率输出 | `test_audio_io` resample（默认）；e2e（资产门禁） | **已实现·默认门禁**；当前 synthesizer 仅兼容 40 kHz，不提供其他模型率或独立目标输出采样率 |
+| VC-FR-001 WAV I/O | `io/audio_io.*`、private `io/bounded_audio_io.*`、pipeline file APIs | `test_audio_io`、`test_bounded_audio_io`（默认）；`test_e2e_conversion`（资产门禁） | **已实现·默认门禁**；seekable bounded reader/atomic streaming writer 有独立门禁，FLAC/MP3 不支持 |
+| VC-FR-002 Resampling | `io::resample_linear`、`bounded_pipeline.cpp` 的全局相位 16 kHz spool 与 40 kHz 模型率输出 | `test_audio_io` + `test_bounded_pipeline_dsp`（默认）；e2e（资产门禁） | **已实现·默认门禁**；当前 synthesizer 仅兼容 40 kHz，不提供其他模型率或独立目标输出采样率 |
 | VC-FR-003 HuBERT default | `content/hubert_encoder.*`、pipeline 默认 encoder、v1/v2 feature dim | `test_hubert_inference`、`test_pipeline_contract`（资产门禁） | **已实现·可选门禁** |
-| VC-FR-004 Optional WavLM | `content/wavlm_encoder.*`、pipeline encoder 分发 | `test_wavlm_alignment`（资产门禁） | **部分**：实现与对齐门禁存在；是否匹配 synthesizer 由调用方/模型资产保证，stock RVC 不可无条件替换 |
-| VC-FR-005 F0 | `f0/rmvpe*`、`f0/fcpe.*`、pipeline F0 分发；完整 tensor manifest、staged init、公开输入 finite/size 边界；`rmvpe_ops.cu` 临时 device buffer 使用 `core::CudaBuffer` | `test_f0`（默认基础/坏 checkpoint）；RMVPE/FCPE alignment（资产门禁，含失败重初始化与输入边界） | **已实现·默认及可选门禁**；PM 明确不支持；RAII 消除算子部分分配后异常的裸资源泄漏路径，但未作 CUDA OOM 故障注入 |
-| VC-FR-006 Index | `index/cuda_flat_index.*`；`pipeline/pipeline.cpp` 的 required-rate/feature-width/lookup-failure 边界 | `test_index`（默认边界/移动）；`test_index_retrieval` 与 pipeline 错维/缺失 Index 契约（资产门禁） | **已实现·默认门禁**；真实特征检索为可选门禁；非零 rate 不再静默旁路缺失、错维或失败的 Index |
-| VC-FR-007 Synthesizer | `synthesizer/synthesizer.*`：完整 used-tensor F32/shape/nbytes/alignment/finite、weight-norm 非退化/有限可表示重建、instance-owned const validated mmap + absolute/lexically-normal path + device/inode/size/mtime/ctime 身份检查、全部公开 infer/debug size/input/output finite fail-closed；`vits_ops.cu` 临时 device buffer RAII | `test_pipeline_smoke` sparse checkpoint/weight-norm/替换/CWD/finite/各入口 size 边界（默认）；`test_vits_alignment`、`test_vits_gen_debug`、pipeline synthesizer contract（资产门禁） | **已实现·默认及可选门禁**；默认层证明边界/回滚，真实模型数值仍由可选门禁证明；F0 v1/v2，non-F0 拒绝；身份检查后恶意并发原地 truncate 的 mmap TOCTOU/SIGBUS 未作故障注入 |
-| VC-FR-008 Pipeline | `pipeline/pipeline.*`：内容/F0/Index/protect/RMS/分块拼接 | `test_pipeline_smoke`（默认）；pipeline contract、e2e、long audio（资产门禁） | **部分**：HuBERT/Index/VITS 按块执行；F0 仍整段执行，host 与 F0 CPU/GPU working set 随时长增长；约 18 秒 fixture 不等于真实 5 分钟资源实测 |
-| VC-FR-009 Numerical safety | 公共入口边界、`core/cuda_buffer.h`、各模块 checked loaders；VITS 全部公开 infer/debug 的尺寸乘积与输入/输出 finite gate；RMVPE/VITS ops 的 RAII 临时分配 | audio/index/content/autograd 与 VITS sparse-checkpoint/finite/各入口 size 默认边界；pipeline/model rollback 和真实模型对齐为资产门禁 | **部分**：本轮补齐 VITS 可观察数值边界并消除两组 ops 的裸临时分配；并非每条 CUDA kernel/library 失败都有故障注入 |
+| VC-FR-004 Optional WavLM | `content/wavlm_encoder.*`、pipeline encoder 分发、caller file policy | `test_wavlm_alignment`、bounded preflight（资产门禁） | **部分**：encoder 实现与对齐门禁存在；没有匹配的 WavLM-trained VITS bounded 资格资产，故 CLI/batch 明确走 legacy 而非静默换 HuBERT |
+| VC-FR-005 F0 | `f0/rmvpe*`、`f0/fcpe.*`、bounded F0 window/spool；完整 manifest、staged init、finite/size 边界；ops 使用 `CudaBuffer` | `test_f0`、`test_cuda_failure`（默认）；RMVPE/FCPE alignment + final window profiles（资产门禁） | **已实现·默认及可选门禁**；PM 不支持；bounded raw core 128000，RMVPE/FCPE 单侧 context 64000/32000，硬输入独立为 256000/192000；故障注入是代表性路径，不是每条 CUDA 调用 |
+| VC-FR-006 Index | `index/cuda_flat_index.*` private unlinked filesystem snapshot；pipeline required-rate/width/lookup fail-closed | `test_index` FIFO/source-mutation/exact（默认）；`test_index_retrieval`（资产门禁） | **已实现·默认及可选门禁**；优先 `FICLONE`、否则 1 MiB bounded copy/compare，需要 `O(Index)` 临时 filesystem 容量；fallback 分支未被强制注入，ENOSPC/权限失败显式拒绝，非零 rate 不旁路 |
+| VC-FR-007 Synthesizer | `synthesizer/synthesizer.*`：完整 manifest/weight-norm；256 MiB VITS-only read-only anonymous snapshot + absolute path identity；公开 infer/debug finite/size/exception fail-closed；VITS ops RAII | `test_audio_io` snapshot/FIFO/ABA/read-only（默认）；`test_pipeline_smoke` VITS truncate/path replacement/CWD/finite/size（默认）；`test_synth_cuda_failure`（默认）；VITS/pipeline model tests（资产门禁） | **已实现·默认及可选门禁**；source truncate 不再造成 active mapping SIGBUS，路径身份变化仍拒绝调用；成功 init 约增加 checkpoint-size host residency；其他模型仍 file-backed |
+| VC-FR-008 Pipeline | `pipeline/pipeline.*`、`bounded_pipeline.*`、shared caller policy | pipeline/bounded DSP（默认）；pipeline/e2e/long/F0/resource/CLI caller（资产门禁） | **已实现·默认及可选门禁**：HuBERT callers bounded；direct E2E matrix 为 RMVPE/v2 + FCPE/v1，另有两种 F0 profiles；effective core=`Ceff+2Qeff`、content=`Ceff+2Qeff+2Peff+160`；17.565/35.130 秒 RSS 1342624/1354844 KiB、device 892334080/851812352 B。只有两个时长点且无独立 click threshold；legacy buffer/file 与 WavLM 仍随时长增长 |
+| VC-FR-009 Numerical safety | 公共 checked boundaries、`CudaBuffer`、VITS public exception boundary、RMVPE/VITS private fault seams | `test_cuda_failure`、`test_synth_cuda_failure` 及模块默认边界；真实模型 rollback/alignment 为资产门禁 | **部分**：代表性 allocation、H2D/D2H、pre-launch、observable sync 和 host-allocation failure 已注入且 seam 不进入 production；并非每条 CUDA/cuBLAS/cuFFT 或真实系统 OOM 都被注入，Pipeline 持续 `bad_alloc` 可传播 |
 | VC-FR-010 Output | pipeline/40 kHz model-rate `AudioBuffer`、`io::write_audio`、`vc_convert` 输出 | `test_audio_io` 原子替换/失败保留（默认）；e2e 有限/非空输出（资产门禁） | **已实现·默认门禁**：只支持当前 40 kHz model-rate WAV；同目录 staging 经 fsync/close 后 rename，失败保留旧目标 |
-| VC-FR-011 CLI | `tools/app_support/cli_parse.h`、各 `vc_*_app.*` Options/parser/runner、薄 main 与现有 CMake target | `test_cli_contract` 真实进程非法语法/退出码（默认） | **部分**：严格解析与失败契约有默认门禁；真实模型 CLI 成功 WAV 仍缺资产门禁 |
+| VC-FR-011 CLI | `tools/app_support/cli_parse.h`、`file_conversion_policy.h`、各 app-support/薄 main | `test_cli_contract`（默认）；`test_cli_bounded_callers` 真实 HuBERT/RMVPE/v2/speech（资产门禁） | **部分**：严格解析、失败和 `vc_convert`/单文件 `vc_batch` bounded caller 已在当前 39/39 中通过；WavLM 明确 legacy，`vc_probe` 仍无行为验收 |
 | VC 初始化失败不得保留旧模型 | `pipeline/pipeline.cpp::init` staging/commit | `test_pipeline_contract` failed reinitialization（资产门禁） | **已实现·可选门禁** |
-| VC-FR-012 Auxiliary CLIs | `vc_batch`、`vc_probe` CMake targets | `test_cli_contract` 覆盖 `vc_batch` 数值失败；无 `vc_probe` 行为门禁 | **部分**：`vc_probe` 仍是骨架；不得计入 Spec 001 完成证据 |
+| VC-FR-012 Auxiliary CLIs | `vc_batch`、`vc_probe` CMake targets | `test_cli_contract` 覆盖 batch 数值失败；`test_cli_bounded_callers` 覆盖单文件成功；无 `vc_probe` 行为门禁 | **部分**：`vc_probe` 仍是骨架；不得计入 Spec 001 完成证据 |
+| VC-MIG-001..006 Bounded file migration | additive API + private bounded I/O/planner/F0/RMS + shared HuBERT caller policy；legacy API 保留 | bounded I/O/DSP、RMVPE/FCPE profiles、long/resource/WavLM preflight/CLI caller | **已实现·默认及可选门禁**：R1–R5 已实施并经当前工作树 39/39 收口；临时 disk `O(duration)`、WavLM legacy、只有两个资源时长点且无独立 click threshold 仍是明示证据边界 |
 
 ## 训练
 
@@ -50,7 +55,7 @@
 | TR-FR-007 WAV/data baseline | `tools/app_support/vc_train_app.cpp` 的发现、前端与固定片段采样；`vc_preprocess_app.cpp` 可独立准备片段；对应 `tools/vc_*.cpp` 为薄 main | `test_cli_contract` 严格数值/退出码（默认）；无独立 filelist/cache/batching 产品 CTest | **部分**：训练路径与严格参数边界存在；完整数据产品仍缺 |
 | TR-FR-008 Progress | `vc_train_app.cpp` runner 的文本 step/loss 输出 | 无机器可读协议 CTest | **部分**：稳定结构化协议未定义 |
 | TR-FR-009 Inference G export | `GeneratorTrainer::export_model`、`vc_train` 临时文件 + rename | generator zero-step/训练后 round-trip（资产门禁） | **已实现·可选门禁** |
-| TR-FR-010 Independent Index build | `tools/build_index.cpp` | index contract/retrieval；无训练事务集成测试 | **部分**：工具独立可构建，未与 G 导出原子绑定 |
+| TR-FR-010 Independent Index build | `tools/build_index.cpp`：确定路径排序、same-directory unique staging、fsync/close + rename | `test_build_index_contract` 真实 HuBERT/语音确定性/旧 inode/失败清理（资产门禁）；无训练事务集成 | **部分**：工具独立构建与发布已加固，仍未与 G 导出原子绑定 |
 | TR-FR-011 Checkpoint resume | 无 G/D/optimizer/epoch/RNG 持久化 | 无 | **不支持** |
 | TR-FR-012 Legacy `FineTuneTrainer` | `training/fine_tuning.cpp` | `test_core` 仅验证畸形 dataset | **不支持**：门面必须失败 |
 | TR-FR-013 Distributed/FP16/multi-GPU/from-scratch | 无 | 无 | **不支持** |
@@ -117,7 +122,7 @@ fail-closed 和 standalone exact-retrieval 诊断 probe；这些 scaffold 不等
 | RT-FR-015 Latency and stability | 已批准 Index-enabled 10-minute benchmark + 250/350 ms SLO，要求 0 fallback | current pipeline diagnostic RTF≈2.82；standalone probe 记录 synthetic/available-feature exact retrieval latency/memory | **不支持**：无产品 runner/代表性 target/full pipeline；probe 不是 SLO/backend/上限 |
 | RT-FR-016 Numerical and continuity safety | 已批准 real-asset stream/continuity、Index exact retrieval 与 Index/no-index 质量 A/B gates | standalone probe 与 CPU exact reference 对拍；legacy crop/phase characterization；离线 module/E2E/Index 门禁 | **不支持**：没有 target-speaker 质量 A/B、stream continuity 或 boundary gate |
 | RT-FR-017 Memory evidence | 已批准 fixed workspace + endurance memory report 目标 | 无 realtime resource gate | **不支持** |
-| RT-FR-018 Offline compatibility | 既有 Spec 001/API/CLI/CTest 在未来迁移中保持 | 2026-08-12 current tip 30/30（11 contract + 19 integration、0 fail，356.41 秒）；尚未发生 realtime 产品迁移 | **提案约束**：R0 scaffold 加入后现有 suite 未回退；后续迁移仍须以各自 current-tip 复验为准 |
+| RT-FR-018 Offline compatibility | 既有 Spec 001/API/CLI/CTest 在未来迁移中保持 | 加固前 30/30 为历史；当前 39 distinct（16 contract-labelled、24 integration-labelled、1 overlap）已全量通过；尚未发生 realtime 产品迁移 | **提案约束**：本轮仅加固离线，不改变 realtime 实现状态；未来迁移仍须对对应待合入工作树 fresh 复验 |
 
 ## I/O、输入边界与安全
 
@@ -126,10 +131,10 @@ fail-closed 和 standalone exact-retrieval 诊断 probe；这些 scaffold 不等
 | IO-001：WAV 读写、未知 chunk、声道下混 | `io/audio_io.*` | `test_audio_io`（默认） | **已实现·默认门禁** |
 | IO-002：重采样参数边界 | `io/audio_io.*` | `test_audio_io`（默认） | **已实现·默认门禁**；质量为线性重采样，未声明高保真指标 |
 | IO-003：FLAC/MP3 | 无解码实现；pipeline 仅接受 `output_format=wav` | pipeline contract（资产门禁）、支持矩阵 | **不支持** |
-| IO-004：safetensors shape/dtype/offset/payload | `io/safetensors.*`、`training/checked_weights.h` | `test_audio_io` 默认边界；训练 rollback 资产门禁 | **已实现·默认门禁**（通用解析边界） |
-| IO-005：Index header、维度、范围、k、move | `index/cuda_flat_index.*` | `test_index`（默认） | **已实现·默认门禁** |
-| SEC-001：CUDA allocation/copy 失败不可继续 | `core/cuda_buffer.h` 与模块错误检查；`rmvpe_ops.cu`、`vits_ops.cu` 的全部临时 device allocation 使用 RAII | autograd/content kernel contract 与 VITS 默认数值边界覆盖部分路径；RMVPE/VITS 真实模型测试覆盖正常执行 | **部分**：两组 ops 的部分分配后异常会沿栈释放；不是每条 CUDA kernel 路径都有独立 OOM/copy/launch 故障注入 |
-| SEC-002：初始化失败不保留半加载状态 | pipeline、RMVPE/FCPE、VITS 与训练模型 staging/reset/initialized guards；VITS 实例持有已验证 mmap 并检测 checkpoint 文件身份变化 | F0 默认坏 checkpoint、VITS sparse checkpoint/替换（默认）；F0 alignment、pipeline/training rollback tests（资产门禁） | **已实现·默认及可选门禁** |
+| IO-004：safetensors shape/dtype/offset/payload | `io/safetensors.*`、`training/checked_weights.h`；VITS 选择 capped anonymous snapshot | `test_audio_io` parse/snapshot/FIFO/ABA/truncate/read-only（默认）；训练 rollback 资产门禁 | **已实现·默认门禁**：通用 loader 仍 file-backed；VITS-only snapshot 上限 256 MiB，单 fd 身份前后复验 |
+| IO-005：Index header、维度、范围、k、move/snapshot | `index/cuda_flat_index.*`、ADR-0005 | `test_index` FIFO/truncate/overwrite/exact/move（默认）；真实 retrieval（资产门禁） | **已实现·默认及可选门禁**；private unlinked filesystem snapshot 保持 exact mmap 热路径；copy capacity/未强制注入 reflink fallback 明示 |
+| SEC-001：CUDA allocation/copy 失败不可继续 | `CudaBuffer`、RMVPE/VITS ops checked launches、test-only fault macro | `test_cuda_failure` + `test_synth_cuda_failure`（默认）；真实模型正常路径（资产门禁） | **部分**：代表性 allocation/H2D/D2H/pre-launch/sync/public boundary 已注入并验证 RAII；不是所有 kernel/library/OOM 路径 |
+| SEC-002：初始化失败不保留半加载状态 | pipeline、RMVPE/FCPE、VITS 与训练 staged/reset guards；VITS anonymous snapshot/path identity；Index snapshot transaction | F0/VITS/Index 默认坏输入与 replacement；pipeline/training rollback（资产门禁） | **已实现·默认及可选门禁** |
 
 ## 构建与验证
 
@@ -137,11 +142,11 @@ fail-closed 和 standalone exact-retrieval 诊断 probe；这些 scaffold 不等
 |---|---|---|---|
 | BUILD-001：CMake 3.24、C++20/CUDA20、显式 CUDA 架构 | 根 `CMakeLists.txt`，默认 SM87 cache | configure/build 命令；可信 ARM64 CI | **已实现**；非 SM87 产品支持未知 |
 | BUILD-002：核心库与 CLI 目标 | 显式 source list + 12 个内部 OBJECT 组件；`voxmutatio` static compatibility facade；四个按命令隔离的 `resonantia_vc_*_app_support` 与 `resonantia_web_support`；既有 CLI targets | fresh build、CMake graph、静态库符号集合与 CLI/HTTP contract | **已实现**；内部 target 不构成新公共 ABI |
-| BUILD-003：可复现默认 contract suite | `cmake/ResonantiaTests.cmake`；优先系统 Catch2 3.4，缺失时使用固定 3.4.0 archive + SHA-256 | CI `ctest --label-regex contract` | **已实现·默认门禁**；跨机器的系统包补丁版本可能不同 |
+| BUILD-003：可复现默认 contract suite | `cmake/ResonantiaTests.cmake`；优先系统 Catch2 3.4，缺失时使用固定 3.4.0 archive + SHA-256 | asset-free 15 tests；full config 39 distinct / 16 contract-labelled / 24 integration-labelled / 1 overlap | **已实现·默认门禁**；fresh Release/SM87 当前工作树已 39/39 通过（0 失败，1297.94 秒）；跨机器系统包补丁版本可能不同 |
 | BUILD-004：模型/fixture 测试不得假通过 | `VOXMUTATIO_ENABLE_MODEL_TESTS`、每测试 `ASSETS` 注册检查 | configure 输出缺失资产原因 | **已实现** |
 | BUILD-005：GPU 测试串行与 timeout | CTest `RESOURCE_LOCK voxmutatio_gpu`、每测试 timeout | CTest properties | **已实现** |
 | BUILD-006：PR 与自托管 runner 安全边界 | `.github/workflows/ci.yml` | PR 只跑 repository-policy；`main` push/manual 才跑 GPU | **已实现**；普通 PR 没有编译门禁，这是显式覆盖缺口 |
-| BUILD-007：SDD/Codex bridge | 根 `AGENTS.md`、`scripts/check_sdd.sh`、SDD 索引与 ADR 模板 | repository-policy 在 PR/push 运行 SDD contract；本地 bridge smoke | **已实现**；模块重构由 Accepted ADR-0001 追踪；ADR-0002 R0 仅部分完成，qualification 仍被 target model + matching Index/licensed corpus 阻塞 |
+| BUILD-007：SDD/Codex bridge | 根 `AGENTS.md`、`scripts/check_sdd.sh`、SDD 索引与 ADR 模板 | repository-policy + 本地 32-required-file/link contract | **已实现**；ADR-0004/0005 追踪本轮离线迁移；ADR-0002/Spec006 实现状态未改变 |
 
 ## 更新规则
 
