@@ -1,113 +1,101 @@
 # Implementation Plan: Voice Conversion Engine
 
-**Branch**: `001-voice-conversion-engine` | **Date**: 2026-08-07
-**Status**: 推理部分 Complete(P0–P5 已完成并数值对齐);训练与 WebUI(原 P6)已拆分为独立 spec 002/003。
+**Branch**: `001-voice-conversion-engine`
+**Status**: Library/pipeline implemented; CLI acceptance incomplete
+**Updated**: 2026-08-09
 
-> 事实基线见 [specs/PROJECT_STATE.md](../PROJECT_STATE.md)。本 plan 仅覆盖 001 的推理引擎范围。
+## Current Delivery
 
-## Summary
+当前交付是 Jetson/SM87 面向的 C++20/CUDA20 离线推理链。运行时模型为
+safetensors，内部音频为 mono float32，模型计算为 CUDA FP32：
 
-构建纯 C++20/CUDA 的声音转换引擎，完整实现 RVC (Retrieval-based Voice Conversion) 的推理和训练管线。核心模块包括：内容编码器 (WavLM/HuBERT)、F0 提取器 (RMVPE/FCPE)、CUDA 特征检索、VITS 合成器、端到端 Pipeline、CLI 工具和 WebUI。
-
-## Technical Context
-
-**Language/Version**: C++20 / CUDA 20
-**Primary Dependencies**: cuBLAS, CUTLASS (submodule), CUDA Runtime
-**Storage**: safetensors (zero-copy mmap)
-**Testing**: CTest + 数值对齐探针
-**Target Platform**: NVIDIA Jetson AGX Orin (SM87)
-**Project Type**: 独立 C++ 库 + CLI 工具 + WebUI 服务
-**Performance Goals**: 端到端 < 5s (5s 音频, Jetson AGX Orin)
-
-## Constitution Check
-*GATE: 宪法 v1.4.0(11 条原则)。*
-
-| Principle | Compliance | Notes |
-|-----------|------------|-------|
-| I. Library-First | ✅ | 每个模块独立编译单元 |
-| II. CLI Interface | ✅ | vc_convert, vc_batch, vc_probe, build_index |
-| III. Test-First | ✅ | 数值对齐门控;10/10 测试通过 |
-| IV. safetensors-Only | ✅ | 零拷贝 mmap,无 pickle |
-| V. Zero-Dependency Purity | ✅ | 手写 CUDA Index,无 FAISS/ONNX |
-| VI. Numerical Alignment | ✅ | HuBERT 7e-7 / F0 1.5e-5Hz / 音频 0.9997 |
-| VII. Simplicity | ✅ | 不照搬 RVC-WebUI |
-| VIII. Anti-Abstraction | ✅ | 直接使用 cuBLAS/CUDA |
-| IX. Integration-First | ✅ | test_e2e_conversion 为最高优先级 |
-| X. Real Audio Only | ✅ | 全部用 LibriSpeech 真实语音对齐 |
-| XI. Python Isolation | ✅ | Python 仅在 tools/(uv);运行时零依赖 |
-
-## Project Structure
-
-### Documentation (this feature)
-```
-specs/001-voice-conversion-engine/
-├── spec.md               # 功能规格
-├── plan.md               # 实施计划 (本文档)
-├── research.md           # 技术调研
-└── data-model.md         # 数据模型
+```text
+WAV -> 16 kHz front-end -> HuBERT(default) -> optional Flat Index
+    -> RMVPE(default) or FCPE -> F0 VITS v1/v2 -> 40 kHz model-rate WAV
 ```
 
-### Source Code (repository root)
-```
-include/voxmutatio/
-├── core/                 # P0: 核心类型、设备管理
-├── io/                   # P0: 音频 I/O、safetensors 加载
-├── content/              # P1: WavLM/HuBERT 编码器
-├── f0/                   # P2: RMVPE/FCPE F0 提取
-├── index/                # P3: CUDA Flat Index
-├── synthesizer/          # P4: VITS 合成器
-├── pipeline/             # P5: 端到端编排
-├── training/             # P6: 微调训练
-└── webui/                # P6: WebUI 服务
+## Implemented Phases
 
-src/                      # 对应实现文件 (.cpp, .cu, .cuh)
-tools/                    # CLI 工具
-tests/                    # 测试套件
-```
+### P0 — Build, device and contracts
 
-## Implementation Phases
+- [x] CMake C++20/CUDA20，默认 SM87，可自动发现 CUDA compiler。
+- [x] CUDA device 初始化、RAII buffer 和错误传播。
+- [x] 无本地模型资产的 contract 层。
 
-> 状态图例:✅ 完成并验证 · ⚠️ 骨架/桩 · ➡️ 拆分到独立 spec
+### P1 — Core I/O and weights
 
-### Phase 0: Infrastructure (P0) — ✅ 完成
-- [x] `core/types.cpp` - 错误码字符串化
-- [x] `core/device.cpp` - CUDA 设备管理
-- [x] `io/safetensors.cpp` - safetensors 零拷贝加载(健壮 tokenizer,213/741/560 张量)
-- [x] `io/audio_io.cpp` - WAV 读写 + 重采样
-- [x] 编译验证:`cmake --build build`
+- [x] WAV 读取/写入、mono 下混与线性重采样。
+- [x] safetensors 解析与布局/字节数校验；模型消费者按各自 manifest 校验必需权重的
+  dtype、shape、数值与模型不变量。
+- [x] 明确拒绝非 WAV 音频格式。
 
-### Phase 1: Content Encoder (P1) — ✅ HuBERT 完成 / ⚠️ WavLM 桩
-- [x] `content/hubert_encoder.cpp` - HuBERT (ContentVec) CNN 特征提取器 + 12 层 Transformer
-- [ ] `content/wavlm_encoder` - ⚠️ 文件存在但未接入/未验证(规划中)
-- [x] `test_hubert_inference.cpp` - 数值对齐(RMS 7.1e-07 < 1e-4)
+### P2 — Content and F0
 
-### Phase 2: F0 Extraction (P2) — ✅ RMVPE 完成 / ⚠️ FCPE 未实现
-- [x] `f0/rmvpe.cpp` + `rmvpe_ops.cu` - DeepUnet + BiGRU CUDA 实现
-- [ ] `f0/fcpe` - ⚠️ 未实现(规划中)
-- [x] `test_rmvpe_alignment.cpp` - F0 对齐(1.5e-05 Hz < 0.5 Hz)
+- [x] HuBERT 默认路径：v1 256D、v2 768D。
+- [x] WavLM 可选实现与资产门控对齐；要求匹配训练的 synthesizer。
+- [x] RMVPE 默认实现。
+- [x] FCPE 可选实现与资产门控对齐。
+- [x] PM 保留枚举但在 pipeline 明确拒绝。
 
-### Phase 3: Feature Index (P3) — ✅ 完成
-- [x] `index/cuda_flat_index.cpp` - 加权 k-NN 检索 + build_index 工具
-- [x] `test_index_retrieval.cpp` - 检索一致性(cosine 1.0)
+### P3 — Index and synthesizer
 
-### Phase 4: Synthesizer (P4) — ✅ 完成
-- [x] TextEncoder(相对位置注意力) + Flow(WaveNet 耦合) + GeneratorNSF
-- [x] `test_vits_alignment.cpp` - 音频对齐(相关性 0.9997 > 0.999)
+- [x] 内存映射 Flat Index 与精确加权 k-NN。
+- [x] F0 VITS v1/v2：TextEncoder、Flow、NSF/HiFi-GAN Generator。
+- [x] 版本、特征维度、speaker、pitch、F0 指针和尺寸边界校验。
+- [x] non-F0 明确拒绝。
 
-### Phase 5: Pipeline (P5) — ✅ 完成
-- [x] `pipeline/pipeline.cpp` - 端到端编排(含 index_rate 混合)
-- [x] `test_e2e_conversion.cpp` - 集成测试(相关性 0.9997)
-- [x] `tools/vc_convert.cpp` - CLI 工具可用
+### P4 — Pipeline and CLI
 
-### Phase 6: 训练 + WebUI — ➡️ 拆分为独立 spec
-- ➡️ `training/` 微调训练 → **spec 002-training**(当前仅 TODO 桩)
-- ➡️ `webui/` WebUI 服务 → **spec 003-webui**(前端存在但无 server 可执行文件)
-- [ ] `tools/vc_batch.cpp` - ⚠️ 骨架,待随对齐更新验证
+- [x] HuBERT/RMVPE/Index/VITS 编排。
+- [x] protect、RMS mix、pitch、F0 filter。
+- [x] 安静点分块、上下文 padding、拼接和输出长度边界。
+- [x] `vc_convert` 与当前支持的 40 kHz model-rate WAV 输出；失败返回非零状态。
+- [x] WAV 目标文件同目录 staged write + `fsync`/close + atomic rename；失败保留旧目标并
+  清理 staging。
+- [x] CPU、FP16、formant shift、非 WAV、独立 target sample rate 的失败契约。
 
-## Complexity Tracking
+### P5 — Verification
 
-| Violation | Why Needed | Simpler Alternative Rejected Because |
-|-----------|------------|-------------------------------------|
-| 双内容编码器 (WavLM + HuBERT) | WavLM 鲁棒性强，HuBERT 生态兼容 | 只做 HuBERT 会丢失 WavLM 的噪音鲁棒性 |
-| 双 F0 提取器 (RMVPE + FCPE) | 离线/实时双场景需求 | 只做 RMVPE 无法满足实时 < 2ms 延迟 |
-| 手写 CUDA Index | 宪法原则 V (零依赖) | FAISS 引入大型外部依赖，违反纯度原则 |
+- [x] 默认 contract：最近一次验证 11/11，包含 CLI/HTTP 进程、legacy Web API 与 realtime 报告
+  validator；后者不扩大 Spec 001 产品范围。
+- [x] 本地资产齐全时：最近一次完整验证 30/30 CTest（11 contract + 19 integration、
+  0 fail，real 335.05 秒）。
+- [x] HuBERT、RMVPE、FCPE、WavLM、VITS、端到端和长音频均由资产门控的
+  integration 测试覆盖。
+- [x] `vc_convert`/`vc_batch` 非法参数语法与退出码的真实进程 CTest。
+- [x] 严格数值解析，拒绝 malformed、非有限、溢出、空白、十六进制浮点、尾随字符和
+  越界值。
+- [ ] 真实模型 `vc_convert` 成功 WAV 的 CLI 资产门禁，以及 `vc_probe` 的产品验收；
+  当前 `vc_probe` 仍是骨架。
+
+因此 30/30 是当前库/模型与已注册 CLI/HTTP/R0 scaffold 契约证据，不是整个 001 规格
+Complete 的依据。
+
+## Current Constraints
+
+- 只支持 CUDA FP32 和 WAV I/O。
+- HuBERT 是默认内容编码器；WavLM 不是 stock RVC 模型的透明替代。
+- 当前只支持 40 kHz synthesizer；输出保持该模型率，不提供 32/48 kHz 架构或独立重采样。
+- 长音频只把 HuBERT/Index/VITS 约束到单块；F0 仍整段执行，file/buffer pipeline 的 host
+  内存与 F0 CPU/GPU working set 都随时长增长。
+- `infer_stream` 等局部 helper 不等于完整实时产品链。
+- 模型/fixture 不入 Git；CMake 必须在注册 integration 前检查资产。
+
+## Superseded Historical Decisions
+
+以下内容曾出现在早期计划中，但已被当前实现或规格拆分取代，不得再当作现状：
+
+| 历史决策 | 当前结论 |
+|---|---|
+| WavLM 作为主路径、HuBERT 作为 legacy | **已取代**：HuBERT 是默认；WavLM 仅可选且需匹配模型 |
+| FLAC 输入属于基线 | **已取代**：当前音频 API 仅支持 WAV |
+| CPU fallback、FP16 或 PM 可自动降级 | **已取代**：这些配置明确失败 |
+| `target_sample_rate` 可独立控制输出 | **已取代**：只能为 0 或等于当前支持的 40 kHz 模型率 |
+| 固定秒数、实时倍数或显存数字可作完成证据 | **已取代**：没有带完整环境元数据的可复用基准 |
+| 在 001 内交付训练与 WebUI | **已取代**：训练、Web 和分离分别由 002、003、004 管理 |
+
+## Next Work
+
+端到端实时变声已拆分到 Spec 006 和 ADR-0002：决策已批准、R0 证据部分完成，但产品
+runtime/session/ALSA 入口仍未实现，且 qualified target model+matching Index/corpus 仍阻塞。
+不得从离线分块或 standalone Index probe 推导“已实时”。

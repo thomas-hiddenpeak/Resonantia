@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: resonantia-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Validate tracked scripts and patch formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/*.sh
+          scripts/check_sdd.sh
+          git show --check --oneline --no-renames HEAD
+
+  cuda-build-and-contract-tests:
+    # Resonantia targets Jetson Orin-class devices (aarch64, SM87). Running untrusted fork
+    # pull requests on a self-hosted GPU would be unsafe, so this workflow is
+    # intentionally limited to trusted pushes and manual dispatches.
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 60
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      CTEST_OUTPUT_ON_FAILURE: "1"
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          clean: true
+
+      - name: Validate runner and scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v cmake
+          command -v nvcc
+          test "$(uname -m)" = "aarch64"
+          nvcc --version
+          bash -n scripts/*.sh
+          scripts/check_sdd.sh
+          git show --check --oneline --no-renames HEAD
+
+      - name: Configure reproducible contract suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-ci \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVOXMUTATIO_CUDA_ARCHITECTURES=87 \
+            -DVOXMUTATIO_BUILD_TESTS=ON \
+            -DVOXMUTATIO_ENABLE_MODEL_TESTS=OFF
+
+      - name: Build
+        shell: bash
+        run: cmake --build build-ci --parallel 2
+
+      - name: Run contract tests
+        shell: bash
+        run: ctest --test-dir build-ci --output-on-failure --label-regex contract

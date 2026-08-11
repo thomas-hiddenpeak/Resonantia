@@ -1,157 +1,141 @@
 # Feature Specification: Voice Conversion Engine
 
 **Feature Branch**: `001-voice-conversion-engine`
-**Created**: 2026-08-07
-**Status**: Complete
+**Created**: 2026-08-05
+**Status**: Library/pipeline baseline implemented; specification verification partially complete
+**Scope date**: 2026-08-09
 
-## Current Status (Verified)
+## 1. Scope
 
-### What Works (all verified with real models + real audio)
-- ✅ Code compiles (CMake build succeeds)
-- ✅ Full test suite passes (9/9 tests)
-- ✅ CUDA kernels compile and run (cuBLAS, cuFFT linked)
-- ✅ Model weights downloaded and converted to safetensors (all loading verified):
-  - HuBERT Base: 361 MB (213 tensors)
-  - RMVPE: 346 MB (741 tensors)
-  - VITS f0G40k (v2): 140 MB (560 tensors)
-- ✅ Safetensors loader verified (mmap zero-copy, all tensors parsed)
-- ✅ **HuBERT content encoder numerically aligned**: RMS 7.1e-07 vs transformers
-- ✅ **RMVPE F0 extractor numerically aligned**: mean error 1.5e-05 Hz, 365/365 voiced
-- ✅ **VITS synthesizer numerically aligned**: audio correlation 0.9997 vs RVC
-- ✅ **End-to-end voice conversion executed**: real LibriSpeech speech → 40kHz output,
-  waveform correlation 0.9997 vs Python RVC reference
-- ✅ **CLI tool (vc_convert) converts real audio files** to valid output (no NaN/Inf)
+本规格定义当前已经实现的离线声音转换主链：
 
-### Verified Numerical Alignment (real audio: LibriSpeech)
-| Stage | Metric | Result | Threshold |
-|-------|--------|--------|-----------|
-| HuBERT v2 (layer12) | RMS error | 7.09e-07 | < 1e-4 (SC-001) |
-| HuBERT v1 (final256) | RMS error | 2.58e-06 | < 1e-4 |
-| RMVPE salience | RMS error | 1.97e-07 | — |
-| RMVPE F0 | mean error | 1.52e-05 Hz | < 0.5 Hz (SC-002) |
-| VITS TextEncoder (m_p) | RMS error | 7.15e-08 | — |
-| VITS Flow (z) | RMS error | 2.07e-07 | — |
-| VITS audio | correlation | 0.9997 | > 0.999 (SC-003) |
-| End-to-end | correlation | 0.9997 | > 0.99 |
-
-## Completion Checklist
-
-Per Constitution v1.4.0 Spec Completion Criteria:
-
-- [x] All FR have implementation code (HuBERT, RMVPE, VITS, pipeline)
-- [x] All Acceptance Scenarios have test cases (9 tests)
-- [x] All tests pass with real data (9/9)
-- [x] SC-001: HuBERT L2 < 1e-4 (verified: RMS 7.1e-07)
-- [x] SC-002: F0 error < 0.5 Hz (verified: 1.5e-05 Hz)
-- [x] SC-003: SRCC > 0.999 (verified: audio correlation 0.9997)
-- [x] Edge Cases handled (empty/short/long audio in test_pipeline)
-- [x] Integration test passed (test_e2e_conversion: real audio, corr 0.9997)
-- [x] Actual inference executed with real model weights
-- [x] Real safetensors weights loaded and verified
-
-## User Scenarios & Testing *(mandatory)*
-
-### User Story 1 - 离线单文件转换 (Priority: P1)
-用户提供一个输入音频文件和目标说话人 ID，系统输出转换后的音频文件。
-
-**Why this priority**: 这是 RVC 的核心功能，所有其他功能都建立在此基础之上。
-
-**Independent Test**: 
-```bash
-./vc_convert --hubert models/hubert.safetensors --model models/vits.safetensors \
-  --input test.wav --output result.wav --speaker 0
+```text
+WAV -> mono float32 -> 16 kHz -> HuBERT -> optional Flat Index
+    -> RMVPE (or optional FCPE) -> F0 VITS v1/v2 -> 40 kHz model-rate WAV
 ```
 
-**Acceptance Scenarios**:
-1. **Given** 有效的输入 WAV 文件和模型权重, **When** 运行 vc_convert, **Then** 输出音频文件存在且格式正确
-2. **Given** 输入为 16kHz 单声道 PCM, **When** 转换完成, **Then** 输出为 40kHz 单声道 PCM
-3. **Given** index_rate=0.6, **When** 转换完成, **Then** 特征混合比例正确（60% 检索 + 40% 原始）
+默认内容编码器是 HuBERT。v1 synthesizer 使用 256D 特征，v2 使用 768D 特征。
+WavLM 是已实现的可选编码器，但只能搭配在相同特征空间训练的 synthesizer，不能把
+它当作 stock RVC 模型的无条件替代。
 
-### User Story 2 - 批量转换 (Priority: P2)
-用户提供一个目录，系统批量转换所有音频文件。
+Web 编排见 Spec 003，训练见 Spec 002，声源分离见 Spec 004；它们不属于本规格的
+离线推理完成条件。端到端实时变声由独立的
+[Spec 006](../006-realtime-voice-conversion/spec.md) 与
+[ADR-0002](../../docs/adr/0002-persistent-streaming-runtime-and-local-audio-boundary.md) 管理；
+两者已于 2026-08-10 获批，但尚未实现 realtime 产品路径，也不改变本规格的离线完成条件。
 
-**Why this priority**: 提高工作效率，但依赖 Story 1 的核心管线。
+## 2. Supported Contract
 
-**Independent Test**:
-```bash
-./vc_batch --input-dir ./audio/ --output-dir ./converted/ --speaker 0
-```
+| 维度 | 当前支持 | 不支持 / 必须拒绝 |
+|---|---|---|
+| 输入、输出 | WAV | FLAC、MP3 和其他编码格式 |
+| 后端 | CUDA | CPU |
+| 计算精度 | FP32 | FP16 |
+| 内容编码 | HuBERT（默认）；WavLM（可选且需匹配模型） | 任意不匹配的 encoder/synthesizer 组合 |
+| RVC 模型 | F0 v1 / 256D；F0 v2 / 768D | non-F0 |
+| F0 | RMVPE（默认）；FCPE（可选） | PM |
+| 输出采样率 | 当前兼容 synthesizer 的原生 40 kHz | 32/48 kHz 等其他模型率；独立 target sample rate |
+| 运行参数 | pitch、index rate、RMS mix、protect、F0 filter | formant shift |
 
-### User Story 3 - 数值对齐验证 (Priority: P1)
-开发者运行探针工具，验证 C++ 实现与 Python 原始实现的数值一致性。
+`target_sample_rate=0` 表示使用当前兼容模型的原生 40 kHz；显式值只有等于
+`model_sample_rate=40000` 才合法。这不是一个额外的输出重采样功能。
 
-**Why this priority**: 确保重构的正确性，是质量门控的核心。
+## 3. User Scenarios
 
-**Independent Test**:
-```bash
-./vc_probe --hubert models/hubert.safetensors --reference python_output.npz
-```
+### Story 1 — 单文件离线转换（P1）
 
-### User Story 4 - WebUI 交互转换 (Priority: P3)
-用户通过浏览器上传音频、选择参数、下载结果。
+用户提供 WAV、HuBERT、RMVPE、F0 synthesizer 和可选 Flat Index，CLI 输出模型
+原生 40 kHz 的 WAV。writer 先在目标同目录完整写入唯一 staging 文件，完成
+`fsync`/close 后以 rename 原子替换；任何校验、写入或提交失败都保留原目标。失败时返回
+非零状态或结构化错误，不得把部分输出宣称为成功。
 
-**Why this priority**: 提升用户体验，但核心管线优先。
+### Story 2 — v1 / v2 模型适配（P1）
 
-### Edge Cases
-- 输入音频时长 < 0.1s（过短）
-- 输入音频时长 > 5min（过长，需分块处理）
-- 输入为立体声音频（需 downmix 到单声道）
-- 输入采样率 != 16kHz（需重采样）
-- 模型权重文件损坏或不完整
+v1 模型只接受 256D 内容特征，v2 模型只接受 768D 内容特征。版本、维度、speaker
+范围、F0 指针和长度在进入 CUDA 计算前校验。
 
-## Requirements *(mandatory)*
+### Story 3 — 长音频（P1）
 
-### Functional Requirements
-- **FR-001**: System MUST 支持 RVC v1 (256D) 和 v2 (768D) 两种模型架构
-- **FR-002**: System MUST 使用 safetensors 格式加载权重（零拷贝 mmap）
-- **FR-003**: System MUST 支持 WavLM-Base+ 和 HuBERT-Base 两种内容编码器
-- **FR-004**: System MUST 支持 RMVPE（离线）和 FCPE（实时）两种 F0 提取器
-- **FR-005**: System MUST 使用手写 CUDA Flat Index 替代 FAISS
-- **FR-006**: System MUST 支持 VITS 合成器（TextEncoder + Flow + HiFiGAN NSF）
-- **FR-007**: System MUST 支持音高偏移（f0_up_key，半音单位）
-- **FR-008**: System MUST 支持 RMS 能量混合（rms_mix_rate）
-- **FR-009**: System MUST 支持非声门脉冲保护（protect 参数）
-- **FR-010**: System MUST 提供 CLI 工具（vc_convert, vc_batch, vc_probe）
-- **FR-011**: System MUST 提供嵌入式 WebUI 服务
-- **FR-012**: System MUST 支持微调训练（基于预训练权重）
+超出单段上限的 WAV 在安静位置分块，带上下文转换后裁剪并拼接。HuBERT、Index 与 VITS
+按块执行，但为了全局音高一致性，当前实现仍对整段 padded clip 一次计算 F0；file/buffer
+路径也保留整段输入、前处理与输出。因此 host 内存和 F0 的 CPU/GPU working set 都随时长
+增长；这不构成任意长度恒定内存或低延迟流式接口。
 
-### Key Entities
-- **AudioBuffer**: 单声道 float32 PCM 音频数据 + 采样率
-- **VCConfig**: 声音转换配置参数（模型路径、推理参数等）
-- **VCResult**: 转换结果（音频数据 + 耗时统计 + 错误信息）
-- **Tensor**: safetensors 中的张量元数据（name, shape, dtype, offsets）
+### Story 4 — 可选检索与参数更新（P2）
 
-## Success Criteria *(mandatory)*
+Flat Index 按 `index_rate` 混合检索特征；运行时允许更新已经实现的 pitch、
+index rate、RMS mix 与 protect。任何保留但未实现的参数都应明确失败。
 
-### Measurable Outcomes
-- **SC-001**: HuBERT 特征提取 L2 误差 < 1e-4（vs Python 参考实现）
-- **SC-002**: F0 提取绝对误差 < 0.5 Hz（vs Python 参考实现）
-- **SC-003**: 合成音频 SRCC > 0.999（vs Python 参考实现）
-- **SC-004**: 单文件转换端到端延迟 < 5s（Jetson AGX Orin, 5s 音频）
-- **SC-005**: CUDA Flat Index Top-K 检索 < 1ms（10k 特征库）
-- **SC-006**: 零 Python 依赖（推理链路完全脱离 Python 运行时）
+## 4. Functional Requirements
 
-## Assumptions
-- 目标硬件为 NVIDIA Jetson AGX Orin (SM87)
-- 用户已使用 Python 转换工具将 `.pth` 权重转换为 `.safetensors`
-- 输入音频为 WAV 或 FLAC 格式
-- 模型的说话人数量在权重中已固定（不支持动态添加）
+- **FR-001 WAV I/O**：读取 PCM/float WAV、下混至 mono float32，并写出合法 WAV。
+- **FR-002 Resampling**：内容/F0 前端使用 16 kHz；当前输出保持兼容模型的原生 40 kHz。
+- **FR-003 HuBERT default**：提供 v1 256D final projection 与 v2 768D layer feature。
+- **FR-004 Optional WavLM**：仅在显式选择且提供匹配模型时启用。
+- **FR-005 F0**：RMVPE 为默认；FCPE 可选；PM 必须返回不支持。
+- **FR-006 Index**：内存映射 Flat Index，校验文件头、维度、范围和 `k`，执行精确
+  加权 k-NN 混合。非零 `index_rate` 要求显式提供并成功加载与内容特征同宽的 Index；
+  缺失、错维或检索失败不得静默按 no-index 返回成功。
+- **FR-007 Synthesizer**：支持 F0 VITS v1/v2 的 TextEncoder、Flow 和
+  NSF/HiFi-GAN Generator，拒绝 non-F0。
+- **FR-008 Pipeline**：编排内容、F0、Index、protect、RMS mix、分块与拼接。
+- **FR-009 Numerical safety**：公开入口校验空指针、尺寸、乘法溢出和非有限数据；
+  CUDA/cuBLAS 临时资源必须异常安全。
+- **FR-010 Output**：成功时以同目录 staging + atomic rename 产生当前支持的 40 kHz
+  model-rate WAV；失败
+  返回错误、保留旧目标且不得伪造其他格式或采样率。
+- **FR-011 CLI**：`vc_convert` 暴露当前支持参数并对未知/非法选项失败；数值 flags 使用
+  全量消费、有限值、溢出与范围检查。`test_cli_contract` 以真实进程门控非法语法和退出码；
+  真实模型的 CLI 成功 WAV 路径仍缺独立资产门禁。
+- **FR-012 Auxiliary CLIs**：`vc_batch` 与 `vc_probe` 是构建目标；当前缺 CLI E2E 门禁，
+  且 `vc_probe` 仍是骨架，属于部分实现。
 
-## Completion Plan (open items — audited 2026-08-09)
+## 5. Explicit Non-goals
 
-本 spec 曾被当作 “Complete(推理部分)”，经代码实测属**过早**。以下 MUST 未满足，
-依宪法 *Sequential Completion* 在**本 spec 内**推进（不另建 spec）：
+- CPU 推理、FP16 推理和 PM F0。
+- FLAC/MP3 解码或编码。
+- non-F0 synthesizer。
+- formant shift。
+- 32/48 kHz 等其他 synthesizer 架构，以及与模型原生采样率不同的独立输出采样率。
+- 麦克风、WebSocket 或端到端实时服务；已批准的本机实时能力由 Spec 006 单独管理，仍不是
+  Spec 001 的完成条件。
+- 在本规格内实现训练、WebUI 或声源分离。
 
-| 项 | 现状 | 决策 | 优先级 |
-|---|---|---|---|
-| FR-010 vc_batch | ✅ 已实现+实测 | 一次载入模型循环转整目录(--recursive + 与 vc_convert 参数对齐);真实 2 文件端到端通过 | **✓ 完成** |
-| Edge >5min 分块推理 | ✅ 已实现+测试 | pipeline.convert_long:整段一次 F0(全局音高)→静音切点分块→按绝对位置拼接;短片段走原路径(e2e corr 保持 0.999716);test_long_audio_chunking 幅度谱对齐 spec_corr=0.986>0.98(波形相关因 NSF 相位重置无效,已用相位无关指标) | **✓ 完成** |
-| FR-004 FCPE F0 | ✅ 已实现+对齐 | 真实 FCPE(torchfcpe CFNaiveMelPE 全卷积端口)+ `--f0-method rmvpe|fcpe` 分发;对齐 torchfcpe:mel mean|Δ|5.7e-6、F0 V/UV 100% 一致、voiced medianΔ=1.5e-5Hz(远低于嬪法 0.5Hz);端到端 vc_convert --f0-method fcpe 真实转换通过 | **✓ 完成** |
-| FR-003 WavLM 编码器 | ✅ 已实现+对齐 | 真实 WavLM-Base+ 内容编码器(共享 wav2vec2 前端 + **门控相对位置偏置**)+ `--content-encoder hubert|wavlm` 分发;对齐 microsoft/wavlm-base-plus:mean|Δ|4.8e-7、max|Δ|4.3e-5、**cos=1.0**;端到端管线路径通过。⚠️ 注:WavLM 特征空间≠ContentVec,需**WavLM 训练的合成器**方能高质量转换(stock RVC v2 合成器基于 ContentVec);编码器本身已对齐,可供训练/兼容模型使用 | **✓ 完成** |
+## 6. Verification and Acceptance
 
-> 所有 open MUST 均已满足并通过对齐/集成测试 → **001 推理引擎可标 Complete**。
-> 后续增强(不阻塞 Complete):FCPE/WavLM 前向当前在主机运行(正确但较慢),CUDA 化为性能项;
-> WebUI 暴露 f0-method/content-encoder 选择器为小项。
-> 「每环节多 SOTA 模型可选」属 spec 004 扩展(S7)；「实时流式」为全新功能，
-> 依 Sequential Completion 须在 001 完成后再建 spec。
+默认无模型资产构建必须执行 contract 测试；模型与 fixture 齐全时，启用
+`VOXMUTATIO_ENABLE_MODEL_TESTS=ON` 执行 integration。最近一次完整资产环境验证为
+30/30 CTest 通过（11 个 contract + 19 个 integration、0 失败，real 335.05 秒），其中覆盖
+HuBERT、RMVPE、FCPE、
+WavLM、Index、VITS、pipeline、端到端 library/pipeline 转换、长音频，以及
+`vc_convert`/`vc_batch` 的严格参数失败。该结果仍不包含真实模型 CLI 成功 WAV 或
+`vc_probe` 行为验收；新增的两个 Spec 006 R0 测试也不扩大 Spec 001 产品范围，因此不足以
+把整个 001 规格标为完成。
 
+验收重点：
+
+- HuBERT v1/v2 输出维度正确，模型布局与 tensor 字节数在推理前复验。
+- RMVPE/FCPE 初始化完整校验运行时使用的 tensor；失败重初始化不得保留旧状态，公开
+  输入在 CUDA 前拒绝空指针、非法长度和非有限值。两者、WavLM 与 VITS 只在对应资产
+  实际存在并执行对齐测试后报告数值结果。
+- pipeline 对 CPU、FP16、PM、non-F0、formant shift、非 WAV 和独立
+  `target_sample_rate` 返回失败。
+- 长音频输出有限、非空、长度符合测试门槛，HuBERT/Index/VITS 按块执行且临时产物退出后
+  清理；当前整段 host memory 与 F0 working set 仍随时长增长。
+- 错误路径不泄漏 CUDA/cuBLAS 资源，边界尺寸不触发整数除零或有符号溢出。
+
+## 7. Success Criteria
+
+- **SC-001**：当前 11 个默认 contract 测试全部通过。
+- **SC-002**：资产齐全时所有被注册的模型集成测试实际执行并通过；缺资产时清楚列出
+  未注册项。
+- **SC-003**：v1 256D 与 v2 768D 的版本/特征契约均有直接测试。
+- **SC-004**：有效 WAV 转换产生有限、非空的 40 kHz model-rate WAV；失败由返回状态判断，
+  调用方不得依据目标文件存在推断成功。
+- **SC-005**：所有明确不支持组合稳定失败，而不是静默降级。
+- **SC-006（部分满足）**：`vc_convert`/`vc_batch` 的严格参数语法与非法退出码已由
+  CLI 进程 CTest 门控，WAV writer 的成功替换与失败保留由默认 I/O 门禁覆盖；仍需真实
+  模型的 CLI 成功转换门禁，并决定 `vc_probe` 的产品范围。
+
+本规格不以某个固定延迟、吞吐倍数或显存数字作为已达成结论；性能基准必须另附硬件、
+模型、输入长度、编译配置和测量方法。

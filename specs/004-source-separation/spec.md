@@ -1,83 +1,161 @@
-# Spec 004 — Source Separation (vocal / de-reverb / de-harmony / de-echo / de-noise)
+# Feature Specification: Source Separation and Vocal Cleanup
 
-**Status**: Runners Complete · **Date**: 2026-08-09 (was In Progress 2026-08-07)
-**Constitution**: pure C++/CUDA, **zero Python at runtime** (Principle V/XI). Python
-only in `tools/` (uv) for one-time weight conversion + offline numerical alignment.
+**Feature**: `004-source-separation`
+**Updated**: 2026-08-09
+**Status**: **Model runners complete / Experimental / Workflow acceptance partial / Asset gated**
 
-## Why
-Training a target voice needs a **clean single-speaker vocal**. Real user recordings
-are often full songs (vocal + accompaniment + reverb + backing harmony). So audio
-front-end preprocessing is a **first-class project feature**, not a test tool:
+## 1. Scope
 
-- **Vocal separation**: full song → vocal stem + instrumental.
-- **De-reverb**: remove room reverb / echo tails from a vocal.
-- **De-harmony (karaoke)**: remove backing/harmony vocals → lead only.
+本模块为训练素材和手动转换提供可选的音频前处理：
 
-The WebUI "录音内容 × 含混响" selection maps to a preprocessing chain:
-- 纯人声 + 干净 → (slice) → train
-- 纯人声 + 含混响 → de-reverb → slice → train
-- 带伴奏歌曲 → separate → de-harmony → de-reverb → slice → train
+- vocal separation：歌曲混音 → vocal stem；
+- de-harmony：削弱伴唱/和声，保留 lead vocal；
+- de-reverb、de-echo、de-noise；
+- Silero VAD smart slicing；
+- 长音频 chunked overlap-add。
 
-## Model choice (pragmatic first target)
-The SOTA family is spectrogram Transformers/U-Nets over STFT:
-- **MDX-Net / UVR conv U-Net** (magnitude-spectrogram U-Net → mask) — simplest, reuses
-  our conv kernels + a GPU STFT. **First target.**
-- **MelBand-RoFormer / BS-RoFormer** (band-split + rotary attention) — current SOTA,
-  heavier (band-split, rotary pos emb). Second target; same STFT/iSTFT front-end.
-- De-reverb + karaoke are the **same architecture, different weights** — once the
-  runner exists, new tasks = new safetensors.
+它不是 `vc_convert` 默认主链的一部分，只有 CLI/Web 显式选择时才运行。runner 已实现
+不等于权重已随仓库发布，也不等于所有输入上已经达到生产质量。
 
-All are magnitude-mask or complex-mask models on STFT; **de-reverb/karaoke RoFormers
-share the runner**. So the module is: STFT → model → mask → apply → iSTFT.
+## 2. As-built Architecture
 
-## Architecture (`src/separation/`, `include/voxmutatio/separation/`)
-- `stft.{h,cu}` — GPU STFT/iSTFT via cuFFT (complex). Hann window, hop, center pad,
-  overlap-add reconstruction. **Foundation (also lets us move `compute_spec` to GPU).**
-- `separator.{h,cpp}` — `Separator` class: load a task model (safetensors), run
-  chunked overlap-add inference on a waveform, return stems. Tasks: `kSeparate`,
-  `kDeReverb`, `kDeHarmony`.
-- Model runner (conv U-Net first; RoFormer later) on the autograd-free inference path
-  (forward only, cuBLAS + conv kernels).
-- Chunked processing (RoFormer default ~11 s @ 44.1k, overlap 4) for long audio + VRAM.
+```text
+WAV
+  -> CUDA STFT / spectrogram front-end
+  -> selected task runner
+       Open-Unmix (UMX) vocal separation
+       OR config-driven MelBand-RoFormer task model
+  -> mask / estimated source
+  -> CUDA iSTFT
+  -> chunked overlap-add for long audio
+  -> WAV
 
-## Weights
-`tools/convert_separation_weights.py` (uv, offline) converts a chosen open checkpoint
-(MSST/UVR MDX or MelBand-RoFormer) → F32 safetensors under `models/separation/`.
+optional slicing:
+  waveform -> Silero VAD -> speech segments
+```
 
-## CLI + WebUI integration
-- `vc_preprocess --separate --dereverb --deharmony` (chain flags) call the Separator
-  before slicing.
-- `vc_serve` maps 录音内容/含混响 → the chain; training preprocessing runs it.
+实现位于 `src/separation/` 与 `include/voxmutatio/separation/`：
 
-## Phases
-- [x] S0: spec + module skeleton + GPU STFT/iSTFT foundation.
-- [x] S1: STFT round-trip numerical test (reconstruct == input within tol; 1.99e-7).
-- [x] S2: vocal-separation forward runner + weight conversion + alignment.
-      **First runner = Open-Unmix `umxhq` (vocals)**: STFT(4096/1024) magnitude ->
-      per-frame FC/BatchNorm -> 3-layer bidirectional LSTM -> mask -> mixture-phase
-      iSTFT. Pure C++/CUDA, forward-only (`src/separation/separator.cu`), self-
-      contained cuBLAS + custom LSTM/BatchNorm kernels. `tools/convert_separation_
-      weights.py` converts the checkpoint to F32 safetensors + dumps a staged
-      reference. **Aligned vs PyTorch: model 1.6e-6, STFT 1.6e-7, end-to-end 1.5e-6.**
-      (Chosen over MDX-TDF first: torch-loadable, deterministic, fully alignable.)
-- [x] S3: chunked overlap-add for very long audio — 50% Hann overlap, normalise by
-      window sum (`Roformer::forward_chunked`, `chunk_size` from config).
-- [x] S4: de-reverb + de-harmony + **de-echo + de-noise** weights (MelBand-RoFormer)
-      on the same front-end — 5 SOTA runners converted + aligned (band-split 3.3e-6,
-      transformer 4.9e-7, mask 1.35e-6). Registry in `tools/convert_roformer_weights.py`.
-- [x] S5: wired into `vc_preprocess` (`--separate/--deharmony/--dereverb/--deecho/`
-      `--denoise/--vad`) + WebUI cascade; real-audio validated.
-- [x] S6 (SOTA): config-driven MelBand-RoFormer runner (band-split + RoPE gated
-      attention), batched-GEMM attention, scratch-pool reuse (de-reverb 2.9x). Silero
-      VAD v5 pure C++/CUDA smart slicing added (aligned 2.5e-7).
-- [x] S7 (extension, v1.1): **selectable models per task** — implemented end-to-end:
-      `vc_preprocess` supports `--separate-model/--deharmony-model/--dereverb-model/
-      --deecho-model/--denoise-model`; `vc_serve` adds `GET /api/sep-models` discovery
-      + `/api/step` model validation/forwarding; WebUI cascade adds per-stage model
-      picker (hidden unless a stage has >1 installed model). Model registry lives in
-      `src/separation/sep_registry.cpp` and discovers drop-in alternatives from
-      `<name>.json` `{ "task": ..., "label": ... }`.
+- CUDA STFT/iSTFT（cuFFT、Hann window、center padding、overlap-add）。
+- Open-Unmix `umxhq` vocal runner。
+- config-driven MelBand-RoFormer（band split、RoPE/gated attention、mask head）。
+- task/model registry 与 drop-in `<name>.json` metadata。
+- Silero VAD v5 native C++/CUDA runner。
+- long-audio chunking 与 overlap-add。
 
-## Gates
-Real audio only for functional tests. STFT round-trip < 1e-4. Each model runner
-numerically aligned vs a one-time Python reference (offline). Zero Python at runtime.
+## 3. Model and Asset Contract
+
+模型权重、converted fixture 和 Python reference dump 不进 Git。运行时模型使用 FP32
+safetensors；一次性权重转换/参考生成脚本可放在 `tools/`，运行时不得依赖 Python。
+
+典型本地资产包括：
+
+- `models/separation/umxhq_vocals.safetensors`；
+- 各任务的 MelBand-RoFormer safetensors 和 registry JSON；
+- `models/vad/silero_vad.safetensors`；
+- `tests/fixtures/separation/` 与 `tests/fixtures/vad/` 下的参考数据。
+
+CMake 仅在每个测试声明的全部资产存在时注册该 integration test。缺资产时“不注册”
+是环境限制，不是功能通过或失败；发布者必须另行说明权重来源、许可证和获取方式。
+
+## 4. User Scenarios
+
+### Story 1 — CLI vocal cleanup（P1，已实现）
+
+`vc_preprocess` 接受 `--separate`、`--deharmony`、`--dereverb`、
+`--deecho`、`--denoise`、`--vad`，按请求处理 WAV 并输出 WAV。
+
+### Story 2 — Per-task model selection（P1，已实现）
+
+每个 separation stage 可通过对应 `--*-model` 选择已安装模型。registry 校验任务与
+模型匹配，未知、缺失默认或错任务模型在加载权重前失败；真实 CLI 进程门禁覆盖这些
+拒绝路径。
+
+### Story 3 — Web staged preprocessing（P2，已实现并有默认门禁）
+
+Spec 003 的 `/api/sep-models` 提供模型发现，`/api/step` 对 material work set
+应用单个 stage。结果先写入唯一 staging 目录，再通过 backup/rename 发布；提交失败恢复
+或保留旧 work backup，并由真实 HTTP 故障场景门禁验证 live work 不丢失。
+
+### Story 4 — Production cleanup quality（P1，未验证）
+
+在代表性音乐、说话、混响、伴唱与噪声数据集上评估 stem leakage、伪影、语音可懂度
+与下游训练收益。当前 fixture 对齐不构成这一产品质量证明。
+
+## 5. Functional Requirements
+
+- **FR-001 STFT/iSTFT**：参数和输入尺寸前置校验，重建误差受测试门控。
+- **FR-002 UMX runner**：加载声明的 FP32 safetensors，执行 vocal mask/source 推理。
+- **FR-003 RoFormer runner**：配置驱动的 band split、transformer、mask 与 iSTFT。
+- **FR-004 Task coverage**：separate、de-harmony、de-reverb、de-echo、de-noise 可由
+  相应权重驱动。
+- **FR-005 Long audio**：按模型配置 chunking，并使用 overlap-add 归一化拼接。
+- **FR-006 VAD**：Silero VAD 可选，供 smart slicing 使用。
+- **FR-007 Registry**：枚举已安装模型并验证 model/task 关系；配置与 safetensors
+  必须匹配。`vc_preprocess` 对未注册、缺失默认或错任务名称立即失败。
+- **FR-008 CLI/Web**：`vc_preprocess` 和 `vc_serve` 只暴露已安装且通过边界校验的
+  stage/model；Web step 只有在 staged 结果完整且可提交时才替换 live work set，任何
+  提交失败都必须保留或恢复旧 work set。
+- **FR-009 Numerical safety**：拒绝无效 FFT、band、attention、chunk 和 tensor
+  尺寸；拒绝非有限中间/输出。`vc_preprocess` 数值 flags 采用严格解析，并在 seconds×sr
+  转换前校验派生样本数范围；任意恶意模型 config 的资源上界仍属部分门禁。
+- **FR-010 Runtime purity**：C++/CUDA 运行时不加载 PyTorch/pickle，不调用 Python。
+
+## 6. Verification Gates
+
+启用 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON` 后，当前 CMake 按资产分别注册：
+
+- `test_separation_stft`；
+- `test_separation_spec`；
+- `test_separation_umx`；
+- `test_separation_roformer`；
+- `test_separation_vad`。
+
+最近一次所有本地资产齐全的完整项目验证为 30/30 CTest（11 contract + 19 integration、
+0 fail，real 335.05 秒），通过项包含上述五个测试以及默认 CLI/HTTP/legacy Web contract。
+这份结果是该资产集和该环境的实现证据，不应外推为任意权重/任意录音的质量保证。
+默认 `test_cli_contract` 覆盖 `vc_preprocess` 数值、缺值、registry/default/task mismatch，
+`test_web_contract` 覆盖真实 `/api/step` busy、失败回滚和成功清理。`/api/sep-models` 的
+完整多模型响应与五任务真实权重执行仍不是默认门禁，因此完整工作流验收仍是部分状态。
+UMX、RoFormer 与 VAD 的资产门禁还构造错误 shape 或非有限 checkpoint，并从公开入口注入
+NaN/Inf 音频，验证 loader 在上传前拒绝权重且运行入口不返回貌似有效的输出。
+
+模型 integration 必须至少验证：
+
+- 关键中间 tensor 与离线参考的布局、形状、有限性和误差门；
+- STFT/iSTFT reconstruction；
+- UMX 和 RoFormer 的端到端输出；
+- 长音频 chunked 与 whole-path 的一致性门；
+- VAD probability/segment 边界；
+- 缺失、错误或任务不匹配的模型配置稳定失败。
+- `vc_preprocess` 数值 flags 严格拒绝 malformed、非有限值、溢出和越界范围。
+
+## 7. Explicit Limitations
+
+- 权重与 fixtures 不随源码仓库提供，测试和运行都可能因本地资产缺失而不可用。
+- 模块仍按实验性能力管理；未建立跨数据集的生产音质、鲁棒性和吞吐保证。
+- 不承诺实时处理；已有 chunking/scratch reuse 只说明实现方式。
+- 不在 Spec 002 中自动证明“清理后训练效果更好”。
+- 不支持把任意 PyTorch checkpoint 直接交给 C++ 运行时。
+
+## 8. Historical Decisions
+
+- **已取代**：“MDX conv U-Net 是 first target / current runner”。实际首先交付并对齐的
+  runner 是 Open-Unmix，随后实现 MelBand-RoFormer。
+- **已取代**：把孤立的加速倍数写为模块完成证据。性能结论必须附硬件、模型、输入、
+  warm-up、编译配置和测量方法。
+- **已取代**：把 runner 完成称为生产 ready。当前正确状态是“实现完成、实验性、
+  模型资产门控”。
+
+## 9. Completion and Promotion Criteria
+
+代码实现项已完成；从“实验性”升级前仍需：
+
+- [ ] 发布可审计的模型清单、来源、哈希、许可证和下载流程。
+- [ ] 建立覆盖不同内容/语言/音乐类型的真实数据质量基准。
+- [ ] 证明 cleanup 对下游训练的收益，并记录失败样例。
+- [ ] 建立带环境元数据的时延、吞吐和显存基准。
+- [ ] 明确服务部署的资源配额、并发和故障恢复策略。
+- [x] 将 Web step 的 live work replacement 改为可回滚提交，并增加真实 HTTP 故障测试。
+- [x] 让 `vc_preprocess --*-model` 对未知、缺失默认或 task 不匹配的模型失败，并覆盖 CLI 门禁。
+- [x] 严格解析并约束 `sr/seg/hop/RMS/trim/VAD` 等预处理数值参数。

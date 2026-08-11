@@ -1,249 +1,176 @@
 # Resonantia — VoxMutatio
 
-> *Vox mutatur, mens manet.* (声音变化，意识不变。)
+> *Vox mutatur, mens manet.*（声音变化，意识不变。）
 
-**[English](./docs/en/README.md)**
+Resonantia 是面向 Jetson Orin（SM87）的 RVC 风格 C++20/CUDA 声音转换项目。
+当前成熟入口是源码树内的 CLI；运行时不依赖 Python/PyTorch，Python 只用于
+`tools/` 中的模型下载、转换和参考数据生成。
 
----
+## 能力与成熟度
 
-Resonantia 是 [RVC (Retrieval-based Voice Conversion)](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) 的纯 C++/CUDA 重构实现，提供零 Python 依赖的声音转换引擎。
+| 能力 | 当前状态 | 关键边界 |
+|---|---|---|
+| 离线声音转换 | **已实现** | CUDA FP32、WAV、F0 RVC v1/v2、当前仅兼容 40 kHz synthesizer |
+| Flat Index 检索 | **已实现** | host mmap 精确检索；非零 `index_rate` 缺失、错维或检索失败时 fail-closed |
+| 训练 | **实验性** | `vc_train` 提供 decoder/GAN 工程路径；无 resume、生产稳定性或音色质量保证 |
+| 声源分离与清理 | **实验性、资产门控** | UMX、MelBand-RoFormer、Silero VAD；权重与 reference 不随 Git 分发 |
+| Web 编排 | **已实现、验收部分** | `vc_serve` 调用 CLI；默认监听 `0.0.0.0` 且默认无认证；非实时、无 TLS |
+| 端到端实时变声 | **未实现** | Spec 006 已批准、R0 证据部分完成；尚无 persistent runtime、session、ALSA CLI |
 
-## 状态：可用 ✅
+离线主链是：
 
-端到端语音转换已实现并验证，与 Python RVC 数值对齐（真实 LibriSpeech 语音）：
-
-| 模块 | 指标 | 结果 |
-|------|------|------|
-| HuBERT 内容编码器 | RMS 误差 | 7.1e-07 |
-| RMVPE F0 提取器 | 平均误差 | 1.5e-05 Hz |
-| VITS 合成器 | 波形相关性 | 0.9997 |
-| **端到端转换** | **波形相关性** | **0.9997** |
-
-全部 13 个测试通过。`vc_convert` 可转换任意真实音频，`vc_train` 可从真实录音微调目标声线（见下方「实际使用工作流」）。
-
-## 设计目标
-
-- **纯 C++20/CUDA**：推理和训练链路完全脱离 Python/PyTorch 运行时
-- **GPU 优先**：所有计算密集型算子在 GPU 上执行
-- **safetensors 唯一权重格式**：零拷贝 mmap 加载，无 pickle 安全风险
-- **数值对齐**：与 Python 原始实现逐样本对齐验证
-
-## 架构
-
-```
-Resonantia/
-├── CMakeLists.txt
-├── include/
-│   └── voxmutatio/
-│       ├── core/             # 核心类型、配置、错误码
-│       ├── separation/       # 声源分离 (HTDemucs/MDX-Net)
-│       ├── content/          # 内容编码器 (WavLM + HuBERT)
-│       ├── f0/               # F0 基频提取器 (RMVPE + FCPE)
-│       ├── index/            # CUDA 特征检索 (手写 Flat Index)
-│       ├── synthesizer/      # VITS 合成器 (NSF vocoder)
-│       ├── training/         # 微调训练基础设施
-│       ├── pipeline/         # 端到端推理管线编排
-│       ├── io/               # 音频 I/O、safetensors 加载
-│       └── webui/            # 嵌入式 WebUI 服务
-├── src/
-│   ├── core/                 # 核心实现
-│   ├── separation/           # 声源分离 CUDA 实现
-│   ├── content/              # WavLM/HuBERT CUDA 实现
-│   │   ├── wavlm_encoder.{h,cu}
-│   │   └── hubert_encoder.{h,cu}
-│   ├── f0/                   # F0 提取 CUDA 实现
-│   │   ├── rmvpe.{h,cu}
-│   │   └── fcpe.{h,cu}
-│   ├── index/                # CUDA 特征检索实现
-│   │   └── cuda_flat_index.{h,cu}
-│   ├── synthesizer/          # VITS 合成器 CUDA 实现
-│   │   ├── text_encoder.{h,cu}
-│   │   ├── flow.{h,cu}
-│   │   ├── generator_nsf.{h,cu}
-│   │   └── source_hn_nsf.{h,cu}
-│   ├── training/             # 训练实现
-│   ├── pipeline/             # 管线编排
-│   │   └── pipeline.{h,cpp}
-│   └── io/                   # 音频 I/O、权重加载
-│       ├── audio_io.{h,cpp}
-│       └── safetensors.{h,cpp}
-├── tools/                    # 命令行工具
-│   ├── vc_convert.cpp        # 离线单次转换工具
-│   ├── vc_batch.cpp          # 批量转换工具
-│   └── vc_probe.cpp          # 模型检查和数值验证探针
-├── tests/                    # 测试
-│   ├── test_hubert.cpp       # HuBERT 特征对齐测试
-│   ├── test_f0.cpp           # F0 提取对齐测试
-│   ├── test_synthesizer.cpp  # 合成器数值测试
-│   └── test_pipeline.cpp     # 端到端管线测试
-├── webui/                    # WebUI 前端资源
-│   ├── index.html            # 主页面
-│   ├── app.js                # 前端逻辑
-│   └── styles.css            # 样式表
-├── docs/                     # 设计文档
-│   ├── DESIGN.md             # 架构设计总览
-│   └── NUMERICAL_ALIGNMENT.md # 数值对齐策略
-└── third_party/              # 第三方依赖
-    └── cutlass/              # CUTLASS (submodule)
+```text
+WAV -> mono float32 -> 16 kHz -> HuBERT -> optional Flat Index
+    -> RMVPE (or optional FCPE) -> F0 VITS v1/v2 40 kHz -> WAV
 ```
 
-> **实现状态**：`content/hubert`、`f0/rmvpe`、`index`、`synthesizer`、`pipeline`、`training`（解码器微调 + 完整 VITS GAN）、`webui`（`vc_serve` 后端）、`io` 已实现并数值验证；`separation/`、`content/wavlm`、`f0/fcpe`、`third_party/cutlass` 为规划中，当前未接入运行时。
+WavLM 只有在 synthesizer 以相同特征空间训练时才兼容。CPU、FP16、PM F0、
+non-F0、formant shift、FLAC/MP3，以及独立目标采样率转换均不支持并应明确失败。
+完整的当前状态与最近验证记录见
+[`specs/PROJECT_STATE.md`](specs/PROJECT_STATE.md)。
 
-## 推理管线
+## 最短可复现路径
 
-```
-输入音频 (任意采样率)
-    │
-    ▼
-┌─────────────┐
-│ 声源分离     │  ← HTDemucs/MDX-Net (可选)
-│ (Optional)  │
-└─────┬───────┘
-      │
-      ▼
-┌─────────────┐
-│ 重采样到16kHz │
-└─────┬───────┘
-      │
-      ▼
-┌─────────────┐
-│  WavLM/     │  ← CUDA encoder (ContentVec, 256D/768D)
-│  HuBERT     │
-│  特征提取    │
-└─────┬───────┘
-      │
-      ▼
-┌─────────────┐     ┌─────────────┐
-│   F0 提取    │────▶│  protect    │  ← 非声门脉冲保护
-│ (RMVPE/FCPE)│     │  混合       │
-└─────┬───────┘     └─────────────┘
-      │
-      ▼
-┌─────────────┐
-│  CUDA 索引   │  ← 手写 Flat Index (零 FAISS 依赖)
-│  检索增强    │
-└─────┬───────┘
-      │
-      ▼
-┌──────────────────┐
-│   VITS 合成器     │
-│  ┌──────────────┐│
-│  │ TextEncoder   ││  ← Transformer encoder
-│  │  (Flow)      ││  ← Residual Coupling Flow
-│  └──────┬───────┘│
-│         │        │
-│  ┌──────▼───────┐│
-│  │ GeneratorNSF  ││  ← HiFiGAN + NSF 声源
-│  │ (HiFiGAN+NSF) ││
-│  └──────┬───────┘│
-└─────────┼────────┘
-          │
-          ▼
-┌─────────────┐
-│ 重采样到目标  │  ← 40kHz / 48kHz
-│ 采样率       │
-└─────┬───────┘
-      │
-      ▼
-  输出音频 (WAV/FLAC)
-```
+### 1. 构建
 
-## 构建
+要求 CMake 3.24+、C++20 编译器、CUDA Toolkit 和支持目标架构的 CUDA GPU：
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DVOXMUTATIO_CUDA_ARCHITECTURES=87
+cmake --build build --parallel 2
 ```
 
-## 实际使用工作流
+产品和 CI 基线是 Jetson Orin / SM87；在其他 CUDA GPU 上开发时必须显式设置
+对应的 `VOXMUTATIO_CUDA_ARCHITECTURES`。
 
-从真实录音训练目标声线，再用它转换任意语音/歌声。**运行时零 Python**——全部由
-C++/CUDA CLI 完成（`tools/` 下的 Python 仅用于一次性下载与离线对拍）。
+### 2. 准备资产
 
-### 1. 准备模型
+模型不进入 Git。按 [`models/README.md`](models/README.md) 的固定 revision、锁定工具环境
+和哈希流程准备至少以下 safetensors：
+
+- `models/hubert_base/model.safetensors`
+- `models/rmvpe.safetensors`
+- 一个兼容的 F0 v1/v2、40 kHz synthesizer
+
+`models/pretrained_v2/pretrained_v2/f0G40k.safetensors` 是架构和数值验证用的通用预训练
+generator，**不是目标声线模型**。实际目标声线转换应使用同一份有权使用的语料得到的
+`model.safetensors` 与版本匹配的 Flat `model.index`（v1 为 256D、v2 为 768D；仓库训练
+路径当前使用 v2/768D）；仓库当前没有可发布的目标声线资产对。
+
+### 3. 转换 WAV
+
+直接运行当前 CLI：
 
 ```bash
-cd tools && uv run download_models.py && cd ..
+build/vc_convert \
+  --hubert models/hubert_base/model.safetensors \
+  --rmvpe models/rmvpe.safetensors \
+  --model models/pretrained_v2/pretrained_v2/f0G40k.safetensors \
+  --input source.wav --output converted.wav \
+  --version v2 --sr 40000
 ```
 
-需要 `models/` 下：`hubert_base/model.safetensors`（内容编码器）、`rmvpe.safetensors`
-（F0 提取）、`pretrained_v2/pretrained_v2/f0G40k.safetensors`（40k 预训练 G）。
-
-### 2. 训练目标声线
-
-```bash
-# 原始录音（一个 WAV 或一个目录）-> 切片 -> 微调 -> 检索索引
-scripts/train_voice.sh --raw my_voice/ --work runs/alice --steps 300
-```
-
-产出 `runs/alice/model.safetensors`（微调模型）与 `runs/alice/model.index`（检索索引）。
-流程：`vc_preprocess`（去静音 + 定长切片）→ `vc_train`（autograd 解码器 mel-L1 微调）
-→ `build_index`。
-
-### 3. 转换
+使用训练产物和匹配 Index：
 
 ```bash
 scripts/convert_voice.sh \
   --model runs/alice/model.safetensors \
   --index runs/alice/model.index \
-  --input song.wav --output song_alice.wav \
+  --input source.wav --output converted.wav \
   --index-rate 0.5 --pitch 0
 ```
 
-### 直接调用 CLI（脚本等价展开）
+以进程退出码和库的 `VCResult::success` 判断成功，不能只看旧输出文件是否存在。
+CLI 参数、默认值和错误行为见 [`docs/CLI.md`](docs/CLI.md) 与各命令的 `--help`。
+
+## 测试
+
+默认 contract 不依赖被忽略的模型和数值 fixture：
 
 ```bash
-build/vc_preprocess --input my_voice/ --output-dir runs/alice/clips \
-  --sr 40000 --seg-sec 3.0 --trim
-build/vc_train --hubert models/hubert_base/model.safetensors \
-  --rmvpe models/rmvpe.safetensors \
-  --pretrained models/pretrained_v2/pretrained_v2/f0G40k.safetensors \
-  --target runs/alice/clips --out runs/alice/model.safetensors --steps 300
-build/build_index --hubert models/hubert_base/model.safetensors \
-  --input-dir runs/alice/clips --output runs/alice/model.index
-build/vc_convert --hubert models/hubert_base/model.safetensors \
-  --rmvpe models/rmvpe.safetensors --model runs/alice/model.safetensors \
-  --index runs/alice/model.index --index-rate 0.5 \
-  --input song.wav --output song_alice.wav --version v2 --speakers 109 --sr 40000
+ctest --test-dir build --output-on-failure --label-regex contract
 ```
 
-> 训练支持两种模式，均纯 C++/CUDA 自研 autograd、导出模型与推理运行时逐比特兼容（往返 corr 1.0）：
-> - **解码器微调**（默认）：mel-L1 微调 NSF-HiFiGAN 声码器适配目标音色，快速。
-> - **完整 VITS GAN**（`vc_train --gan`）：后验编码器 enc_q + flow + 解码器 对抗
->   MPD-V2 判别器，损失 = 45·mel + KL + 2·特征匹配 + 对抗（LSGAN），音质更高。
->   判别器权重默认取 G 同目录的 `f0D40k.safetensors`。
+模型、对齐、训练和端到端测试只有在声明资产存在时才注册：
+
+```bash
+cmake -S . -B build-model-tests \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DVOXMUTATIO_CUDA_ARCHITECTURES=87 \
+  -DVOXMUTATIO_ENABLE_MODEL_TESTS=ON
+cmake --build build-model-tests --parallel 2
+ctest --test-dir build-model-tests --output-on-failure
+```
+
+缺资产、未注册或 skip 都不等于通过。当前测试数量、环境和完整结果只维护在
+[`specs/PROJECT_STATE.md`](specs/PROJECT_STATE.md)，避免 README 复制易过期数字。
+
+## 实验性训练
+
+```bash
+scripts/train_voice.sh \
+  --raw my_voice_wav/ \
+  --work runs/alice \
+  --steps 300
+```
+
+该脚本编排 `vc_preprocess -> vc_train -> build_index`。训练路径用于工程验证，不承诺
+大数据集稳定性、断点续训、生产资源上限、声音相似度或可商用权利。保留原始录音与
+预训练模型，不要把实验输出当作唯一可恢复副本。
 
 ## WebUI
 
-面向普通用户的浏览器界面，**统一调度训练与推理全流程**,双标签:
-
-- **① 训练声线**:命名目标声线 → 选**训练质量档位**(快速试听 / 标准 / 高音质,
-  自动映射模式与步数,可展开高级微调)→ 上传目标说话人录音(可多选,显示总时长
-  并提示 ≥10 分钟)→ 一键训练。后端自动执行 切片 → 微调 → 建索引,实时回传阶段与日志。
-- **② 语音转换**:选已训练声线 → 选**效果档位**(最稳 / 平衡 / 最贴音色 / 唱歌,
-  每档带人话说明,一键填参,可展开高级微调)→ 上传音频 → 转换 → 试听/下载。
-  参数含音高、特征检索率、RMS 混合、清音保护、F0 平滑半径(filter_radius)。
-
-后端 `vc_serve` 是纯 C++ HTTP 服务(POSIX socket 手写,零第三方、零 Python 运行时),
-作为**编排层**调用已验证的 CLI(vc_preprocess / vc_train / build_index / vc_convert)
-子进程完成各阶段;训练在后台线程执行,不阻塞界面。声线模型存于 `runs/<name>/`。
+唯一受支持的 Web 服务入口是 `vc_serve`：
 
 ```bash
-build/vc_serve --repo "$PWD" --webroot webui --port 8080
-# 浏览器打开 http://localhost:8080
+build/vc_serve --repo "$PWD" --webroot webui \
+  --host 0.0.0.0 --port 8080
 ```
 
-接口:`GET /api/voices`、`POST /api/train`(multipart 录音+参数)、
-`GET /api/train/status`、`POST /api/convert`(选声线+音频)。
+默认配置会暴露给所有可达 IPv4 网络且 API 不认证。只在受信网络使用；面向不可信网络
+至少启用 bearer token，并由反向代理提供 TLS、访问控制和审计：
+
+```bash
+build/vc_serve --repo "$PWD" --webroot webui \
+  --host 0.0.0.0 --port 8080 \
+  --auth-token 'replace-with-a-secret'
+```
+
+`--auth-token` 只保护 `/api/`，静态 WebUI 仍可读取。完整路由、资源上限和部署 non-goals
+见 [`specs/003-webui/spec.md`](specs/003-webui/spec.md)。该服务是离线 CLI 编排层，
+不是 WebSocket 或实时音频服务器。
+
+## 作为库使用
+
+当前仓库提供 `voxmutatio` CMake static facade 供源码树内目标和 `add_subdirectory` 集成；
+尚无 `install()`、导出 package config 或稳定的预编译 SDK 发行契约。公共头位于
+`include/voxmutatio/`，但嵌入方应准备随源码重编译，并以对应 Spec 和 contract tests
+判断接口成熟度。
+
+## 项目导航
+
+- [`models/README.md`](models/README.md)：模型来源、转换、哈希与目标声线资产边界
+- [`docs/CLI.md`](docs/CLI.md)：CLI 工作流、常用参数和失败语义
+- [`specs/README.md`](specs/README.md)：SDD 权威层级、规格索引和维护规则
+- [`specs/PROJECT_STATE.md`](specs/PROJECT_STATE.md)：当前能力与最近验证快照
+- [`specs/TRACEABILITY.md`](specs/TRACEABILITY.md)：需求、实现和测试追踪
+- [`docs/DESIGN.md`](docs/DESIGN.md)：当前架构与实现边界
+- [`docs/REFACTORING_GUIDE.md`](docs/REFACTORING_GUIDE.md)：重构、迁移和回滚门禁
+- [`AGENTS.md`](AGENTS.md)：Codex 的 SDD 桥接入口
+
+修改 SDD 或桥接入口后运行：
+
+```bash
+bash scripts/check_sdd.sh
+```
 
 ## 参考项目
 
-| 项目 | 角色 |
-|------|------|
-| [RVC-Project/RVC-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) | 原始 Python 实现（重构目标） |
-| [Qwen3x-Orin](https://github.com/thomas-hiddenpeak/Qwen3x-Orin) | C++/CUDA 引擎风格参考 |
-| [Orator](https://github.com/thomas-hiddenpeak/Orator) | C++20 规范和测试风格参考 |
-| [qwen35-thor](https://github.com/thomas-hiddenpeak/qwen35-thor) | SM110a 架构参考 |
+- [RVC-Project/Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
+- [Qwen3x-Orin](https://github.com/thomas-hiddenpeak/Qwen3x-Orin)
+- [Orator](https://github.com/thomas-hiddenpeak/Orator)
 
 ## 许可证
 

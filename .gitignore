@@ -44,8 +44,9 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Models and weights (large files)
-models/
+# Models and weights (large files); keep the asset-governance README trackable.
+models/*
+!models/README.md
 *.safetensors
 *.pth
 *.pt

@@ -1,246 +1,73 @@
-<!-- 
-Resonantia Custom Skill: API and Interface Design
-Adapted from addyosmani/agent-skills (MIT License)
-Customized for C++20 Module Boundaries + CUDA Kernels
+<!--
+Resonantia project skill. Adapted from addyosmani/agent-skills (MIT License).
 -->
 
-# API and Interface Design (Resonantia Edition)
+# API and Interface Design
 
-## Overview
+Use this guide when changing public headers, configuration structs, CLI options, or
+cross-module call boundaries. Read the Constitution, the relevant Spec, and the
+affected public header and callers before proposing an interface.
 
-Design stable, well-documented C++ interfaces that are hard to misuse. Good interfaces make the right thing easy and the wrong thing hard. This applies to module public headers, CUDA kernel launch APIs, and configuration structs.
+## Workflow
 
-**Constitution Principle VIII**: Anti-Abstraction. Prefer simple, direct interfaces over clever abstractions.
+1. State the observable contract before editing: accepted inputs, output shape and
+   units, ownership, lifetime, error behavior, initialization state, and concurrency.
+2. Inspect every current producer and consumer. Preserve behavior that callers can
+   observe unless the governing Spec and migration plan explicitly change it.
+3. Keep the public surface minimal. Put kernels, launch geometry, device storage,
+   weight layout, and scratch allocation in private implementation details.
+4. Add or update contract tests before implementation. Test invalid inputs and
+   failure states as well as the happy path.
+5. Update CMake wiring and active SDD traceability when the public contract changes.
 
-## When to Use
+## Contract rules
 
-- Designing new module public headers (`include/voxmutatio/<module>/`)
-- Defining CUDA kernel launch signatures
-- Creating configuration structs
-- Changing existing public APIs
+- Use the existing module's error convention consistently. Do not mix exceptions,
+  booleans, sentinels, and optional error strings within one operation family without
+  a documented migration.
+- Distinguish invalid caller input from initialization, I/O, model-validation, and
+  CUDA execution failures. Never return plausible output after a failed operation.
+- Make initialization transactional: validate and allocate into staged state, then
+  commit it atomically. On failure, leave the object destructible and in a documented
+  uninitialized or previous-valid state.
+- Validate public sizes before narrowing to `int` or computing byte counts. Check
+  nullability, empty input, overflow, dtype, shape, finite values, compatible model
+  variants, and supported enum values at the boundary.
+- Treat defaults, result ordering, units, error categories, and accepted file formats
+  as API. Do not silently broaden a field to advertise unsupported behavior.
 
-## Core Principles
+## Ownership and CUDA boundaries
 
-### 1. Contract First (Header First)
+- Prefer owning RAII types for files, mmap regions, host/device buffers, CUDA
+  streams/events, library handles, locks, and temporary files.
+- Mark borrowed buffers and views clearly. Document the required lifetime, memory
+  space, mutability, alignment, and stream association; never retain a borrowed view
+  beyond its contract.
+- Define whether a CUDA-facing call is synchronous or asynchronous. For asynchronous
+  calls, state who owns the stream, when inputs may be reused, and where failures
+  become observable.
+- Keep scratch memory instance-owned or operation-owned and bounded. If an object is
+  not thread-safe, make that part of the contract and enforce it internally where
+  shared mutable state exists.
 
-Define the public header before implementing. The header is the contract — implementation follows.
+## Compatibility
 
-```cpp
-// include/voxmutatio/content/hubert_encoder.h (contract)
-#pragma once
+- Prefer additive changes with validated defaults only when the default preserves
+  existing behavior.
+- Preserve RVC v1/v2 tensor dimensions and model compatibility checks. Do not make
+  WavLM interchangeable with HuBERT, or FCPE interchangeable with RMVPE, without the
+  required model/config compatibility validation.
+- Reject unsupported precision, formats, sample-rate modes, and algorithms explicitly
+  rather than exposing inert configuration fields.
+- For a breaking API or architecture change, require the governing migration section,
+  ADR, updated callers, and regression tests in the same change.
 
-#include <cstddef>
-#include <string>
-#include <vector>
+## Verification
 
-namespace voxmutatio::content {
+- Build every affected library, CLI, and test target.
+- Run focused contract tests, then the broader asset-free CTest suite when practical.
+- Run real-model integration tests for changes that affect model compatibility or
+  numerical output; report unavailable assets as unverified, not passed.
+- Check public headers for private implementation leakage and circular dependencies.
 
-struct HubertConfig {
-    std::string model_path;
-    int output_dim = 256;
-    bool half_precision = false;
-};
-
-class HubertEncoder {
-public:
-    bool init(const HubertConfig& config);
-    std::vector<float> extract(const float* audio, int num_samples);
-    [[nodiscard]] int output_dim() const noexcept { return output_dim_; }
-
-private:
-    int output_dim_ = 256;
-};
-
-}  // namespace voxmutatio::content
-```
-
-**Implementation** (`.cu` file) is private to the module.
-
-### 2. Consistent Error Semantics
-
-Pick one error strategy and use it everywhere:
-
-```cpp
-// Pattern 1: bool return for init/load operations
-bool init(const HubertConfig& config);  // false = failure
-
-// Pattern 2: std::optional for fallible queries
-std::optional<std::string> Device::init(...);  // nullopt = success, string = error
-
-// Pattern 3: ErrorCode enum for detailed errors
-enum class ErrorCode : std::uint8_t {
-    kSuccess,
-    kInvalidInput,
-    kModelLoadFailed,
-    // ...
-};
-```
-
-**Don't mix patterns.** If `init()` returns `bool`, don't have `load()` return `std::optional`.
-
-### 3. Validate at Boundaries
-
-Trust internal code. Validate at public API boundaries:
-
-```cpp
-// Public API (validate)
-std::vector<float> HubertEncoder::extract(const float* audio, int num_samples) {
-    if (!audio || num_samples <= 0) {
-        throw std::invalid_argument("audio must be non-null and non-empty");
-    }
-    // ... implementation ...
-}
-
-// Internal helper (trust)
-__device__ float hubert_activation(float x) {
-    return x * (1.0f + std::log(std::exp(x)));  // GELU approximation
-    // No validation needed — called from kernel with validated input
-}
-```
-
-### 4. Prefer Addition Over Modification
-
-Extend interfaces without breaking existing consumers:
-
-```cpp
-// Good: Add optional config fields
-struct HubertConfig {
-    std::string model_path;
-    int output_dim = 256;
-    bool half_precision = false;
-    int num_layers = 12;  // Added later, has default
-};
-
-// Bad: Remove fields or change types
-struct HubertConfig {
-    std::string model_path;
-    // int output_dim = 256;  // Removed — breaks existing code
-};
-```
-
-### 5. Predictable Naming
-
-| Element | Convention | Example |
-|---------|-----------|---------|
-| Files | `snake_case` | `hubert_encoder.h` |
-| Namespaces | `snake_case` | `voxmutatio::content` |
-| Types | `PascalCase` | `HubertEncoder` |
-| Functions | `snake_case` | `extract()` |
-| Members | `trailing_` | `output_dim_` |
-| Constants | `kPascalCase` | `kHubertHiddenDim` |
-| Enums | `kPascalCase` | `ModelVersion::kV1` |
-
-## CUDA Kernel API Patterns
-
-### Kernel Launch Wrapper
-
-Hide launch configuration from callers:
-
-```cpp
-// Public API (simple)
-std::vector<float> extract(const float* audio, int num_samples);
-
-// Internal wrapper (handles launch config)
-__global__ void hubert_forward_kernel(
-    const float* audio, float* output,
-    int num_samples, int output_dim,
-    const float* weights  // captured in weights_
-);
-
-// Implementation
-std::vector<float> HubertEncoder::extract(const float* audio, int num_samples) {
-    int block_size = 256;
-    int grid_size = (num_samples + block_size - 1) / block_size;
-    hubert_forward_kernel<<<grid_size, block_size>>>(...);
-    cudaDeviceSynchronize();
-    // ...
-}
-```
-
-### Configuration Structs
-
-Use structs for kernel parameters > 3 arguments:
-
-```cpp
-// Good: Config struct
-struct KernelConfig {
-    int block_size = 256;
-    int shared_memory_bytes = 48 * 1024;
-    bool use_half_precision = false;
-};
-
-void launch_kernel(const KernelConfig& cfg, ...);
-
-// Bad: Too many parameters
-void launch_kernel(int block_size, int shared_mem, bool half_prec, int foo, float bar, ...);
-```
-
-## Header Organization
-
-### Public Headers (`include/`)
-
-```
-include/voxmutatio/content/
-├── hubert_encoder.h      # Public API only
-└── wavlm_encoder.h       # Public API only
-```
-
-**Rules**:
-- No `#include` of `src/` internal headers
-- No implementation details (GPU pointers, kernel configs)
-- Only what external callers need
-
-### Internal Headers (`src/`)
-
-```
-src/content/
-├── hubert_encoder.cu     # Implementation
-├── hubert_encoder.h      # Internal forward declarations
-└── hubert_common.cuh     # Shared CUDA utilities (private)
-```
-
-**Rules**:
-- `.cuh` files are private to the module
-- Can include anything
-- Not exposed in `include/`
-
-## Hyrum's Law for C++ APIs
-
-> With a sufficient number of users of an API, all observable behaviors will be depended on.
-
-**Implications**:
-- Every public function signature is a commitment
-- Error message text is observable (don't change casually)
-- Return value ordering is observable
-- Default parameter values are observable
-
-**Mitigation**:
-- Mark deprecated APIs with `[[deprecated("use X instead")]]`
-- Keep backward-compatible wrappers during deprecation period
-- Document breaking changes in commit messages
-
-## Common Rationalizations
-
-| Rationalization | Reality |
-|----------------|---------|
-| "We'll design the API later" | The header IS the design. Write it first. |
-| "Internal APIs don't need contracts" | Internal consumers are still consumers. |
-| "CUDA kernels are implementation details" | Kernel launch signatures are APIs. Design them well. |
-| "We can always refactor the header" | Header changes propagate to all consumers. |
-
-## Verification Checklist
-
-- [ ] Public header compiles independently
-- [ ] No `src/` headers leaked to `include/`
-- [ ] Naming conventions followed (Google C++ Style)
-- [ ] Error semantics consistent with existing APIs
-- [ ] New fields have default values (backward compatible)
-- [ ] `[[nodiscard]]` on value-returning functions
-- [ ] `noexcept` on non-throwing functions
-- [ ] `static_assert` for compile-time invariants
-
-## See Also
-
-- `.specify/memory/constitution.md` — Principle VIII (Anti-Abstraction)
-- `.clang-format` — Auto-formatting rules
-- `docs/DESIGN.md` — Module decomposition
+See `.specify/memory/constitution.md`, `docs/DESIGN.md`, and the task's relevant Spec.

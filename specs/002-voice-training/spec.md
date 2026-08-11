@@ -1,123 +1,125 @@
-# Feature Specification: Voice Training (学习声线与音高)
+# Feature Specification: Voice Training
 
 **Feature Branch**: `002-voice-training`
 **Created**: 2026-08-07
-**Status**: Approved — 架构 **A(纯 C++/CUDA autograd)** · 40k · fine-tune only
+**Status**: **Experimental / Partially Complete**
+**Architecture**: C++/CUDA autograd, 40 kHz v2 fine-tuning path
 
-## Decision (2026-08-07)
+## 1. Product Boundary
 
-用户确认 **方案 A:纯 C++/CUDA 训练(自研 autograd)**。
+项目已经有可执行的训练实验路径，但尚未达到“用户提交数据即可稳定训练出生产声线”
+的产品状态。
 
-- 训练是本项目**不可分离**的一部分,与推理同等一等公民。
-- 训练产物必须是符合本项目与参考项目风格的 **safetensors 权重 + 索引**
-  (可被 C++ 推理运行时直接加载)。
-- 采样率**先只做 40k**(与已对齐的 f0G40k 一致),后期再完善 32k/48k。
-- **只做 fine-tune**(基于预训练模型微调),不做从零预训练。
+当前可用入口是：
 
-宪法 XI(Python 仅在 tools/)在此语境下的解读:**训练与推理运行时都用纯
-C++/CUDA**;Python 仅用于离线数据准备的一次性辅助(如无必要则不引入)。
+- `vc_train` decoder-only mel fine-tune。
+- `vc_train --gan` posterior/flow/decoder + discriminator 的 GAN fine-tune。
+- `GeneratorTrainer`、`GANTrainer` 及其底层 autograd/AdamW 组件。
+- 独立 `build_index` CLI。
 
-## 目标
+旧公共 `FineTuneTrainer` 仅为源码兼容保留。其 `init/train/save_checkpoint/
+load_checkpoint` 明确返回失败，**不支持训练**；不得把它计入完成能力。
 
-给定目标说话人/歌手的音频数据集,通过纯 C++/CUDA 的 GAN 微调,产出
-`G_<name>.safetensors` + `<name>.index`,供推理"模仿与演唱"该目标声线。
+## 2. Current Workflow
 
----
+```text
+WAV target clips
+  -> HuBERT + RMVPE + v2/40k synthesizer front-end
+  -> fixed-length training segments
+  -> decoder mel-L1 fine-tune
+     OR full GAN step:
+        PosteriorEncoder + Flow + Decoder
+        one scale discriminator + eight period discriminators
+        mel + KL + feature-matching + LSGAN losses
+  -> inference-ready G safetensors (atomic export)
 
-## 1. 训练管线概览(对齐 RVC)
-
-```
-目标音频目录
-  → 预处理(切片/重采样 40k+16k/响度归一)
-  → 特征提取(HuBERT 内容 + RMVPE F0,复用已实现 C++ 前向)
-  → 频谱(用于 PosteriorEncoder enc_q 与 mel 损失)
-  → GAN 微调:
-       Generator(enc_p + enc_q + flow + dec)  ← 需反向
-       Discriminator(MultiPeriod + MultiScale) ← 需反向
-       损失 = mel L1 + KL + feature-matching + adversarial(LSGAN)
-       优化器 = AdamW(G) + AdamW(D)
-  → 检查点(safetensors)+ 断点续训
-  → 导出仅推理所需的 G → safetensors
-  → 构建检索索引(复用已实现 C++ build_index)
+optional, separate:
+  extracted features -> build_index -> .index
 ```
 
-**关键新增(训练专用,推理未实现)**:
-- 反向自动微分引擎(autograd)+ AdamW 优化器。
-- PosteriorEncoder(enc_q,WaveNet)前向 + 反向。
-- 判别器(MPD/MSD)前向 + 反向。
-- 训练损失(mel/KL/fm/adv)前向 + 反向。
-- 生成器所有算子的**反向**(推理已有前向)。
+当前导出只保证代码和测试覆盖的推理权重往返。它不等于已经证明新目标声线的主观质量、
+相似度或大数据集稳定性。
 
----
+## 3. User Scenarios
 
-## 2. User Scenarios
+### Story 1 — 开发者运行 decoder 微调实验（P1，已实现）
 
-### Story 1 — 训练目标声线 (P1)
-```bash
-vc_train --pretrained-g models/pretrained_v2/f0G40k.safetensors \
-         --pretrained-d models/pretrained_v2/f0D40k.safetensors \
-         --hubert models/hubert_base/model.safetensors \
-         --rmvpe models/rmvpe.safetensors \
-         --input-dir data/target_voice --out models/mymodel --epochs 100
-# 产出 models/mymodel/G.safetensors + model.index
-vc_convert --model models/mymodel/G.safetensors --index models/mymodel/model.index ...
-```
+开发者向 `vc_train` 提供 HuBERT、RMVPE、预训练 v2/40k G、WAV 文件或目录、训练
+步数和输出路径。程序执行真实优化并原子写出 inference-ready safetensors。
 
-### Story 2 — 断点续训 (P2)
-从最近检查点恢复,loss 连续。
+### Story 2 — 开发者运行完整 GAN step（P1，已实现但实验性）
 
-### Story 3 — 进度可观测 (P2)
-输出结构化 epoch/step/loss,供 WebUI(spec 003)消费。
+在额外提供 D checkpoint 后，`--gan` 路径执行 enc_q、flow、decoder、判别器和
+mel/KL/feature-matching/adversarial 损失。训练 loss 必须有限，错误初始化必须清空
+旧 checkpoint 状态。
 
----
+### Story 3 — 断点续训（P1，未实现）
 
-## 3. Functional Requirements
+保存/恢复 G、D、optimizer、epoch/step 和 RNG 状态，并验证恢复后的下一步等价。
+当前 `vc_train` 只有最终 G 导出，不具备这一契约。
 
-- **FR-001 Autograd**:反向自动微分引擎(Tensor + 反向图 + 拓扑反传),
-  device 存储用 RAII(CudaBuffer);每个算子有梯度检查(有限差分)门控。
-- **FR-002 Optimizer**:AdamW,凸问题上验证收敛。
-- **FR-003 训练算子反向**:linear、conv1d(dilation/stride/groups)、
-  conv_transpose1d、layer_norm、gelu/leaky_relu/tanh、attention、
-  fused tanh·sigmoid;每个都有梯度检查。
-- **FR-004 PosteriorEncoder(enc_q)**:前向 + 反向(训练用后验编码器)。
-- **FR-005 判别器**:MultiPeriodDiscriminator + MultiScaleDiscriminator 前向 + 反向。
-- **FR-006 损失**:mel L1、KL、feature-matching、adversarial(LSGAN),前向 + 反向。
-- **FR-007 数据管线**:切片、重采样(40k+16k)、响度归一、特征/F0/频谱缓存、
-  filelist、batching(变长 → 截断/填充到训练片段)。
-- **FR-008 训练循环**:GAN 交替优化 G/D;梯度裁剪;学习率调度。
-- **FR-009 检查点**:safetensors 保存/加载 G+D+optimizer state;断点续训。
-- **FR-010 导出**:导出仅推理所需 G → safetensors(与 f0G40k 同构,可被 spec 001 加载)。
-- **FR-011 索引**:训练集特征 → `.index`(复用 C++ build_index)。
-- **FR-012 CLI**:`vc_train`。
+### Story 4 — 生产声线质量（P1，未验证）
 
----
+在代表性数据集上验证音色相似度、可懂度、音高保持、伪影和人工听感。现有单元/集成
+测试不能替代这一验证。
 
-## 4. Success Criteria
+## 4. Requirements and Status
 
-- **SC-001 Autograd 正确**:所有算子反向相对有限差分误差 < 1e-3(梯度检查)。
-- **SC-002 优化器正确**:AdamW 在凸问题上收敛到已知最优。
-- **SC-003 端到端可训**:~10 分钟目标音频,完成 N epoch 微调无崩溃/NaN。
-- **SC-004 产物可用**:导出 safetensors 被 C++ 推理运行时加载并转换出有效音频(无 NaN/Inf)。
-- **SC-005 声线学习有效**:转换输出音色更接近目标(目标说话人 embedding 余弦相似度提升)。
-- **SC-006 断点续训**:从检查点恢复后 loss 连续。
-- **SC-007 索引可用**:产出 `.index` 被 `vc_convert --index` 正常检索。
+| ID | Requirement | Status |
+|---|---|---|
+| FR-001 | CUDA autograd tape、反向图与基础/神经网络算子 | 已实现并有 contract/梯度测试；覆盖度持续维护 |
+| FR-002 | AdamW、梯度裁剪、非有限梯度/损失防护 | 已实现 |
+| FR-003 | differentiable STFT/mel L1 | 已实现 |
+| FR-004 | NSF/HiFi-GAN decoder 的可训练前向 | 已实现 |
+| FR-005 | PosteriorEncoder、Flow、判别器训练图 | 已实现 |
+| FR-006 | KL、feature matching、LSGAN、mel 的 G/D 交替 step | 已实现，实验性 |
+| FR-007 | WAV 数据发现、前端特征/F0、训练片段采样 | `vc_train` 内实现基线路径；非完整数据产品 |
+| FR-008 | 结构化进度 | 仅 CLI 文本 step/loss；稳定机器可读协议未定义 |
+| FR-009 | inference G safetensors 导出 | 已实现；临时文件 + rename 原子提交 |
+| FR-010 | 独立 Flat Index 构建 | 已由 `build_index` 实现；未与训练事务绑定 |
+| FR-011 | 持久化 checkpoint 与断点续训 | **未实现** |
+| FR-012 | 旧 `FineTuneTrainer` 门面 | **不支持，必须失败** |
+| FR-013 | 分布式、FP16、多 GPU、从零预训练 | **不支持** |
+| FR-014 | 生产级音质/声线相似度保证 | **未验证** |
 
----
+## 5. Safety and Correctness Gates
 
-## 5. 质量门(NON-NEGOTIABLE)
+- 训练入口对 speaker、steps/epochs、segment、learning rate 和数据路径做范围/存在性
+  校验；数值参数使用严格全量解析并拒绝非有限值、溢出、尾随字符和越界值，真实
+  `vc_train` 进程由 `test_cli_contract` 门控。
+- checkpoint tensor 必须验证 dtype、shape、byte range、有限值和 weight norm。
+- `GeneratorTrainer`、`GANTrainer` 初始化采用失败回滚；失败后旧权重不可继续使用。
+- loss 非有限时不得更新或导出伪成功模型。
+- 最终 G 导出使用同目录临时文件、精确 little-endian 写入、flush/close 后 rename；
+  失败清理临时产物。
+- 功能集成使用真实 WAV；小型合成张量只用于算子梯度/边界测试。
 
-- **梯度检查是训练的"数值对齐"**:每个反向算子必须有有限差分梯度检查测试
-  (类比推理阶段的逐样本对齐)。无梯度检查的反向算子不得合入。
-- **真实音频**:功能测试用真实目标音频(宪法 X);合成信号仅用于 autograd 单元梯度检查。
-- **可复现参考**:关键损失/子图可与 PyTorch(tools/ 离线)对拍一次以确立正确性,
-  但训练运行时不依赖 Python。
+## 6. Verified Evidence
 
----
+本地资产齐全的最近一次 current-tree 30/30 CTest（11 contract + 19 integration、0 fail，
+real 335.05 秒）中包含：
 
-## Completion Checklist
+- autograd contract；
+- real-audio mel loss；
+- generator trainer 初始化回滚、训练、导出与推理往返；
+- discriminator、posterior/flow 和完整 GAN step；
+- GAN 初始化回滚与未初始化失败契约。
 
-- [ ] FR-001..012 实现
-- [ ] SC-001..007 验证(真实目标音频)
-- [ ] 所有反向算子梯度检查通过
-- [ ] 导出产物经 C++ 推理运行时端到端验证
-- [ ] plan.md / tasks 建立并推进
+这些证据说明训练代码会执行真实优化且关键数值/资源边界受测试，不证明：
+
+- 长时间或大数据集训练稳定；
+- checkpoint resume；
+- 导出模型在未知数据上的泛化；
+- 声线 embedding 相似度提升或生产音质。
+
+## 7. Completion Criteria
+
+要把状态从“实验性 / 部分完成”升级为产品能力，至少还需：
+
+- [ ] 实现并测试 G/D/optimizer/epoch/step/RNG 的 checkpoint resume。
+- [ ] 定义并完成可复现的真实数据集训练稳定性门。
+- [ ] 完成导出 G + Index 的一致性/事务边界。
+- [ ] 建立客观指标与盲听协议，证明目标声线相似度和音质。
+- [ ] 定义失败恢复、磁盘配额、产物保留和版本兼容策略。
+- [ ] 决定旧 `FineTuneTrainer` 的正式实现或移除计划。
+- [x] 使用严格数值解析并以真实进程测试 malformed、非有限、溢出、尾随字符和越界参数。
