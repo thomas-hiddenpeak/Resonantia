@@ -1,101 +1,101 @@
-# Implementation Plan: Voice Training (002)
+# Implementation Plan: Voice Training
 
-**Branch**: `002-voice-training` | **Date**: 2026-08-07
-**Architecture**: 纯 C++/CUDA 自研 autograd(方案 A) · 40k · fine-tune only
+**Branch**: `002-voice-training`
+**Updated**: 2026-08-09
+**Status**: Experimental / partially complete
 
-> 事实基线见 [specs/PROJECT_STATE.md](../PROJECT_STATE.md)。质量门:每个反向算子必须有有限差分梯度检查(训练版"数值对齐")。
+## Delivery Strategy
 
-## 策略
+复用已对齐的推理前端和 synthesizer 权重，在 C++/CUDA autograd 上先交付可验证的
+decoder fine-tune，再扩展到 posterior/flow/discriminator 的完整 GAN step。当前代码
+已达到“开发者可运行实验”，尚未达到“可恢复、可规模化、质量有保证”的训练产品。
 
-复用推理阶段已实现且对齐的**前向**;新增**反向**与训练专用组件。核心是先建一个
-**最小 tape-based 反向自动微分引擎**,device 存储用 RAII(顺带偿还审计 P0 的
-裸 cudaMalloc 债务),再在其上搭生成器/判别器/损失,最后 GAN 循环。
+## As-built Phases
 
-## Constitution Check (v1.4.0)
+### A0 — Autograd core: implemented
 
-| Principle | Compliance | Notes |
-|-----------|------------|-------|
-| III. Test-First | ✅ | 梯度检查门控每个反向算子 |
-| V. Zero-Dependency Purity | ✅ | 纯 C++/CUDA autograd,无第三方训练框架 |
-| VI. Numerical Alignment | ✅ | 梯度检查 + 关键子图与 PyTorch 对拍一次 |
-| X. Real Audio Only | ✅ | 功能测试用真实目标音频 |
-| XI. Python Isolation | ✅ | 训练运行时纯 C++;Python 仅离线一次性对拍 |
+- [x] RAII device tensor storage and tape-based backward graph。
+- [x] add/mul/sum/matmul 及训练所需的 reshape/slice/concat/embedding 等基元。
+- [x] linear、conv、transpose-conv、normalization、activation、softmax 等反向。
+- [x] 有限差分/contract 测试覆盖关键算子与非法尺寸。
 
-## Phases
+### A1 — Optimizer and differentiable mel: implemented
 
-### Phase A0: Autograd 核心 — ✅ 完成
-- [x] `core/cuda_buffer.h` — RAII device 缓冲(替代裸 cudaMalloc/free)
-- [x] `autograd/tensor.{h}` + `autograd.cu` — Tensor + 反向图 + 拓扑反传 `backward(loss)`
-- [x] 基础算子:add、mul、sum、matmul(前向 + 反向)
-- [x] `test_autograd`:有限差分梯度检查(< 4e-6)
-- **门控 SC-001(部分)✅**
+- [x] AdamW、bias correction、梯度裁剪和 non-finite 防护。
+- [x] differentiable frame/STFT/magnitude/mel/log/L1。
+- [x] real-audio mel integration test。
 
-### Phase A1: NN 算子反向 — ✅ 完成
-- [x] linear(bias)、conv1d(dilation/stride/groups)、conv_transpose1d
-- [x] layer_norm、gelu、relu、leaky_relu、tanh、sigmoid、softmax
-- [x] 每个算子梯度检查通过(max rel err < 4e-4)
-- [ ] 相对位置注意力 → 由基元(linear+matmul+softmax+reshape)在 A3 组合
-- **门控 SC-001(基元全部)✅**
+### A2 — Trainable generator path: implemented, experimental
 
-### Phase A2: 优化器 — ✅ 完成
-- [x] AdamW(decoupled weight decay、bias correction、per-param m/v RAII)
-- [x] 凸问题收敛测试(max|x-target| 1.2e-7)
-- **门控 SC-002✅**
+- [x] `GeneratorTrainer` 加载 v2/40k G 的 decoder 参数。
+- [x] decoder forward/backward 和 mel-L1 更新。
+- [x] 初始化失败回滚，不保留旧 checkpoint。
+- [x] 原子导出 inference-ready G，测试导出后推理往返。
 
-> **可微分算子集 + mel 损失地基已完成(A0–A2 + mel):**
-> - 额外基元:transpose2d/concat_rows/slice_rows/embedding/scale/sqrt/log/abs/frame(均梯度检查)
-> - 可微 mel 损失(`training/mel_loss`):frame→DFT matmul→幅度→Slaney mel→log→L1
-> - 已证明:真实语音 mel 优化 loss 5.19→2.45(autograd+AdamW 端到端)
-> **剩余为“模型组装”:在已验证基元上搭生成器/训练循环。**
+### A3 — Full GAN components: implemented, experimental
 
-### Phase A3: 训练专用前向/反向组件 — 解码器路径完成
-- [x] 生成器(dec NSF-HiFiGAN)forward-on-autograd(加载预训练权重为参数)
-      对齐推理解码器 corr 0.9997
-- [ ] PosteriorEncoder(enc_q):spec + WaveNet + 反向 —(完整 GAN follow-up)
-- [ ] MultiPeriodDiscriminator + MultiScaleDiscriminator:前向 + 反向 —(follow-up)
-- [x] 梯度检查(逐算子有限差分)
+- [x] PosteriorEncoder `enc_q`。
+- [x] Flow 训练图。
+- [x] 一个 scale discriminator + 八个 period discriminators。
+- [x] mel、KL、feature-matching 与 LSGAN losses。
+- [x] G/D 交替优化、梯度裁剪和 epoch LR decay。
+- [x] 真实 WAV 的有限 loss 与完整 step 集成测试。
 
-### Phase A4: 损失 — mel 已完成
-- [x] mel L1(可微 STFT + Slaney mel + log,已验证驱动优化)
-- [ ] KL 散度(m_p/logs_p/m_q/logs_q)
-- [ ] feature-matching、adversarial(LSGAN)
-- [ ] 与 PyTorch 对拍一次
+### A4 — CLI and data baseline: implemented, limited
 
-### Phase A5: 数据管线
-- [ ] 预处理:静音切片、重采样(40k + 16k)、响度归一
-- [ ] 特征/F0/频谱提取与缓存(复用 C++ HuBERT/RMVPE 前向)
-- [ ] filelist + batching(训练片段截断/填充)
+- [x] `vc_train` 读取 WAV 文件/目录。
+- [x] HuBERT + RMVPE + v2/40k 前端，随机固定长度片段。
+- [x] decoder 与 `--gan` 两种实验模式。
+- [x] step/loss 文本进度和最终 G 导出。
+- [x] 独立 `build_index` CLI。
+- [ ] 完整数据 catalog/cache/版本化与可重入预处理事务。
+- [ ] 稳定的机器可读事件协议。
+- [x] 严格解析 CLI 数值参数，并由真实进程门禁拒绝 malformed、非有限、溢出、空白、
+  十六进制浮点、尾随字符和越界值。
 
-### Phase A6: 训练循环 — 解码器 fine-tune 完成
-- [x] 解码器 mel-L1 fine-tune 循环(AdamW);真实音频 loss 0.9159→0.2719(-70%)
-- [ ] GAN 交替优化 G/D;梯度裁剪;lr 调度 —(完整 GAN follow-up)
-- [x] 结构化进度输出(step/loss)
-- **门控 SC-003**
+### A5 — Checkpoint and resume: not implemented
 
-### Phase A7: 检查点与导出 — 完成
-- [x] 导出仅推理 G(与 f0G40k 同构):`GeneratorTrainer::export_model`
-      本地 safetensors 写入器;weight_norm 重derivation;cond(g) 反折叠
-- [x] `tools/build_index` 产出 `.index`(推理引擎已有)
-- [ ] 断点续训(optimizer 状态)—(follow-up)
-- **门控 SC-006、SC-007**
+- [ ] 保存 G、D 和 optimizer moments。
+- [ ] 保存 epoch、step、LR scheduler、RNG 与数据遍历位置。
+- [ ] 原子 checkpoint manifest 与版本兼容。
+- [ ] kill/restart 后 next-step 等价测试。
 
-### Phase A8: 端到端验证 — 解码器路径完成
-- [x] fine-tune → 导出 → C++ 推理:往返 corr 1.000000(零步与微调后均精确复现)
-- [x] `vc_train` CLI(真实音频 → 解码器 fine-tune → 导出;`vc_convert` 加载微调 G 合成有效音频)
-- **门控 SC-004、SC-005**
+`FineTuneTrainer::save_checkpoint/load_checkpoint` 当前明确返回 false，不能用它作为
+A5 的占位完成证据。
 
-## 风险与约束
+### A6 — Quality and productization: not verified
 
-| 风险 | 缓解 |
-|------|------|
-| Autograd 工程量大 | 最小 tape 引擎,只实现所需算子;梯度检查逐个门控 |
-| 反向数值不稳 | 有限差分梯度检查 + 关键子图 PyTorch 对拍 |
-| 显存/性能 | RAII 显存池;训练片段定长;先正确后优化 |
-| GAN 不收敛 | 从预训练权重 fine-tune(非从零);对齐 RVC 超参 |
+- [ ] 多规模真实数据集的长时间稳定性和资源基准。
+- [ ] held-out 音频的 intelligibility、pitch preservation、artifact 指标。
+- [ ] speaker embedding 与人工盲听的声线相似度协议。
+- [ ] 失败恢复、磁盘配额、并发隔离、产物保留和许可证说明。
+- [ ] 确认 Web 训练编排只暴露已经具备的实验能力。
 
-## 复杂度记录
+## Supported vs Unsupported
 
-| 选择 | 原因 | 被拒替代 |
-|------|------|---------|
-| 自研 tape autograd | 全生成器需反向,手写逐算子不可维护 | 无框架逐函数反向(不可维护) |
-| device RAII(CudaBuffer) | 训练大量临时张量;偿还审计债务 | 裸 cudaMalloc(泄漏风险、无异常安全) |
+| Area | Current |
+|---|---|
+| Runtime | C++/CUDA FP32 |
+| Training mode | v2/40k fine-tune; decoder-only or experimental GAN |
+| Export | inference G safetensors |
+| Resume | unsupported |
+| `FineTuneTrainer` | unsupported legacy facade |
+| FP16 / CPU / distributed / multi-GPU | unsupported |
+| From-scratch pretraining | out of scope |
+| Production voice similarity | unverified |
+
+## Superseded Plan Claims
+
+- **已取代**：“FR-001..012 全部完成”。当前 resume、产品数据管线和
+  `FineTuneTrainer` 没有完成。
+- **已取代**：“SC-005 声线学习有效已通过”。现有训练 loss/推理往返不能证明生产
+  声线相似度。
+- **已取代**：“端到端验证完成即可称训练完成”。当前证据只支持实验性组件与小规模
+  真实音频 step。
+- **已取代**：“checkpoint 指最终导出 G”。最终推理导出不包含 optimizer 与恢复状态，
+  不能称为断点续训。
+
+## Next Milestone
+
+下一里程碑优先完成 A5 的可验证 resume，再建立 A6 的质量协议；在这两项完成前，
+规格状态保持“实验性 / 部分完成”。

@@ -1,271 +1,179 @@
-# Resonantia 架构设计
+# Resonantia 架构设计与实现边界
 
-> **实现状态(2026-08-07)**:本文件描述**目标架构**,部分模块为规划中。事实基线以 [specs/PROJECT_STATE.md](../specs/PROJECT_STATE.md) 为准。
->
-> - ✅ **已实现并数值对齐**:core、io、content(HuBERT)、f0(RMVPE)、index、synthesizer(VITS)、pipeline、CLI(vc_convert/build_index)
-> - ⚠️ **桩/未接入**:content(WavLM)、f0(FCPE)、tools(vc_batch/vc_probe)
-> - ➡️ **规划中(拆为独立 spec)**:训练/微调(spec 002)、WebUI 服务(spec 003)、声源分离 separation/
+**状态日期：2026-08-11。** 本文记录当前实现，不把目标设计写成已经支持的能力。可执行入口和测试方法以仓库当前 `CMakeLists.txt`、CLI `--help` 与 CTest 注册为准。
 
-## 1. 目标
+本文是 SDD 的“当前实现视图”，不是独立的需求来源。规范性需求、状态证据和历史材料的权威层级及阅读路由见 [`../specs/README.md`](../specs/README.md)；需求到代码和测试的映射见 [`../specs/TRACEABILITY.md`](../specs/TRACEABILITY.md)。若本文与功能规格或可执行证据冲突，必须按 SDD 漂移处理并在同一变更中校准，不能静默选择其中一份。
 
-将 [RVC (Retrieval-based Voice Conversion)](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) 的推理和训练管线从 Python/PyTorch 完全迁移到纯 C++20/CUDA，消除对 Python 运行时的依赖，同时保持数值输出与原始实现的一致性。
+## 1. 产品范围
 
-### 1.1 使用场景
-1. **独立 CLI 工具**：离线批量声音转换
-2. **WebUI 模式**：嵌入式 HTTP 服务 + 现代前端界面
-3. **库模式**：作为独立 C++ 库被其他项目集成
+Resonantia 将 RVC 风格的声音转换推理链迁移到 C++20/CUDA，当前产品与验证基线是
+Jetson Orin 系列（SM87；本地验证机为 Orin NX）。运行时不依赖 Python/PyTorch；Python
+工具只负责权重转换、下载和生成离线参考数据。
 
-## 2. 技术栈
+当前主链：
 
-| 层级 | 技术 |
-|------|------|
-| 语言 | **纯 C++20 / CUDA** — 零 Python 依赖 |
-| 构建 | CMake 3.24+, nvcc (SM87), C++20 + CUDA 12 |
-| 风格 | Google C++ Style + 宪法治理 (static_assert/constexpr) |
-| GEMM | cuBLAS + CUTLASS (submodule) |
-| 权重格式 | **safetensors 唯一格式**（零拷贝 mmap 加载） |
-| 精度 | FP32 为主，FP16 可选（与 RVC `is_half` 配置对齐） |
-| 音频 I/O | WAV/FLAC 自研读写 + 重采样 |
-| 特征检索 | **手写 CUDA Flat Index**（零 FAISS 依赖） |
-| WebUI | httplib (嵌入式 HTTP) + 纯前端 (HTML/JS/CSS) |
-| 测试 | CTest + 自定义数值对齐探针 |
-
-## 3. 宪法治理特性
-
-参考 Orator/Qwen3x-Orin 项目，使用编译时验证确保代码正确性：
-
-```cpp
-// 编译时维度验证
-static_assert(kHubertHiddenDim == 768U);
-static_assert(kVitsSegmentSize == 3200U);
-
-// 编译时 tile 配置验证
-[[nodiscard]] constexpr bool tile_config_valid() const noexcept {
-    return thread_m_ >= 8U && thread_m_ <= 64U;
-}
-static_assert(tile_config(1U).valid());
-static_assert(!tile_config(33U).valid());
-
-// 编译时内存布局验证
-static_assert(sizeof(AudioBuffer) == sizeof(std::vector<float>) + sizeof(int));
+```text
+WAV -> 重采样至 16 kHz -> HuBERT -> 可选特征检索 -> RMVPE/F0 处理
+    -> F0 VITS v1/v2 -> WAV
 ```
 
-## 4. 模块分解
+Web 服务是 CLI 编排层，不是独立的模型执行后端。训练代码和声源分离代码已存在，但仍按实验性能力管理。
+端到端实时变声当前没有实现；相关目标只存在于
+[`Spec 006`](../specs/006-realtime-voice-conversion/spec.md) 与
+[`ADR-0002`](adr/0002-persistent-streaming-runtime-and-local-audio-boundary.md) 的已批准目标中。
+ADR-0002 于 2026-08-10 `Accepted`，授权从 R0 证据开始分阶段实施，但 persistent runtime、
+streaming session、`vc_realtime` 与 ALSA adapter 均尚未进入本设计的 as-built 架构。
+R0 已加入 legacy `infer_stream` characterization、mode-aware `BenchmarkReport` 构造期
+validator、machine-readable asset manifest、离线 Pipeline Index fail-closed 修复与独立
+exact-Index 诊断 probe；这些都是证据/契约 scaffold，不是 realtime 产品入口。
 
-### 4.1 `core/` — 核心类型与配置
+批准的首个 realtime qualified profile 为 v2/HuBERT/FCPE/40 kHz，并要求有效 Flat Index 与
+`index_rate > 0`；no-index 仅是显式诊断/兼容模式或启动时预授权的粘滞 overload fallback，
+不得静默旁路。主验收使用 Index-enabled 10-minute run（p95 `<= 250 ms`、p99 `<= 350 ms`、
+0 fallback）。R0 已测 standalone CPU exact reference 与 persistent-GPU exact retrieval 的
+synthetic/available-feature 诊断可行性，但仍无代表性目标声线 model+Index pair、完整 pipeline
+realtime latency/memory 或质量 A/B baseline。probe 不选择产品 backend/支持上限；`index_rate`、
+rows 上限、backend 和 fallback trigger 必须由 target evidence 决定，不能视为现状。
 
-```
-include/voxmutatio/core/
-├── types.h           # AudioBuffer, VCConfig, ErrorCode 等基础类型
-├── device.h          # CUDA 设备探测和管理
-├── allocator.h       # GPU 内存分配器 (pinned + device)
-└── log.h             # 日志设施
-```
+## 2. 明确的运行时契约
 
-**职责**：项目内所有模块共享的基础设施。不依赖任何具体模型。
+| 维度 | 支持 | 不支持/会拒绝 |
+|---|---|---|
+| 设备 | CUDA | CPU 推理 |
+| 精度 | FP32 | FP16 |
+| 音频文件 | WAV | FLAC、MP3 |
+| RVC 模型 | F0 v1（256D）、F0 v2（768D） | non-F0 |
+| 内容编码 | HuBERT（默认）、WavLM（需匹配合成器） | 不兼容特征空间的模型组合 |
+| F0 提取 | RMVPE（默认）、FCPE（可选） | PM 等未实现方法 |
+| 输出采样率 | 当前兼容模型的原生 40 kHz | 32/48 kHz 等其他模型率；独立 target sample rate 转换 |
+| 变声参数 | pitch、index rate、RMS mix、protect | formant shift |
 
-### 4.2 `separation/` — 声源分离 (Source Separation)
+配置结构保留部分未来字段，不能据此推断能力已经实现；初始化必须对未实现的非默认配置失败。
 
-```
-include/voxmutatio/separation/
-├── separator.h       # SourceSeparator 接口
-└── mdx_config.h      # MDX-Net 配置
+## 3. 模块状态
 
-src/separation/
-├── mdx_net.{h,cu}    # MDX-Net U-Net CUDA 实现
-└── mdx_common.cuh    # 共享算子 (2D Conv, U-Net skip connections)
-```
+### `core/`
 
-**目标**：从混合音频中剥离纯净干声（Dry Vocal）。
+共享类型、设备探测和 CUDA 内存设施。产品执行路径依赖 CUDA；`Device` 类型能描述 CPU 不等于模型具有 CPU 后端。
 
-**实现方案**：
-- **MDX-Net**（推荐）：2D 卷积 + U-Net 结构，手写 CUDA Kernel 难度低于 Transformer
-- **HTDemucs**（备选）：ONNX → TensorRT 路径
+### `io/`
 
-### 4.3 `content/` — 内容编码器 (Content Encoder)
+实现 WAV 解析、同目录 staging + atomic rename 写入、声道下混、线性重采样和
+safetensors 加载。WAV 发布在完整写入、`fsync` 和 close 后提交；失败保留旧目标并清理
+staging。音频 API 目前不提供 FLAC/MP3 解码器。
 
-```
-include/voxmutatio/content/
-├── wavlm_encoder.h   # WavLM-Base+ 接口
-└── hubert_encoder.h  # HuBERT 接口 (legacy 兼容)
+### `content/`
 
-src/content/
-├── wavlm_encoder.{h,cu}    # WavLM CUDA 实现
-├── hubert_encoder.{h,cu}   # HuBERT CUDA 实现
-└── content_common.cuh      # 共享 Transformer 算子
-```
+- HuBERT：推理主链默认使用，v1 输出 256D，v2 输出 768D。
+- WavLM：有独立实现、可选 pipeline/CLI 分发和本地对拍测试；必须配合在 WavLM 特征空间训练的合成器，不能把 stock ContentVec 模型视为兼容。
 
-**目标**：剥离说话人音色，提取纯粹的"语言学/发音内容"。
+### `f0/`
 
-**实现方案**：
-- **WavLM-Base+**（主要）：对带噪音/混响的音频鲁棒性更强
-- **HuBERT-Base**（兼容）：RVC v1/v2 经典选择
+- RMVPE：推理主链默认使用；初始化会完整校验运行时使用的 tensor，并持久共享只读、
+  已验证的 checkpoint 映射。失败重初始化会清空旧状态。
+- FCPE：有独立实现、可选 pipeline/CLI 分发和本地对拍测试；初始化完整校验 tensor，
+  事务式物化 weight-norm 输出投影，失败重初始化会清空旧状态。R0 已固定
+  `torchfcpe==0.0.4` package/checkpoint provenance、locked tool project 与 same-filesystem
+  staged + rollback 事务式发布；不是默认 F0 方法，也未据此证明实时性能。
 
-**关键实现点**：
-- WavLM/HuBERT 本质上是标准的 **Transformer Encoder**
-- 复用 Qwen3x-Orin 项目中已优化的 Attention、GEMM、LayerNorm CUDA Kernels
-- 只需调整维度、激活函数 (GELU) 和位置编码
+### `index/`
 
-### 4.4 `f0/` — F0 基频提取 (Pitch Extraction)
+产品实现是内存映射 host Flat Index，执行精确加权 k-NN 检索，不依赖 FAISS，也不会把整份
+索引复制到显存。索引文件头、维度、查询范围和 `k` 是输入边界的一部分。standalone R0
+probe 的 persistent-GPU exact retrieval 只用于诊断/对拍，未接入 CMake、CTest 或产品 backend，
+也不定义 qualified rows/rate/batch 上限。
 
-```
-include/voxmutatio/f0/
-├── f0_extractor.h    # F0Extractor 统一接口
-├── rmvpe.h           # RMVPE 具体实现
-└── fcpe.h            # FCPE 具体实现
+### `synthesizer/`
 
-src/f0/
-├── rmvpe.{h,cu}      # RMVPE Conformer encoder CUDA 实现
-├── fcpe.{h,cu}       # FCPE 轻量级 CUDA 实现
-└── f0_common.cuh     # 共享算子 (Mel spectrogram, 1D Conv)
-```
+实现 F0 VITS v1/v2 的 TextEncoder、Flow、NSF/HiFi-GAN 生成器。推理前校验模型版本、feature
+dim、speaker id、pitch 范围和 F0 指针。legacy `infer_stream` 实际执行完整 `infer` 后裁剪，
+repeated call 会重置 NSF phase；characterization 已冻结该事实，但它不是 stateful session。
+non-F0 合成器不是当前能力。
 
-**目标**：精准捕捉源音频的音高曲线（F0）。
+### `pipeline/`
 
-**双轨制实现**：
-- **RMVPE**（离线/高质量）：Bi-LSTM + CNN，抗干扰能力最强
-- **FCPE**（实时/低延迟）：1D 卷积 + 池化，延迟 < 2ms
+编排 HuBERT、RMVPE、可选 Index 和 Synthesizer，负责长音频分块、protect 与 RMS 混合。仅接受
+已经实现的 CUDA FP32/F0/40 kHz 契约。`index_rate > 0` 时，Index 缺失、feature width
+不匹配或 lookup failure 均显式失败，不再静默旁路检索。HuBERT、Index 与 VITS 按块执行；
+F0 为保持全局一致性仍对整段 padded clip 一次计算，file/buffer 路径也保留整段 host 输入、
+前处理和输出，因此 host 内存与 F0 CPU/GPU working set 都随时长增长。
 
-### 4.5 `index/` — CUDA 特征检索 (Feature Retrieval)
+### `training/`
 
-```
-include/voxmutatio/index/
-└── cuda_flat_index.h # CUDA Flat Index 接口
+存在 CUDA autograd、AdamW、mel loss、生成器微调、后验编码器、flow 和多周期判别器/GAN 路径。`vc_train` 可执行这些实验性训练路径，但尚无生产训练稳定性、数据规模或音质保证。公共 `FineTuneTrainer` 门面尚未实现，必须返回不支持，不能用空循环伪装成功。
 
-src/index/
-└── cuda_flat_index.{h,cu}  # 手写 CUDA Flat Index 实现
-```
+### `separation/`
 
-**目标**：通过向量相似度搜索，强制生成器使用目标音色。
+包含 STFT/iSTFT、Open-Unmix、MelBand-RoFormer 和 Silero VAD 相关实现。模型和数值参考资产不进 Git，因此相应测试只在本地资产齐全时注册。该模块不是 `vc_convert` 默认主链的一部分。
+三个模型 loader 在 device upload 前校验所有已用 tensor 的 F32 dtype、精确 shape/nbytes 和
+有限值；公开音频入口拒绝 NaN/Inf，可观察 host 输出在返回前复验有限值。该边界不等于已对
+每个 CUDA 中间 activation 做全设备扫描，也不构成生产音质保证。
 
-**关键实现点**：
-- **手写 CUDA Flat Index**（~200 行代码，零 FAISS 依赖）
-- 利用 Shared Memory 和 Warp Shuffle 指令
-- 计算 L2 Distance 或 Inner Product
-- 对于数万条特征的库，GPU 暴力 Top-K 检索 < 1ms
+### WebUI / `vc_serve`
 
-### 4.6 `synthesizer/` — VITS 合成器
+前端是无构建步骤的 HTML/CSS/JavaScript。`vc_serve` 使用 POSIX socket 提供静态文件与
+API，并以子进程调用 CLI。内部进程适配器用 argv 直接启动程序，不经过 shell；它合并并
+有界过滤 stdout/stderr，同时独立保留进程的退出码、终止信号和日志 I/O 错误。训练工作流
+逐阶段检查 preprocess、train 与 index 结果；clips、model、index 先写入同目录 staging，
+只有有效 WAV clips 与非空 model/index 齐全时才成组发布并报告 `done`，失败保留旧产物。
+material 上传后的 raw/work 副本不代表已经完成 step；只有非空 `steps.txt` marker 与有效 work
+WAV 同时存在时训练才复用 work，否则从 raw 开始并执行请求的 separation/cleanup flags。
+监听 socket 与连接 socket 均为 close-on-exec，CLI 不继承 HTTP 文件描述符。监听地址由
+`--host` 配置，默认 `0.0.0.0`；可选
+`--auth-token` 保护 API。服务限制请求头、请求体、上传大小和并发数；已知 API 的错误
+方法返回 405/`Allow`，未知 API 返回 404。交互式 step 在 GPU busy 时立即 409，成功结果
+把 work 与 `steps.txt` marker 作为一组经 staging/backup 发布，任一提交失败都保留旧 work
+和 marker。内部由 `tools/web/http_transport.*` 负责
+socket、HTTP、鉴权和资源 reservation，`workflow_support.*` 负责文件/进程适配器，
+`web_service.*` 负责路由与工作流；job/GPU 状态归单个 `WebService` 实例所有。公网部署
+仍需要反向代理 TLS 和网络访问控制。所有 Web boolean field 只接受 `0` 或 `1`；显式空值
+或其他字符串返回 400。preview/preprocess/convert 的音频响应当前在发送前
+完整缓冲，硬上限为 64 MiB；超过时明确返回 413，不会以 200 返回空 body。
 
-```
-include/voxmutatio/synthesizer/
-├── synthesizer.h       # Synthesizer 接口 (VITS v1/v2)
-├── text_encoder.h      # TextEncoder (Transformer)
-├── flow.h              # ResidualCouplingBlock
-└── generator_nsf.h     # GeneratorNSF (HiFiGAN + NSF)
+历史公共头 `voxmutatio/webui/server.h` 的嵌入式 `WebServer` 从未实现监听器，也不是上述
+服务的库形式。按 ADR-0003，它只在一个迁移窗口内保留 deprecated 源码/静态链接表面；
+`start()` 明确 fail-fast 并引导调用方迁移到 `vc_serve`，不再忙循环或返回伪造 API 成功。
 
-src/synthesizer/
-├── synthesizer.{h,cpp}       # 主编排逻辑
-├── text_encoder.{h,cu}       # Transformer encoder CUDA
-├── flow.{h,cu}               # Residual Coupling Flow CUDA
-├── generator_nsf.{h,cu}      # HiFiGAN upsampler + NSF 注入 CUDA
-├── source_hn_nsf.{h,cu}      # SineGen + SourceModuleHnNSF CUDA
-└── synth_common.cuh          # 共享算子 (Conv1d, ConvTranspose1d, GLU 等)
-```
+## 4. 权重与数据
 
-**关键实现点**：
-- **TextEncoder**：Transformer encoder，输入 [1, T, 256/768] + F0 → 输出 [1, inter_channels, T]
-- **ResidualCouplingBlock**：5 个残差耦合层，每个含 ConvNeXt Block
-- **GeneratorNSF**：HiFiGAN 变体，含多阶段上采样 + NSF 谐波注入
-- **SourceModuleHnNSF**：从 F0 生成谐波正弦波 + 噪声激励
+运行时权重格式是 safetensors。原始 PyTorch `.pth` 使用一次性 Python 工具离线转换；不要在 C++ 服务中加载 pickle。
 
-### 4.7 `training/` — 微调训练基础设施
+模型权重和数值参考 fixture 体积较大且被 `.gitignore` 排除。由此形成两层测试：
 
-```
-include/voxmutatio/training/
-├── trainer.h           # 训练器接口
-├── optimizer.h         # AdamW 优化器
-├── loss.h              # 损失函数 (Mel/Feature/Generator/Discriminator)
-└── data_loader.h       # 数据加载器
+1. 默认 `contract`：不依赖这些本地资产，CI 构建并执行；除低层契约外还包含真实 CLI
+   子进程与真实 HTTP socket 测试。
+2. 可选 `integration`：配置 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON`；只有所需资产存在的用例才进入 CTest。
 
-src/training/
-├── trainer.{h,cpp}     # 训练循环实现
-├── optimizer.{h,cu}    # AdamW CUDA 实现
-├── loss.{h,cu}         # 损失函数 CUDA 实现
-└── data_loader.{h,cpp} # 数据加载和预处理
-```
+测试内部“找不到文件就 return”不是可信的通过证据，因此 CMake 在注册前检查资产。
+2026-08-11 的 Release/SM87 current-tree 完整运行在资产齐全环境中为 30/30 passed
+（11 contract + 19 integration、0 failures，real 335.05 秒）。其中 realtime 报告 validator
+与 legacy VITS characterization 只证明 R0 scaffold 和既有 suite 未回退，不证明 realtime
+session、目标声线质量或 10-minute SLO。
 
-**目标**：支持基于预训练权重的 Fine-tuning（不包含从零预训练）。
+## 5. 构建原则
 
-### 4.8 `pipeline/` — 端到端管线
+- CMake 3.24+，C++20/CUDA20。
+- `VOXMUTATIO_CUDA_ARCHITECTURES` 决定目标架构，默认 87；不再额外硬编码一份冲突的 `-gencode`。
+- Catch2 优先使用系统包，否则下载带 SHA-256 校验的固定源码归档。
+- CI 只在 `main` push/手动触发时使用自托管 ARM64 CUDA runner，避免在自托管机器执行 fork PR 的任意代码。
 
-```
-include/voxmutatio/pipeline/
-└── pipeline.h          # VoiceConversionPipeline 接口
+运行时源码使用显式清单，按 core、I/O、CUDA ops、content、F0、Index、synthesizer、
+separation、autograd、training、pipeline 和 deprecated legacy WebUI compatibility surface
+组成内部 OBJECT
+targets；公共 `voxmutatio` 仍聚合为一个兼容 static archive。CLI 不再内联全部解析与执行：
+四个主要命令各自经内部 `resonantia_vc_*_app_support` 的 Options/parser/runner seam 装配，
+`vc_serve` 经 `resonantia_web_support` 装配。上述内部 target 不新增安装或公共 API。
 
-src/pipeline/
-└── pipeline.{h,cpp}    # 管线编排实现
-```
+仓库当前没有 `install()`、导出 package config 或稳定的预编译 SDK 发行面；成熟消费方式是
+源码树 CLI，嵌入方只能以 `add_subdirectory`/随源码重编译方式使用 `voxmutatio` facade。
 
-**关键实现点**：
-- 编排 Separation → Content → F0 → Index → Synthesizer 的完整链路
-- 音频分块处理（长音频切分为 ~5s 块）
-- RMS 能量混合（源音频和目标音频的音量均衡）
-- 重采样到目标采样率
+## 6. 验证口径
 
-### 4.9 `io/` — 音频 I/O 与权重加载
+历史本地对齐阈值仍可作为集成测试目标：
 
-```
-include/voxmutatio/io/
-├── audio_io.h          # 音频文件读写
-└── safetensors.h       # Safetensors 权重加载
+- HuBERT 特征 RMS 误差 `< 1e-4`
+- RMVPE F0 绝对误差 `< 0.5 Hz`
+- VITS 输出相关性 `> 0.999`
+- 端到端输出相关性 `> 0.99`
 
-src/io/
-├── audio_io.{h,cpp}    # WAV/FLAC 读写 + 重采样
-└── safetensors.{h,cpp} # Safetensors 解析（零拷贝 mmap）
-```
-
-### 4.10 `webui/` — 嵌入式 WebUI 服务
-
-```
-include/voxmutatio/webui/
-└── server.h            # HTTP 服务器接口
-
-src/webui/
-├── server.{h,cpp}      # httplib 服务器实现
-└── routes.{h,cpp}      # API 路由处理
-
-webui/
-├── index.html          # 主页面
-├── app.js              # 前端逻辑
-└── styles.css          # 样式表
-```
-
-**设计原则**：
-- 简洁现代，新手友好
-- 不照搬 RVC-WebUI 的复杂界面
-- 清晰的引导、合理的默认值、实时反馈
-
-## 5. 权重格式转换策略
-
-RVC 的原始权重是 PyTorch `.pth` 格式（pickle 序列化）。需要一个一次性转换工具：
-
-```
-tools/convert_to_safetensors.py
-  └── 输入：RVC .pth 模型文件
-  └── 输出：safetensors 格式（按模块分片）
-```
-
-该工具是 Python 脚本（仅运行一次），不属于 C++ 运行时。转换后的 safetensors 文件可被 C++ 零拷贝 mmap 加载。
-
-## 6. 开发阶段
-
-| 阶段 | 内容 | 交付物 |
-|------|------|--------|
-| **P0** | 项目骨架 + 权重加载 + 音频 I/O | 可编译、可加载模型 |
-| **P1** | WavLM/HuBERT encoder CUDA 实现 | 特征提取数值对齐 |
-| **P2** | RMVPE/FCPE F0 提取 CUDA 实现 | F0 序列数值对齐 |
-| **P3** | CUDA Flat Index 实现 | 特征检索数值对齐 |
-| **P4** | VITS 合成器 CUDA 实现 | 合成音频数值对齐 |
-| **P5** | 完整管线 + CLI 工具 | 端到端转换可用 |
-| **P6** | WebUI + 训练模块 | 完整产品可用 |
-| **P7** | 实时流式推理支持 | 低延迟流式 API |
-
-## 7. 数值对齐验证
-
-每个模块完成后，与 Python 原始实现进行逐样本对齐：
-- **WavLM/HuBERT**：相同输入 PCM → 比较输出特征向量 (L2 < 1e-4)
-- **F0**：相同输入 PCM → 比较 F0 序列 (绝对误差 < 0.5 Hz)
-- **Index**：相同特征 → 比较检索结果 (Top-K 一致)
-- **Synthesizer**：相同特征 + F0 → 比较输出 PCM (SRCC > 0.999)
-
-验证工具：`tools/vc_probe.cpp`，支持加载 Python 导出的中间张量作为参考值。
+只有在对应模型、输入、参考文件均存在且测试实际执行时，才能报告这些结果。默认 CI 通过仅说明可复现契约测试通过，不等价于全模型数值对齐已经在该次提交复验。

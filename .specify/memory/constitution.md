@@ -2,159 +2,137 @@
 
 > *Vox mutatur, mens manet.* (声音变化，意识不变。)
 
+本宪章定义项目不可被普通实现便利性覆盖的工程与治理约束。功能 Spec 定义
+“应当实现什么”，当前代码、公共接口、构建配置与实际测试结果证明“现在实现了
+什么”；两者冲突时必须记录差距，不得把文档声明当作运行证据。
+
 ## Core Principles
 
-### I. Library-First
-每个功能模块从独立库开始。`src/` 下的每个子目录（`core/`, `content/`, `f0/`, `synthesizer/` 等）都是独立的编译单元，通过清晰的 public header 暴露接口。
+### I. Module Boundaries
 
-### II. CLI Interface
-每个核心功能通过 CLI 工具暴露。`vc_convert`, `vc_batch`, `vc_probe` 等工具是功能的"烟雾测试"入口。
+`core`、`content`、`f0`、`index`、`synthesizer`、`training`、`separation` 等领域
+必须保持清晰的公共接口、私有实现和单向依赖。每个模块必须能够被独立测试和替换，
+但不要求每个源码目录都对应独立的 CMake target；target 划分由构建和链接需求决定。
+
+### II. Stable User Interfaces
+
+用户可见工作流必须通过稳定的库接口暴露，并在适用时提供 CLI 烟雾入口。公共配置、
+错误语义和已支持的输入必须显式验证；不得静默接受未实现的选项或改变既有契约。
 
 ### III. Test-First (NON-NEGOTIABLE)
-每个模块在实现前必须有对应的测试骨架。数值对齐测试（与 Python 原始实现对比）是核心质量门控。
 
-### IV. safetensors-Only
-权重格式锁定 safetensors。零拷贝 mmap 加载，无 pickle 安全风险。PyTorch `.pth` 格式仅通过一次性 Python 转换工具支持。
+新增行为和缺陷修复必须先建立能够失败的测试或可复现证据，再实现最小修复。CUDA
+数值代码必须有参考结果、边界测试和与风险相称的集成验证。若客观上无法先写自动化
+测试，变更记录必须解释原因并提供等价的可复现验证。
 
-### V. Zero-Dependency Purity
-推理链路完全脱离 Python/PyTorch 运行时。禁止引入 FAISS、ONNX Runtime 等大型第三方推理库。手写 CUDA Kernel 优先于链接外部库。
+### IV. safetensors-Only Runtime
+
+运行时权重格式锁定为 safetensors，并在 mmap 后验证 dtype、shape、byte range、有限值
+及模型不变量。运行时禁止加载 pickle 或 PyTorch `.pth`；这类格式只允许由 `tools/`
+中的一次性转换工具处理。大型权重和索引不得无必要地完整复制到主机或设备内存。
+
+### V. Runtime Purity
+
+推理与训练运行时使用 C++20/CUDA，不依赖 Python/PyTorch、FAISS、ONNX Runtime 或
+TensorRT。允许使用项目明确采用的 CUDA 基础库和小型、可审计的系统依赖；引入新的
+大型运行时必须由架构决策记录说明动机、成本和迁移方案。
 
 ### VI. Numerical Alignment
-每个模块的输出必须与 Python 原始实现逐样本对齐：
-- 特征向量: L2 < 1e-4
-- F0 序列: 绝对误差 < 0.5 Hz
-- 合成音频: SRCC > 0.999
 
-### VII. Simplicity
-简单优先，YAGNI (You Ain't Gonna Need It)。不预先实现不确定的功能。WebUI 设计简洁现代，不照搬 RVC-WebUI 的复杂界面。
+与参考实现等价的模块必须逐样本验证，默认门限为：
 
-### VIII. Anti-Abstraction
-直接使用 cuBLAS/CUDA 原语，不包装抽象层。避免"过早抽象"——只有在第三个重复模式出现时才提取公共代码。
+- 内容特征：L2 或规范化误差 `< 1e-4`
+- F0 序列：绝对误差 `< 0.5 Hz`
+- 合成音频：相关性 `> 0.999`
 
-### IX. Integration-First Testing
-优先端到端集成测试（完整 Pipeline），而非孤立的单元测试。`test_pipeline.cpp` 是最高优先级的测试。
+若某个 Spec 定义了更适合该模型的指标或更严格门限，以该 Spec 为准。门限、数据集、
+命令、硬件和结果必须一同记录；不能用只检查 shape 的测试代替数值对齐。
 
-### X. Real Audio Only (NON-NEGOTIABLE)
-**所有测试必须使用真实音频数据，禁止使用合成数据（正弦波、白噪声等）进行功能验证。**
-- ✅ 必须使用真实人声录音进行测试
-- ❌ 禁止使用正弦波、多音信号、白噪声等合成音频替代真实人声
-- ❌ 合成数据仅可用于底层工具函数的 smoke test（如 resample 尺寸检查）
-- 原因：语音转换的特征分布（HuBERT 特征、F0 轮廓、能量包络）与合成信号完全不同
-  - 正弦波的 HuBERT 特征无意义
-  - 合成信号无法测试 F0 提取器的真实表现
-  - 无法验证 index search 在真实特征空间中的效果
+### VII. Simplicity and No Speculation
+
+优先完成已验证需求，避免为假设中的后端、模型或扩展点预建框架。第三次出现且语义
+稳定的重复通常才值得抽取公共组件；安全性或正确性所需的公共边界不受此经验规则
+限制。Web 界面保持聚焦，不复制无关的历史功能。
+
+### VIII. Explicit Ownership and RAII
+
+反对投机性抽象不等于反对资源抽象。文件、mmap、主机/设备内存、CUDA stream/event、
+cuBLAS/cuFFT handle、锁和临时文件必须具有明确所有者，并优先使用 RAII 保证所有退出
+路径释放资源。公共包装应保持薄、可审计，表达所有权、生命周期、同步和错误边界；
+禁止以“直接调用原语”为由重复裸资源管理或牺牲异常安全。
+
+### IX. Layered Integration Testing
+
+端到端 Pipeline 是跨模块行为的最高级门禁，但不能替代快速的单元、契约和数值测试。
+测试分层为：默认可运行的无资产契约测试，以及需要真实模型/fixture 的集成与对齐测试。
+缺少资产、跳过或仅编译成功都不得报告为功能通过。
+
+### X. Representative Test Data (NON-NEGOTIABLE)
+
+模型行为、数值对齐和端到端语音功能必须使用具有明确来源的真实模型和真实人声音频。
+合成数据只允许用于底层确定性单元测试、smoke test、尺寸/边界/错误路径、DSP 基元和
+梯度检查；不得用正弦波、白噪声等替代真实语音来宣称模型或 E2E 功能正确。
 
 ### XI. Python Isolation (NON-NEGOTIABLE)
-**`tools/` 是唯一允许使用 Python 的目录**。所有 Python 脚本必须通过 `uv` 管理虚拟环境，确保系统环境干净：
-- 权重转换工具 (`tools/convert_to_safetensors.py`) — 一次性使用
-- 数据预处理工具 — 训练前准备
-- **禁止**在 `src/`, `tests/`, `include/`, `CMakeLists.txt` 中引入任何 Python 依赖
-- **禁止**在 CMake 中使用 `find_package(Python)` 或执行 Python 脚本
-- `tools/` 目录下必须包含 `pyproject.toml` 和 `.python-version` 定义 uv 环境
 
-## Coding Standards
+`tools/` 是唯一允许项目 Python 代码的目录，且必须通过 `uv`、`pyproject.toml` 和
+`.python-version` 管理环境。`src/`、`include/`、`tests/` 与运行时构建不得引入 Python
+或 PyTorch 依赖，CMake 不得通过 `find_package(Python)` 或脚本执行形成隐式运行依赖。
 
-### Language
-- **C++20** / **CUDA 20**
-- **Google C++ Style Guide** 为基础
-- **宪法治理**: `static_assert` / `constexpr` 编译时验证
+## Engineering Standards
 
-### Naming
-| Element | Convention | Example |
-|---------|-----------|---------|
-| Files | `snake_case` | `hubert_encoder.h` |
-| Namespaces | `snake_case` 单行嵌套 | `namespace voxmutatio::content {` |
-| Types | `PascalCase` | `HubertEncoder` |
-| Functions | `snake_case` | `extract_features()` |
-| Members | `trailing_` | `output_dim_` |
-| Constants | `kPascalCase` | `kHubertHiddenDim` |
-| Enums | `enum class` + `kPascalCase` | `ModelVersion::kV1` |
+- 语言基线是 C++20 与项目工具链支持的 CUDA C++；公共头文件不得泄露不必要的实现
+  细节或形成循环依赖。
+- 文件和函数使用 `snake_case`，类型使用 `PascalCase`，成员使用尾随下划线，常量和
+  枚举值使用 `kPascalCase`。
+- 在公共边界验证空指针、尺寸、整数转换、有限值、dtype/shape/byte range 和兼容性。
+  初始化应分阶段完成并原子提交；失败后对象必须保持可析构、可重试的定义状态。
+- GPU/CPU 内存和工作区必须有可说明的上界。检查 CUDA API、kernel launch 和异步同步
+  错误，禁止依赖未定义生命周期或未经验证的 host/device 指针。
+- `[[nodiscard]]`、`noexcept`、`constexpr` 与 `static_assert` 在能准确表达契约时使用，
+  不得为了形式门禁而写出错误的异常或返回值承诺。
 
-### Quality Gates
-- `[[nodiscard]]` on all value-returning functions
-- `noexcept` on non-throwing functions
-- `constexpr` for compile-time computation
-- `static_assert` for invariant validation
+## Evidence and Status
+
+- 实现状态只能由当前提交中的代码、公共 API、CMake/CTest 注册，以及在当前树上实际
+  执行的构建、测试、基准或推理记录支持。
+- 状态记录必须注明验证日期、命令、环境/硬件、资产、通过/失败/跳过数量和未验证项。
+  Skip、缺失资产、历史日志和仅打印指标均不等于通过。
+- `specs/PROJECT_STATE.md` 和 traceability 文档必须随能力变化更新。历史审计、计划和
+  research 是来源记录，不得替代对当前代码与测试的检查。
+- `Complete` 要求所有 FR、Acceptance Scenarios、Success Criteria 和 Edge Cases 均有
+  可追溯实现及证据；性能或对齐指标未测量时必须保持未完成，而非按推断勾选。
 
 ## Governance
 
-### Spec Creation Rules (NON-NEGOTIABLE)
+### Spec lifecycle
 
-**Specs 是项目的核心契约，不得随意创建。**
+1. 新的用户可见能力或独立模块需要功能 Spec；优先扩展已有 Spec，避免重复契约。
+2. 普通重构、性能优化、Bug 修复和测试增强，在不改变用户行为或核心架构时不得新建
+   功能 Spec；应更新相关测试、设计、追踪表和变更记录。
+3. 改变模块边界、持久化格式、核心数据流、运行时依赖或部署/兼容契约的架构变更，
+   必须在实现前提供 ADR，并在相关 Spec 或设计文档中加入迁移章节、回滚策略和追踪项。
+4. 新 Spec 编号前必须核对已有 Spec 的状态和范围。允许在彼此独立、依赖已声明时并行
+   推进；禁止为了编号顺序虚构完成状态。
+5. Spec 只有在需求、验收场景、成功指标、边界、集成运行和必需真实资产均有可复现
+   证据后才能标记 `Complete`。
 
-1. **Sequential Completion**: 已创建的 Spec 必须标记为完成后，才能创建下一个 Spec。
-   - `specs/###-feature-name/spec.md` 的 Status 必须从 `Draft` → `Complete`
-   - 每个 FR (Functional Requirement) 必须有对应的实现和测试
+### Authority and conflict handling
 
-2. **Necessity Audit**: 计划创建新 Spec 前，必须审计：
-   - [ ] 当前 Spec 是否已完成？
-   - [ ] 计划工作是否已被现有 Spec 覆盖？
-   - [ ] 是否属于升级/改善（而非新增功能）？
-
-3. **No Spec for Refactoring/Performance**: 在不改变核心意图的情况下，
-   **不得**因为以下原因新增 Spec：
-   - ❌ 性能提升（kernel optimization → commit message 说明即可）
-   - ❌ 代码重构（refactor → commit message 说明即可）
-   - ❌ Bug 修复（fix → commit message 说明即可）
-   - ❌ 测试覆盖改进（test → commit message 说明即可）
-
-4. **Valid Reasons for New Spec**:
-   - ✅ 新增用户可见功能（如：新增 WebUI）
-   - ✅ 新增模块（如：新增 WavLM 编码器）
-   - ✅ 改变核心架构（如：从 FP32 迁移到 FP16-only）
-
-5. **Spec Upgrade vs. New Spec**:
-   - 改善/扩展现有 Spec 的功能 → 更新现有 `spec.md`，version +1
-   - 完全独立的新功能 → 创建新 Spec `specs/###-new-feature/`
-
-6. **Spec Completion Criteria (NON-NEGOTIABLE)**:
-   
-   Spec 标记为 `Complete` 必须满足以下**所有**条件：
-   
-   - [ ] **所有 FR (Functional Requirements)** 已有对应的实现代码
-   - [ ] **所有 Acceptance Scenarios** 已有对应的测试用例
-   - [ ] **所有测试用例均已通过** (`ctest` 或等价工具)
-   - [ ] **所有 Success Criteria** 已验证达标（数值对齐/性能指标）
-   - [ ] **Edge Cases** 已处理并有测试覆盖
-   - [ ] **集成测试通过** (`test_pipeline.cpp` 端到端验证)
-   - [ ] **实际运行验证**: 至少一次完整的端到端推理已成功执行
-   - [ ] **模型权重**: 所有必需的 safetensors 权重已加载并验证
-   
-   **禁止行为**：
-   - ❌ 仅有骨架代码就标记 Complete
-   - ❌ 测试未运行就标记 Complete
-   - ❌ 测试有失败就标记 Complete
-   - ❌ 数值对齐未验证就标记 Complete
-   - ❌ **没有实际运行过推理就标记 Complete**
-   - ❌ **没有加载过真实模型权重就标记 Complete**
-   - ❌ **仅靠单元测试通过就标记 Complete**（必须包含集成测试）
-   
-   **Completion Checklist 模板**：
-   ```
-   ## Completion Checklist
-   - [x] FR-001: Implementation + test passed
-   - [x] FR-002: Implementation + test passed
-   - ...
-   - [x] SC-001: L2 error < 1e-4 verified
-   - [x] SC-002: F0 error < 0.5 Hz verified
-   - ...
-   - [x] Edge cases: all handled
-   - [x] Integration test: passed
-   - [x] Actual inference: executed successfully with real models
-   ```
-
-### Authority
-
-- **Authority**: Principles I-VI 和 X 是强制门控。违反原则的代码不得合并。
-- **Spec Violation**: 未经审计创建 Spec 视为 CRITICAL 违规。
+- 所有 Core Principles 都是合并门禁；标注 `NON-NEGOTIABLE` 的原则不得由功能 Spec
+  豁免。
+- 本宪章约束工程与治理；批准的功能 Spec 约束产品行为；`docs/DESIGN.md` 解释当前架构。
+  较低层文档不得静默覆盖较高层契约。
+- 对“当前事实”的判断以当前公共接口、实现、构建配置和实际测试证据为准。它们若不
+  满足宪章或 Spec，结论是存在待修复偏差，而不是自动修改规范或宣称已经合规。
+- 改动必须保护用户已有的未提交变更，并按任务范围同步代码、接口、测试、CMake、
+  Spec、设计和状态记录。
 
 ### Amendments
 
-- 修改需要 PR + 理由 + 维护者审批 + 版本升级
-- Versioning policy (SemVer for governance):
-  - MAJOR = 不兼容的治理变更
-  - MINOR = 新原则/章节
-  - PATCH = 澄清和非语义修改
-- Compliance review: 每个 PR 必须验证合规性
+- 宪章修改需要明确理由、维护者审核、版本升级和受影响文档的迁移检查。
+- 版本采用治理 SemVer：MAJOR 表示不兼容的治理变化，MINOR 表示新增或实质扩展原则，
+  PATCH 表示不改变要求的澄清。
+- 每次合并前必须检查适用原则与验证证据；无法执行的门禁必须明确记录，不能隐式略过。
 
-**Version**: 1.3.0 | **Ratified**: 2026-08-07 | **Last Amended**: 2026-08-07
+**Version**: 1.4.0 | **Ratified**: 2026-08-07 | **Last Amended**: 2026-08-09
