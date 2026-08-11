@@ -22,13 +22,18 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Validate tracked scripts and patch formatting
         shell: bash
         run: |
           set -euo pipefail
           bash -n scripts/*.sh
           scripts/check_sdd.sh
-          git show --check --oneline --no-renames HEAD
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            git diff --check "origin/${GITHUB_BASE_REF}...HEAD"
+          else
+            git show --check --oneline --no-renames HEAD
+          fi
 
   cuda-build-and-contract-tests:
     # Resonantia targets Jetson Orin-class devices (aarch64, SM87). Running untrusted fork
