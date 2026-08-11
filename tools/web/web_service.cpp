@@ -686,6 +686,11 @@ void WebService::handle_convert(int fd, const Request& req) {
         std::string vi = paths_.runs + "/" + voice + "/model.index";
         if (nonempty_regular_file(vi)) index = vi;
     }
+    if (index_rate > 0.0 && index.empty()) {
+        send_response(fd, 400, "Bad Request", "application/json",
+                      "{\"error\":\"index_rate > 0 requires a compatible voice index\"}");
+        return;
+    }
 
     std::string in = temp.path() + "/input.wav", out = temp.path() + "/output.wav";
     std::string preprocess_log;
@@ -705,7 +710,7 @@ void WebService::handle_convert(int fd, const Request& req) {
                     "--rms-mix", std::to_string(rms), "--protect",
                     std::to_string(protect), "--filter-radius",
                     std::to_string(filter_radius)};
-    if (!index.empty()) {
+    if (index_rate > 0.0) {
         process.argv.insert(process.argv.end(),
                             {"--index", index, "--index-rate",
                              std::to_string(index_rate)});
