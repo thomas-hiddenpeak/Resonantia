@@ -1,6 +1,6 @@
 # Resonantia 架构设计与实现边界
 
-**状态日期：2026-08-11。** 本文记录当前实现，不把目标设计写成已经支持的能力。可执行入口和测试方法以仓库当前 `CMakeLists.txt`、CLI `--help` 与 CTest 注册为准。
+**状态日期：2026-08-12。** 本文记录当前实现，不把目标设计写成已经支持的能力。可执行入口和测试方法以仓库当前 `CMakeLists.txt`、CLI `--help` 与 CTest 注册为准。
 
 本文是 SDD 的“当前实现视图”，不是独立的需求来源。规范性需求、状态证据和历史材料的权威层级及阅读路由见 [`../specs/README.md`](../specs/README.md)；需求到代码和测试的映射见 [`../specs/TRACEABILITY.md`](../specs/TRACEABILITY.md)。若本文与功能规格或可执行证据冲突，必须按 SDD 漂移处理并在同一变更中校准，不能静默选择其中一份。
 
@@ -70,7 +70,8 @@ staging。音频 API 目前不提供 FLAC/MP3 解码器。
 ### `f0/`
 
 - RMVPE：推理主链默认使用；初始化会完整校验运行时使用的 tensor，并持久共享只读、
-  已验证的 checkpoint 映射。失败重初始化会清空旧状态。
+  已验证的 checkpoint 映射。失败重初始化会清空旧状态；算子层的临时 device buffer 由
+  `core::CudaBuffer` 持有，CUDA copy/计算抛错时沿栈释放。
 - FCPE：有独立实现、可选 pipeline/CLI 分发和本地对拍测试；初始化完整校验 tensor，
   事务式物化 weight-norm 输出投影，失败重初始化会清空旧状态。R0 已固定
   `torchfcpe==0.0.4` package/checkpoint provenance、locked tool project 与 same-filesystem
@@ -85,10 +86,18 @@ probe 的 persistent-GPU exact retrieval 只用于诊断/对拍，未接入 CMak
 
 ### `synthesizer/`
 
-实现 F0 VITS v1/v2 的 TextEncoder、Flow、NSF/HiFi-GAN 生成器。推理前校验模型版本、feature
-dim、speaker id、pitch 范围和 F0 指针。legacy `infer_stream` 实际执行完整 `infer` 后裁剪，
-repeated call 会重置 NSF phase；characterization 已冻结该事实，但它不是 stateful session。
-non-F0 合成器不是当前能力。
+实现 F0 VITS v1/v2 的 TextEncoder、Flow、NSF/HiFi-GAN 生成器。初始化逐项校验所有运行时
+已用 tensor 的 F32 dtype、精确 shape/nbytes、可读对齐和有限值；weight-norm 的 `g/v` 还要求
+每个 `v` row 非退化，并以 double 次序验证重建结果有限且可表示为 FP32。每个 Synthesizer
+实例持有本次验证的 const 只读 mmap，不复用按路径共享的全局 loader；初始化把调用方路径
+固定为 absolute + lexically-normal 路径（不解析 symlink），加载前后记录
+device/inode/size/mtime/ctime 文件身份，公开调用若发现该路径所指 checkpoint 已改变或被替换即
+返回空结果，且不受后续 current-working-directory 改变影响。`infer`/`infer_stream` 及公开
+`debug_*` 在读取调用方数组前检查各自最宽中间尺寸乘积，拒绝对应输入的 NaN/Inf，并在返回前
+拒绝非有限的可观察输出；`infer` 还显式约束 attention 的 `2*T*T`。VITS 算子的临时 device buffer 由
+`core::CudaBuffer` 管理。legacy `infer_stream` 仍实际执行完整 `infer` 后裁剪，repeated call
+会重置 NSF phase；characterization 已冻结该事实，但它不是 stateful session。non-F0
+合成器不是当前能力。
 
 ### `pipeline/`
 
@@ -129,6 +138,9 @@ socket、HTTP、鉴权和资源 reservation，`workflow_support.*` 负责文件/
 仍需要反向代理 TLS 和网络访问控制。所有 Web boolean field 只接受 `0` 或 `1`；显式空值
 或其他字符串返回 400。preview/preprocess/convert 的音频响应当前在发送前
 完整缓冲，硬上限为 64 MiB；超过时明确返回 413，不会以 200 返回空 body。
+`/api/convert` 只有在 `index_rate > 0` 且选定声线存在非空 Index 时才向 `vc_convert`
+传递 `--index/--index-rate`；正数 rate 缺 Index 会在启动 CLI 前返回 400，`index_rate=0`
+则显式不传这两个 flags，即使该声线目录中已有 Index 也保持 no-index 模式。
 
 历史公共头 `voxmutatio/webui/server.h` 的嵌入式 `WebServer` 从未实现监听器，也不是上述
 服务的库形式。按 ADR-0003，它只在一个迁移窗口内保留 deprecated 源码/静态链接表面；
@@ -145,10 +157,10 @@ socket、HTTP、鉴权和资源 reservation，`workflow_support.*` 负责文件/
 2. 可选 `integration`：配置 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON`；只有所需资产存在的用例才进入 CTest。
 
 测试内部“找不到文件就 return”不是可信的通过证据，因此 CMake 在注册前检查资产。
-2026-08-11 的 Release/SM87 current-tree 完整运行在资产齐全环境中为 30/30 passed
-（11 contract + 19 integration、0 failures，real 335.05 秒）。其中 realtime 报告 validator
-与 legacy VITS characterization 只证明 R0 scaffold 和既有 suite 未回退，不证明 realtime
-session、目标声线质量或 10-minute SLO。
+2026-08-12 的 Release/SM87 current-tip 完整运行在资产齐全环境中为 30/30 passed
+（11 contract + 19 integration、0 failures，`Total Test time (real) = 356.41 sec`）。其中
+realtime 报告 validator 与 legacy VITS characterization 只证明 R0 scaffold 和既有 suite
+未回退，不证明 realtime session、目标声线质量或 10-minute SLO。
 
 ## 5. 构建原则
 

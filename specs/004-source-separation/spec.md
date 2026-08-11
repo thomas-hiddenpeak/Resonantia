@@ -1,7 +1,7 @@
 # Feature Specification: Source Separation and Vocal Cleanup
 
 **Feature**: `004-source-separation`
-**Updated**: 2026-08-09
+**Updated**: 2026-08-12
 **Status**: **Model runners complete / Experimental / Workflow acceptance partial / Asset gated**
 
 ## 1. Scope
@@ -111,8 +111,9 @@ Spec 003 的 `/api/sep-models` 提供模型发现，`/api/step` 对 material wor
 - `test_separation_roformer`；
 - `test_separation_vad`。
 
-最近一次所有本地资产齐全的完整项目验证为 30/30 CTest（11 contract + 19 integration、
-0 fail，real 335.05 秒），通过项包含上述五个测试以及默认 CLI/HTTP/legacy Web contract。
+2026-08-12 所有本地资产齐全的 current-tip 完整项目验证为 30/30 CTest（11 contract +
+19 integration、0 fail，`Total Test time (real) = 356.41 sec`），通过项包含上述五个测试以及
+默认 CLI/HTTP/legacy Web contract。
 这份结果是该资产集和该环境的实现证据，不应外推为任意权重/任意录音的质量保证。
 默认 `test_cli_contract` 覆盖 `vc_preprocess` 数值、缺值、registry/default/task mismatch，
 `test_web_contract` 覆盖真实 `/api/step` busy、失败回滚和成功清理。`/api/sep-models` 的

@@ -2,6 +2,7 @@
 
 **Feature Branch**: `002-voice-training`
 **Created**: 2026-08-07
+**Updated**: 2026-08-12
 **Status**: **Experimental / Partially Complete**
 **Architecture**: C++/CUDA autograd, 40 kHz v2 fine-tuning path
 
@@ -96,8 +97,8 @@ mel/KL/feature-matching/adversarial 损失。训练 loss 必须有限，错误�
 
 ## 6. Verified Evidence
 
-本地资产齐全的最近一次 current-tree 30/30 CTest（11 contract + 19 integration、0 fail，
-real 335.05 秒）中包含：
+本地资产齐全的 2026-08-12 current-tip 30/30 CTest（11 contract + 19 integration、0 fail，
+`Total Test time (real) = 356.41 sec`）中包含：
 
 - autograd contract；
 - real-audio mel loss；

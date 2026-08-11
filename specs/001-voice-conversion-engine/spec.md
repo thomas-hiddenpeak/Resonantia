@@ -3,7 +3,7 @@
 **Feature Branch**: `001-voice-conversion-engine`
 **Created**: 2026-08-05
 **Status**: Library/pipeline baseline implemented; specification verification partially complete
-**Scope date**: 2026-08-09
+**Scope date**: 2026-08-12
 
 ## 1. Scope
 
@@ -77,9 +77,13 @@ index rate、RMS mix 与 protect。任何保留但未实现的参数都应明确
   加权 k-NN 混合。非零 `index_rate` 要求显式提供并成功加载与内容特征同宽的 Index；
   缺失、错维或检索失败不得静默按 no-index 返回成功。
 - **FR-007 Synthesizer**：支持 F0 VITS v1/v2 的 TextEncoder、Flow 和
-  NSF/HiFi-GAN Generator，拒绝 non-F0。
+  NSF/HiFi-GAN Generator，拒绝 non-F0。初始化必须校验每个运行时已用 tensor 的
+  F32 dtype、精确 shape/nbytes、float alignment 和有限值，并拒绝退化或不可有限重建的
+  weight-norm；已验证 mmap 由实例持有，模型路径在 init 时固定为绝对路径，checkpoint
+  文件身份在公开调用前改变时必须 fail-closed。
 - **FR-008 Pipeline**：编排内容、F0、Index、protect、RMS mix、分块与拼接。
-- **FR-009 Numerical safety**：公开入口校验空指针、尺寸、乘法溢出和非有限数据；
+- **FR-009 Numerical safety**：公开入口校验空指针、尺寸、乘法溢出和非有限数据，合成器
+  的 infer/debug 入口不得返回含 NaN/Inf 的可观察输出；RMVPE/VITS 的 CUDA 临时 buffer 与其他
   CUDA/cuBLAS 临时资源必须异常安全。
 - **FR-010 Output**：成功时以同目录 staging + atomic rename 产生当前支持的 40 kHz
   model-rate WAV；失败
@@ -104,20 +108,23 @@ index rate、RMS mix 与 protect。任何保留但未实现的参数都应明确
 ## 6. Verification and Acceptance
 
 默认无模型资产构建必须执行 contract 测试；模型与 fixture 齐全时，启用
-`VOXMUTATIO_ENABLE_MODEL_TESTS=ON` 执行 integration。最近一次完整资产环境验证为
-30/30 CTest 通过（11 个 contract + 19 个 integration、0 失败，real 335.05 秒），其中覆盖
-HuBERT、RMVPE、FCPE、
-WavLM、Index、VITS、pipeline、端到端 library/pipeline 转换、长音频，以及
-`vc_convert`/`vc_batch` 的严格参数失败。该结果仍不包含真实模型 CLI 成功 WAV 或
-`vc_probe` 行为验收；新增的两个 Spec 006 R0 测试也不扩大 Spec 001 产品范围，因此不足以
-把整个 001 规格标为完成。
+`VOXMUTATIO_ENABLE_MODEL_TESTS=ON` 执行 integration。2026-08-12 current tip 的完整资产
+环境验证为 30/30 CTest 通过（11 个 contract + 19 个 integration、0 失败，
+`Total Test time (real) = 356.41 sec`），其中覆盖 HuBERT、RMVPE、FCPE、WavLM、Index、
+VITS、pipeline、端到端 library/pipeline 转换和长音频；`test_long_audio_chunking` 为
+223.61 秒。默认 `test_pipeline_smoke` 覆盖 VITS sparse-checkpoint、weight-norm、文件替换、
+CWD 独立性、输入/输出 finite 与各公开入口 frame-size fail-closed 边界；RMVPE/VITS 算子临时
+分配由 RAII 管理。该结果仍不包含真实模型 CLI 成功 WAV 或 `vc_probe` 行为验收；Spec 006
+R0 测试也不扩大 Spec 001 产品范围，因此不足以把整个 001 规格标为完成。
 
 验收重点：
 
 - HuBERT v1/v2 输出维度正确，模型布局与 tensor 字节数在推理前复验。
 - RMVPE/FCPE 初始化完整校验运行时使用的 tensor；失败重初始化不得保留旧状态，公开
-  输入在 CUDA 前拒绝空指针、非法长度和非有限值。两者、WavLM 与 VITS 只在对应资产
-  实际存在并执行对齐测试后报告数值结果。
+  输入在 CUDA 前拒绝空指针、非法长度和非有限值。VITS 另需覆盖完整已用 tensor manifest、
+  weight-norm 非退化/有限重建、实例 mmap/绝对路径与文件身份变化、各公开入口的 frame
+  算术边界和非有限输出拒绝。
+  RMVPE、FCPE、WavLM 与 VITS 只在对应资产实际存在并执行对齐测试后报告模型数值结果。
 - pipeline 对 CPU、FP16、PM、non-F0、formant shift、非 WAV 和独立
   `target_sample_rate` 返回失败。
 - 长音频输出有限、非空、长度符合测试门槛，HuBERT/Index/VITS 按块执行且临时产物退出后
