@@ -8,7 +8,9 @@
 #pragma once
 
 #include <functional>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include "voxmutatio/core/cuda_buffer.h"
@@ -26,7 +28,12 @@ struct Node {
 
   [[nodiscard]] int64_t numel() const {
     int64_t n = 1;
-    for (int s : shape) n *= s;
+    for (int s : shape) {
+      if (s <= 0) throw std::invalid_argument("tensor dimensions must be positive");
+      if (n > std::numeric_limits<int64_t>::max() / s)
+        throw std::overflow_error("tensor shape product overflow");
+      n *= s;
+    }
     return n;
   }
   void ensure_grad() {
@@ -110,6 +117,9 @@ Tensor concat_rows(const Tensor& a, const Tensor& b, int cols);
 Tensor slice_rows(const Tensor& x, int start, int count, int cols);
 /// Reverse row order: out[r] = x[rows-1-r] (channel flip for coupling flows).
 Tensor flip_rows(const Tensor& x, int rows, int cols);
+/// Reflect-pad the final flattened axis on the right to target_len.
+/// x must contain [1,current_len]; target_len >= current_len and pad < current_len.
+Tensor reflect_pad_end(const Tensor& x, int target_len);
 /// Embedding lookup: table[vocab,dim] gathered by idx[T] -> [T,dim].
 Tensor embedding(const Tensor& table, const std::vector<int>& idx, int dim);
 /// Scale by a constant.
@@ -134,6 +144,8 @@ class AdamW {
 
   /// Apply one update step using each parameter's accumulated .grad.
   void step();
+  /// Validate all gradients and clip their global L2 norm. Returns the pre-clip norm.
+  float clip_grad_norm(float max_norm);
   /// Zero all parameter gradients.
   void zero_grad();
   void set_lr(float lr) { lr_ = lr; }

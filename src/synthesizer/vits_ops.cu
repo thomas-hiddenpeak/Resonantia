@@ -7,6 +7,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace voxmutatio::synthesizer::ops {
@@ -14,7 +16,10 @@ namespace voxmutatio::synthesizer::ops {
 namespace {
 
 inline void ck(cudaError_t e, const char* f, int l) {
-    if (e != cudaSuccess) fprintf(stderr, "CUDA %s:%d: %s\n", f, l, cudaGetErrorString(e));
+    if (e != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA error at ") + f + ":" +
+                                 std::to_string(l) + ": " + cudaGetErrorString(e));
+    }
 }
 #define CK(e) ck((e), __FILE__, __LINE__)
 

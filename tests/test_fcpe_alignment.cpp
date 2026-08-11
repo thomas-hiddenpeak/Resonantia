@@ -15,10 +15,14 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 #include "voxmutatio/f0/fcpe.h"
 #include "voxmutatio/io/audio_io.h"
+#include "voxmutatio/io/safetensors.h"
+#include "f0_checkpoint_fixture.h"
+#include "test_artifacts.h"
 
 namespace {
 
@@ -106,4 +110,52 @@ TEST_CASE("FCPE aligns with torchfcpe reference", "[fcpe][f0][integration]") {
     CHECK(uv_frac > 0.95);
     CHECK(median < 0.5);   // Constitution VI: F0 < 0.5 Hz on voiced frames
     CHECK(mean < 1.0);
+}
+
+TEST_CASE("FCPE initialization and inference failure boundaries",
+          "[fcpe][integration][contract]") {
+    using namespace voxmutatio;
+
+    f0::FcpeConfig config;
+    config.model_path = "../models/fcpe/model.safetensors";
+    f0::FcpeExtractor extractor;
+    REQUIRE(extractor.init(config));
+
+    float finite_sample = 0.0f;
+    float nonfinite_sample = std::numeric_limits<float>::infinity();
+    int frames = 23;
+    CHECK(extractor.infer(nullptr, 1).empty());
+    CHECK(extractor.infer(&finite_sample, 0).empty());
+    CHECK(extractor.infer(&finite_sample, std::numeric_limits<int>::max()).empty());
+    CHECK(extractor.infer(&nonfinite_sample, 1).empty());
+    CHECK(extractor.compute_mel(&nonfinite_sample, 1, frames).empty());
+    CHECK(frames == 0);
+
+    resonantia_test::ScopedArtifact sparse_checkpoint(
+        resonantia_test::unique_artifact_path("fcpe-complete-sparse", ".safetensors"));
+    REQUIRE(resonantia_test::f0_fixture::create_zero_payload_sparse_clone(
+        "../models/fcpe/model.safetensors", sparse_checkpoint.path()));
+    REQUIRE(resonantia_test::f0_fixture::prepare_fcpe_sparse_payload(
+        sparse_checkpoint.path()));
+    {
+        f0::FcpeExtractor manifest_probe;
+        f0::FcpeConfig sparse_config;
+        sparse_config.model_path = sparse_checkpoint.path().string();
+        REQUIRE(manifest_probe.init(sparse_config));
+    }
+    REQUIRE(resonantia_test::f0_fixture::replace_header_bytes(
+        sparse_checkpoint.path(),
+        R"("input_stack.0.weight":{"dtype":"F32","shape":[512,128,3])",
+        R"("input_stack.0.weight":{"dtype":"F32","shape":[512,384,1])"));
+    {
+        io::SafetensorsLoader generic_loader;
+        REQUIRE(generic_loader.load(sparse_checkpoint.path().string()));
+    }
+
+    config.model_path = sparse_checkpoint.path().string();
+    CHECK_FALSE(extractor.init(config));
+    CHECK(extractor.infer(&finite_sample, 1).empty());
+    frames = 23;
+    CHECK(extractor.compute_mel(&finite_sample, 1, frames).empty());
+    CHECK(frames == 0);
 }

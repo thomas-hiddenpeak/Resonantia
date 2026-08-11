@@ -102,6 +102,7 @@ TEST_CASE("HuBERT v2 numerical alignment (layer 12)", "[hubert][alignment]") {
     config.model_path = model_path;
     config.output_dim = 768;
     config.use_final_proj = false;
+    config.num_layers = 12;
 
     content::HubertEncoder encoder;
     REQUIRE(encoder.init(config));
@@ -126,6 +127,14 @@ TEST_CASE("HuBERT v2 numerical alignment (layer 12)", "[hubert][alignment]") {
 
     // SC-001: L2 error < 1e-4
     CHECK(rms < 1e-4);
+
+    content::HubertEncoder invalid;
+    auto unsupported = config;
+    unsupported.half_precision = true;
+    CHECK_FALSE(invalid.init(unsupported));
+    unsupported = config;
+    unsupported.num_layers = 9;
+    CHECK_FALSE(invalid.init(unsupported));
 }
 
 TEST_CASE("HuBERT v1 numerical alignment (final proj 256)", "[hubert][alignment][v1]") {

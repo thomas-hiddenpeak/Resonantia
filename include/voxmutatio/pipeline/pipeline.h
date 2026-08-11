@@ -33,32 +33,35 @@ public:
                             int speaker_id = 0);
 
     /// Update per-request conversion params without reloading models.
-    void set_runtime_params(int f0_up_key, double formant_shift,
+    /// Returns false and leaves the previous values unchanged when any value is
+    /// unsupported, non-finite, or outside its documented range. Once the
+    /// pipeline is initialized, a non-zero index rate also requires a loaded,
+    /// feature-width-compatible index.
+    bool set_runtime_params(int f0_up_key, double formant_shift,
                             double index_rate, double rms_mix_rate, double protect,
-                            int filter_radius = 3) {
-        config_.f0_up_key = f0_up_key;
-        config_.formant_shift = formant_shift;
-        config_.index_rate = index_rate;
-        config_.rms_mix_rate = rms_mix_rate;
-        config_.protect = protect;
-        config_.filter_radius = filter_radius;
-    }
+                            int filter_radius = 3) noexcept;
 
     /// Get config
     [[nodiscard]] const VCConfig& config() const noexcept { return config_; }
 
-    /// Get model version (auto-detected)
+    /// Get the caller-selected model version validated against the checkpoint.
     [[nodiscard]] ModelVersion version() const;
 
     /// Get number of speakers
     [[nodiscard]] int num_speakers() const;
 
+    /// Get the content feature width derived from the configured RVC version.
+    [[nodiscard]] int feature_dim() const noexcept { return feature_dim_; }
+
 private:
+    /// Initialize a fresh staging object; public init() commits it atomically.
+    bool init_in_place(const VCConfig& config);
+
     /// Extract F0 with the configured method (RMVPE default, FCPE if selected+loaded).
     std::vector<float> extract_f0(const float* audio, int num_samples);
 
     /// Extract content features with the configured encoder (HuBERT default,
-    /// WavLM if selected+loaded). Returns [T, 768] row-major.
+    /// WavLM if selected+loaded). Returns [T, feature_dim_] row-major.
     std::vector<float> extract_content(const float* audio, int num_samples);
 
     /// Content → synth for one 16k mono segment using a precomputed F0/UV slice
@@ -70,7 +73,8 @@ private:
 
     /// Long-audio path: high-pass + reflect-pad the whole clip, compute F0 once
     /// (global pitch consistency), split at silence minima, convert each chunk via
-    /// synth_segment, trim the context pad, and stitch. Bounded memory per chunk.
+    /// synth_segment, trim the context pad, and stitch. HuBERT/Index/VITS are
+    /// chunked; whole-clip host preprocessing and F0 working memory are not bounded.
     VCResult convert_long(std::vector<float>& audio16k, int speaker_id);
 
     VCConfig config_;
@@ -98,6 +102,7 @@ private:
     // Runtime state
     bool initialized_ = false;
     bool index_loaded_ = false;
+    int feature_dim_ = 256;
 };
 
 }  // namespace voxmutatio::pipeline

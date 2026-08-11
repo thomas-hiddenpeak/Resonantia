@@ -3,38 +3,48 @@
 
 #include "voxmutatio/training/fine_tuning.h"
 
-#include <chrono>
+#include <algorithm>
+#include <charconv>
+#include <cctype>
 #include <fstream>
 #include <iostream>
-#include <random>
 #include <sstream>
-#include <algorithm>
 
 namespace voxmutatio::training {
 
+namespace {
+
+std::string trim_copy(std::string value) {
+    const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    const auto first = std::find_if(value.begin(), value.end(), not_space);
+    const auto last = std::find_if(value.rbegin(), value.rend(), not_space).base();
+    if (first >= last) return {};
+    return std::string(first, last);
+}
+
+}  // namespace
+
 bool FineTuneTrainer::init(const FineTuneConfig& config) {
     config_ = config;
-    
-    // TODO: Load pre-trained models and initialize optimizer
-    // For now, stub implementation
-    
     current_metrics_ = {};
-    initialized_ = true;
-    
-    return true;
+    initialized_ = false;
+    std::cerr << "FineTuneTrainer is not implemented; use vc_train's decoder or GAN trainer\n";
+    return false;
 }
 
 bool FineTuneTrainer::load_dataset(const std::string& list_path) {
+    dataset_.clear();
     std::ifstream file(list_path);
     if (!file.is_open()) {
         return false;
     }
     
-    dataset_.clear();
+    std::vector<TrainingEntry> parsed;
     
     std::string line;
     while (std::getline(file, line)) {
         // Skip empty lines and comments
+        line = trim_copy(std::move(line));
         if (line.empty() || line[0] == '#') {
             continue;
         }
@@ -48,102 +58,47 @@ bool FineTuneTrainer::load_dataset(const std::string& list_path) {
             std::getline(iss, label);
             
             TrainingEntry entry;
-            entry.audio_path = audio_path;
-            entry.speaker_id = std::stoi(speaker_id_str);
+            entry.audio_path = trim_copy(std::move(audio_path));
+            speaker_id_str = trim_copy(std::move(speaker_id_str));
+            label = trim_copy(std::move(label));
+            int speaker_id = 0;
+            const auto [end, error] = std::from_chars(
+                speaker_id_str.data(), speaker_id_str.data() + speaker_id_str.size(), speaker_id);
+            if (entry.audio_path.empty() || error != std::errc{} ||
+                end != speaker_id_str.data() + speaker_id_str.size() || speaker_id < 0) {
+                return false;
+            }
+            entry.speaker_id = speaker_id;
             entry.label = label;
             
-            dataset_.push_back(std::move(entry));
+            parsed.push_back(std::move(entry));
+        } else {
+            return false;
         }
     }
-    
-    return !dataset_.empty();
+    if (file.bad()) return false;
+    if (parsed.empty()) return false;
+    dataset_ = std::move(parsed);
+    return true;
 }
 
 bool FineTuneTrainer::train() {
-    if (!initialized_ || dataset_.empty()) {
-        return false;
-    }
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    std::cout << "Starting training..." << std::endl;
-    std::cout << "  Epochs: " << config_.epochs << std::endl;
-    std::cout << "  Batch size: " << config_.batch_size << std::endl;
-    std::cout << "  Learning rate: " << config_.learning_rate << std::endl;
-    std::cout << "  Dataset size: " << dataset_.size() << " entries" << std::endl;
-    
-    for (int epoch = 0; epoch < config_.epochs; ++epoch) {
-        // Shuffle dataset
-        std::shuffle(dataset_.begin(), dataset_.end(), 
-                    std::mt19937(std::random_device{}()));
-        
-        // Process batches
-        int num_batches = (dataset_.size() + config_.batch_size - 1) / 
-                         config_.batch_size;
-        
-        for (int batch = 0; batch < num_batches; ++batch) {
-            int start_idx = batch * config_.batch_size;
-            int end_idx = std::min(start_idx + config_.batch_size, 
-                                  static_cast<int>(dataset_.size()));
-            
-            // TODO: Forward pass, loss computation, backward pass, optimizer step
-            // For now, stub implementation with dummy loss
-            
-            double dummy_loss = 0.5 / (epoch + 1);  // Simulated decreasing loss
-            
-            current_metrics_.epoch = epoch + 1;
-            current_metrics_.step = batch + 1 + epoch * num_batches;
-            current_metrics_.loss = dummy_loss;
-            current_metrics_.grad_norm = 1.0;
-            current_metrics_.learning_rate = config_.learning_rate;
-            
-            auto now = std::chrono::high_resolution_clock::now();
-            current_metrics_.elapsed_seconds = 
-                std::chrono::duration<double>(now - start_time).count();
-            
-            // Log progress
-            if ((batch + 1) % 100 == 0) {
-                std::cout << "  Epoch " << (epoch + 1) << "/" << config_.epochs
-                         << ", Batch " << (batch + 1) << "/" << num_batches
-                         << ", Loss: " << dummy_loss << std::endl;
-            }
-            
-            // Save checkpoint
-            if ((batch + 1) % config_.save_every_steps == 0) {
-                save_checkpoint(config_.log_dir, 
-                               "step_" + std::to_string(current_metrics_.step));
-            }
-        }
-        
-        std::cout << "Epoch " << (epoch + 1) << " completed, "
-                  << "Loss: " << current_metrics_.loss << std::endl;
-        
-        // Save epoch checkpoint
-        if ((epoch + 1) % config_.save_every_epoch == 0) {
-            save_checkpoint(config_.log_dir,
-                          "epoch_" + std::to_string(epoch + 1));
-        }
-    }
-    
-    std::cout << "Training completed." << std::endl;
-    return true;
+    std::cerr << "FineTuneTrainer::train is unsupported; no optimization was performed\n";
+    return false;
 }
 
 bool FineTuneTrainer::save_checkpoint(const std::string& path,
                                        const std::string& name) {
-    // TODO: Save model weights, optimizer state, and training metadata
-    // For now, stub implementation
-    
-    std::cout << "Saving checkpoint: " << path << "/" << name << std::endl;
-    return true;
+    (void)path;
+    (void)name;
+    std::cerr << "FineTuneTrainer::save_checkpoint is unsupported\n";
+    return false;
 }
 
 bool FineTuneTrainer::load_checkpoint(const std::string& path) {
-    // TODO: Load model weights, optimizer state, and resume training
-    // For now, stub implementation
-    
-    std::cout << "Loading checkpoint: " << path << std::endl;
-    return true;
+    (void)path;
+    std::cerr << "FineTuneTrainer::load_checkpoint is unsupported\n";
+    return false;
 }
 
 }  // namespace voxmutatio::training

@@ -10,9 +10,13 @@
 #include "voxmutatio/content/cuda/kernels.h"
 #include "voxmutatio/io/safetensors.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <initializer_list>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -31,6 +35,7 @@ constexpr int kNumLayers = 12;
 constexpr int kNumHeads = 12;
 constexpr int kPosConvKernel = 128;
 constexpr int kPosConvGroups = 16;
+constexpr int kMinimumInputSamples = 400;
 
 const int kConvKernels[kNumConvLayers] = {10, 3, 3, 3, 3, 2, 2};
 const int kConvStrides[kNumConvLayers] = {5, 2, 2, 2, 2, 2, 2};
@@ -59,6 +64,116 @@ struct Weights {
     }
 };
 
+bool expect_shape(const Weights& w, const std::string& name,
+                  std::initializer_list<int64_t> shape, bool check_values = true) {
+    const io::Tensor* tensor = w.loader.get_tensor(name);
+    if (!tensor) {
+        fprintf(stderr, "HuBERT: missing required tensor '%s'\n", name.c_str());
+        return false;
+    }
+    if (tensor->shape != std::vector<int64_t>(shape)) {
+        fprintf(stderr, "HuBERT: tensor '%s' has incompatible shape\n", name.c_str());
+        return false;
+    }
+    std::size_t elements = 1;
+    for (int64_t dim : shape) elements *= static_cast<std::size_t>(dim);
+    if (tensor->dtype != "F32" || tensor->data_nbytes != elements * sizeof(float)) {
+        fprintf(stderr, "HuBERT: tensor '%s' is not an F32 tensor of the expected size\n",
+                name.c_str());
+        return false;
+    }
+    const auto* values = reinterpret_cast<const float*>(w.loader.data(name));
+    if (!values) return false;
+    if (check_values) {
+        for (std::size_t i = 0; i < elements; ++i) {
+            if (!std::isfinite(values[i])) {
+                fprintf(stderr, "HuBERT: tensor '%s' contains a non-finite value\n", name.c_str());
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool validate_pos_conv_norm(const Weights& w) {
+    const float* g = w.get("encoder.pos_conv_embed.conv.parametrizations.weight.original0");
+    const float* v = w.get("encoder.pos_conv_embed.conv.parametrizations.weight.original1");
+    if (!g || !v) return false;
+    constexpr int kInPerGroup = kHidden / kPosConvGroups;
+    std::vector<double> norm_sq(kPosConvKernel, 0.0);
+    for (int o = 0; o < kHidden; ++o)
+        for (int i = 0; i < kInPerGroup; ++i)
+            for (int k = 0; k < kPosConvKernel; ++k) {
+                const double value = v[(o * kInPerGroup + i) * kPosConvKernel + k];
+                norm_sq[k] += value * value;
+            }
+    for (int k = 0; k < kPosConvKernel; ++k) {
+        if (!(norm_sq[k] > 0.0) || !std::isfinite(norm_sq[k])) return false;
+        const double norm = std::sqrt(norm_sq[k]);
+        for (int o = 0; o < kHidden; ++o)
+            for (int i = 0; i < kInPerGroup; ++i) {
+                const double value = static_cast<double>(g[k]) *
+                    v[(o * kInPerGroup + i) * kPosConvKernel + k] / norm;
+                if (!std::isfinite(value) ||
+                    std::abs(value) > std::numeric_limits<float>::max()) return false;
+            }
+    }
+    return true;
+}
+
+bool validate_checkpoint(const Weights& w, bool use_final_proj,
+                         bool check_values = true) {
+    bool ok = true;
+    const auto expect = [&](const std::string& name,
+                            std::initializer_list<int64_t> shape) {
+        return expect_shape(w, name, shape, check_values);
+    };
+    for (int layer = 0; layer < kNumConvLayers; ++layer) {
+        const std::string p = "feature_extractor.conv_layers." + std::to_string(layer) + ".";
+        ok &= expect(p + "conv.weight",
+                     {kConvDim, kConvInCh[layer], kConvKernels[layer]});
+    }
+    ok &= expect("feature_extractor.conv_layers.0.layer_norm.weight", {kConvDim});
+    ok &= expect("feature_extractor.conv_layers.0.layer_norm.bias", {kConvDim});
+    ok &= expect("feature_projection.layer_norm.weight", {kConvDim});
+    ok &= expect("feature_projection.layer_norm.bias", {kConvDim});
+    ok &= expect("feature_projection.projection.weight", {kHidden, kConvDim});
+    ok &= expect("feature_projection.projection.bias", {kHidden});
+    ok &= expect("encoder.pos_conv_embed.conv.parametrizations.weight.original0",
+                 {1, 1, kPosConvKernel});
+    ok &= expect("encoder.pos_conv_embed.conv.parametrizations.weight.original1",
+                 {kHidden, kHidden / kPosConvGroups, kPosConvKernel});
+    ok &= expect("encoder.pos_conv_embed.conv.bias", {kHidden});
+    ok &= expect("encoder.layer_norm.weight", {kHidden});
+    ok &= expect("encoder.layer_norm.bias", {kHidden});
+
+    const int output_layer = use_final_proj ? 9 : kNumLayers;
+    for (int layer = 0; layer < output_layer; ++layer) {
+        const std::string p = "encoder.layers." + std::to_string(layer) + ".";
+        for (const char* proj : {"q_proj", "k_proj", "v_proj", "out_proj"}) {
+            ok &= expect(p + "attention." + proj + ".weight", {kHidden, kHidden});
+            ok &= expect(p + "attention." + proj + ".bias", {kHidden});
+        }
+        ok &= expect(p + "layer_norm.weight", {kHidden});
+        ok &= expect(p + "layer_norm.bias", {kHidden});
+        ok &= expect(p + "feed_forward.intermediate_dense.weight", {kFFN, kHidden});
+        ok &= expect(p + "feed_forward.intermediate_dense.bias", {kFFN});
+        ok &= expect(p + "feed_forward.output_dense.weight", {kHidden, kFFN});
+        ok &= expect(p + "feed_forward.output_dense.bias", {kHidden});
+        ok &= expect(p + "final_layer_norm.weight", {kHidden});
+        ok &= expect(p + "final_layer_norm.bias", {kHidden});
+    }
+    if (use_final_proj) {
+        ok &= expect("final_proj.weight", {256, kHidden});
+        ok &= expect("final_proj.bias", {256});
+    }
+    if (ok && check_values && !validate_pos_conv_norm(w)) {
+        fprintf(stderr, "HuBERT: positional-convolution weight norm is degenerate\n");
+        ok = false;
+    }
+    return ok;
+}
+
 // Reconstruct pos_conv weight from weight_norm parametrization.
 // original0 (g): [1, 1, K], original1 (v): [out_ch, in_per_group, K]
 // weight[o,i,k] = g[k] * v[o,i,k] / ||v[:,:,k]||   (norm over dims 0,1)
@@ -72,11 +187,11 @@ std::vector<float> reconstruct_pos_conv_weight(const Weights& w) {
     const int K = kPosConvKernel;             // 128
 
     // Compute per-k norm over (out_ch, in_per_group)
-    std::vector<float> norm(K, 0.0f);
+    std::vector<double> norm(K, 0.0);
     for (int o = 0; o < out_ch; ++o) {
         for (int i = 0; i < in_per_group; ++i) {
             for (int kk = 0; kk < K; ++kk) {
-                float val = v[(o * in_per_group + i) * K + kk];
+                const double val = v[(o * in_per_group + i) * K + kk];
                 norm[kk] += val * val;
             }
         }
@@ -88,7 +203,8 @@ std::vector<float> reconstruct_pos_conv_weight(const Weights& w) {
         for (int i = 0; i < in_per_group; ++i) {
             for (int kk = 0; kk < K; ++kk) {
                 int idx = (o * in_per_group + i) * K + kk;
-                weight[idx] = g[kk] * v[idx] / norm[kk];
+                weight[idx] = static_cast<float>(
+                    static_cast<double>(g[kk]) * v[idx] / norm[kk]);
             }
         }
     }
@@ -253,22 +369,52 @@ std::vector<float> encoder_layer(const Weights& w, int layer_idx,
 }  // namespace
 
 bool HubertEncoder::init(const HubertConfig& config) {
-    output_dim_ = config.output_dim;
-    half_precision_ = config.half_precision;
+    initialized_ = false;
+    const int expected_dim = config.use_final_proj ? 256 : kHidden;
+    const int expected_layers = config.use_final_proj ? 9 : kNumLayers;
+    if (config.model_path.empty()) {
+        fprintf(stderr, "HuBERT: model_path is required\n");
+        return false;
+    }
+    if (config.output_dim != expected_dim || config.num_layers != expected_layers ||
+        config.half_precision) {
+        fprintf(stderr,
+                "HuBERT: invalid configuration (final_proj=%d requires output_dim=%d, "
+                "num_layers=%d, and FP32)\n",
+                config.use_final_proj ? 1 : 0, expected_dim, expected_layers);
+        return false;
+    }
+
+    Weights weights;
+    if (!weights.load(config.model_path) || !validate_checkpoint(weights, config.use_final_proj)) {
+        fprintf(stderr, "HuBERT: checkpoint validation failed for '%s'\n",
+                config.model_path.c_str());
+        return false;
+    }
+
     config_ = config;
+    output_dim_ = expected_dim;
+    half_precision_ = config.half_precision;
+    initialized_ = true;
     return true;
 }
 
 std::vector<float> HubertEncoder::extract(const float* audio, int num_samples) {
-    if (num_samples == 0) return {};
+    if (!initialized_ || !audio || num_samples < kMinimumInputSamples ||
+        num_samples > 16'000 * 40 ||
+        !std::all_of(audio, audio + num_samples, [](float value) { return std::isfinite(value); })) {
+        return {};
+    }
 
     Weights w;
-    if (!w.load(config_.model_path)) {
+    if (!w.load(config_.model_path) ||
+        !validate_checkpoint(w, config_.use_final_proj, false)) {
         fprintf(stderr, "HuBERT: failed to load model '%s'\n",
                 config_.model_path.c_str());
         return {};
     }
 
+    try {
     // 1. Feature extractor: [num_samples] -> [T, 512]
     auto feats = feature_extractor(w, audio, num_samples);
     int T = static_cast<int>(feats.size()) / kConvDim;
@@ -291,10 +437,15 @@ std::vector<float> HubertEncoder::extract(const float* audio, int num_samples) {
     if (config_.use_final_proj) {
         const float* fw = w.get("final_proj.weight");  // [256,768]
         const float* fb = w.has("final_proj.bias") ? w.get("final_proj.bias") : nullptr;
-        return k::linear(hidden.data(), T, kHidden, fw, fb, output_dim_);  // [T,256]
+        hidden = k::linear(hidden.data(), T, kHidden, fw, fb, output_dim_);  // [T,256]
     }
-
-    return hidden;  // [T, 768]
+    if (!std::all_of(hidden.begin(), hidden.end(),
+                     [](float value) { return std::isfinite(value); })) return {};
+    return hidden;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "HuBERT inference failed: %s\n", error.what());
+        return {};
+    }
 }
 
 }  // namespace voxmutatio::content

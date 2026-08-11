@@ -17,7 +17,8 @@ namespace voxmutatio::separation {
 
 class Separator {
  public:
-  /// Loads umxhq vocals weights from a safetensors file (F32).
+  /// Loads umxhq vocals weights from a safetensors file (F32). A malformed,
+  /// incompatible, or non-finite checkpoint leaves valid() false.
   explicit Separator(const std::string& weights_path);
   ~Separator();
 
@@ -32,15 +33,22 @@ class Separator {
 
   /// Neural mask model on mixture magnitude, layout [nb_channels=2, nb_bins=2049,
   /// nb_frames] (channel-major). Returns estimated vocal magnitude, same layout.
+  /// Throws std::invalid_argument for an invalid/oversized shape or non-finite input;
+  /// throws std::runtime_error when uninitialized or when execution/output fails.
   [[nodiscard]] std::vector<float> run_model(const std::vector<float>& mix_mag,
                                              int nb_frames) const;
 
   /// Full separation of a stereo signal (planar [2, Lch]) -> vocal [2, Lch].
+  /// Uses the same invalid_argument/runtime_error convention as run_model().
   [[nodiscard]] std::vector<float> separate_stereo(const std::vector<float>& stereo,
                                                    int Lch) const;
 
   /// Convenience: mono audio at sr -> mono vocal at sr (resamples to 44100 and
   /// back; duplicates to stereo for the model, downmixes the result).
+  /// Null, empty, oversized, invalid-rate, and non-finite inputs throw
+  /// std::invalid_argument;
+  /// initialization, resampling, execution, and non-finite outputs throw
+  /// std::runtime_error.
   [[nodiscard]] std::vector<float> separate_mono(const float* audio, int L, int sr) const;
 
  private:

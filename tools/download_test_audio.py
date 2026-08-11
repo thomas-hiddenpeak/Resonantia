@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Download real speech audio for testing (LibriSpeech, public domain / CC-BY-4.0)."""
+"""Download real LibriSpeech audio fixtures from the manifest-pinned mirror.
+
+Upstream LibriSpeech is CC-BY-4.0; the testing mirror's missing license metadata
+is recorded separately in the Spec 006 asset manifest.
+"""
 
 import os
 import io
@@ -10,9 +14,11 @@ import pandas as pd
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES_DIR = os.path.join(PROJECT_ROOT, "tests", "fixtures")
 
+LIBRISPEECH_REVISION = "5be91486e11a2d616f4ec5db8d3fd248585ac07a"
 LIBRISPEECH_PARQUET = (
     "https://huggingface.co/datasets/hf-internal-testing/"
-    "librispeech_asr_dummy/resolve/main/clean/validation-00000-of-00001.parquet"
+    f"librispeech_asr_dummy/resolve/{LIBRISPEECH_REVISION}/"
+    "clean/validation-00000-of-00001.parquet"
 )
 
 

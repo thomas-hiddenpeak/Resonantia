@@ -86,4 +86,10 @@ TEST_CASE("WavLM-Base+ aligns with transformers reference", "[wavlm][content][in
     CHECK(cos > 0.999);
     CHECK(sabs / n < 1e-3);
     CHECK(smax < 5e-2);
+
+    auto invalid = cfg;
+    invalid.model_path.clear();
+    CHECK_FALSE(enc.init(invalid));
+    CHECK_FALSE(enc.initialized());
+    CHECK(enc.extract(audio->data.data(), static_cast<int>(audio->data.size())).empty());
 }

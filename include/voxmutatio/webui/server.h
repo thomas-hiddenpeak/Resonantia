@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -54,9 +55,22 @@ struct WebServerConfig {
     std::string static_files_dir;  // Directory for static assets (frontend)
 };
 
-/// Embedded HTTP server for Resonantia WebUI
-class WebServer {
+/// Deprecated placeholder for the former embedded HTTP server surface.
+///
+/// This class never implemented an HTTP listener. It remains source-compatible
+/// for one migration window; use the `vc_serve` executable and its documented
+/// HTTP API for all supported Web service behavior.
+class [[deprecated("Embedded WebServer is unsupported; use the vc_serve executable")]] WebServer {
 public:
+    WebServer();
+    ~WebServer();
+
+    WebServer(WebServer&&) noexcept;
+    WebServer& operator=(WebServer&&) noexcept;
+
+    WebServer(const WebServer&) = delete;
+    WebServer& operator=(const WebServer&) = delete;
+
     /// Initialize server
     bool init(const WebServerConfig& config);
     
@@ -64,7 +78,9 @@ public:
     void register_route(HttpMethod method, const std::string& path,
                        RouteHandler handler);
     
-    /// Start server (blocking)
+    /// Fail fast because the legacy embedded server is unsupported.
+    ///
+    /// Always throws std::logic_error with migration guidance for `vc_serve`.
     void start();
     
     /// Stop server
@@ -83,7 +99,8 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-/// Default API routes for voice conversion
+/// Legacy placeholder routes retained only for source compatibility.
+[[deprecated("Legacy embedded routes are unsupported; use the vc_serve HTTP API")]]
 void register_vc_api(WebServer& server);
 
 }  // namespace voxmutatio::webui

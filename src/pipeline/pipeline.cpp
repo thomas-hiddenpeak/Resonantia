@@ -6,18 +6,66 @@
 
 #include "voxmutatio/pipeline/pipeline.h"
 #include "voxmutatio/io/audio_io.h"
+#include "voxmutatio/io/safetensors.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace voxmutatio::pipeline {
 
 namespace {
+
+constexpr int feature_dim_for(ModelVersion version) {
+    return version == ModelVersion::kV1 ? 256 : 768;
+}
+
+constexpr bool supported_version(ModelVersion version) {
+    return version == ModelVersion::kV1 || version == ModelVersion::kV2;
+}
+
+constexpr bool supported_content_encoder(ContentEncoder encoder) {
+    return encoder == ContentEncoder::kHubert || encoder == ContentEncoder::kWavlm;
+}
+
+constexpr bool supported_f0_method(F0Method method) {
+    return method == F0Method::kRmvpe || method == F0Method::kFcpe;
+}
+
+bool expect_f32_tensor(const io::SafetensorsLoader& loader, const std::string& name,
+                       std::initializer_list<int64_t> shape) {
+    const io::Tensor* tensor = loader.get_tensor(name);
+    if (!tensor || tensor->shape != std::vector<int64_t>(shape)) return false;
+    std::size_t elements = 1;
+    for (int64_t dim : shape) elements *= static_cast<std::size_t>(dim);
+    return tensor->dtype == "F32" && tensor->data_nbytes == elements * sizeof(float);
+}
+
+bool validate_rmvpe_checkpoint(const std::string& path) {
+    io::SafetensorsLoader loader;
+    return !path.empty() && loader.load(path) &&
+           expect_f32_tensor(loader, "cnn.weight", {3, 16, 3, 3}) &&
+           expect_f32_tensor(loader, "cnn.bias", {3}) &&
+           expect_f32_tensor(loader, "fc.0.gru.weight_ih_l0", {768, 384}) &&
+           expect_f32_tensor(loader, "fc.0.gru.weight_hh_l0", {768, 256}) &&
+           expect_f32_tensor(loader, "fc.1.weight", {360, 512}) &&
+           expect_f32_tensor(loader, "fc.1.bias", {360});
+}
+
+bool validate_wavlm_checkpoint(const std::string& path) {
+    io::SafetensorsLoader loader;
+    return !path.empty() && loader.load(path) &&
+           expect_f32_tensor(loader, "feature_projection.projection.weight", {768, 512}) &&
+           expect_f32_tensor(loader, "encoder.layers.0.attention.rel_attn_embed.weight", {320, 12}) &&
+           expect_f32_tensor(loader, "encoder.layers.11.feed_forward.output_dense.weight",
+                             {768, 3072});
+}
 
 // Coarse pitch quantization (matches RVC f0_to_coarse), returns 1..255.
 int f0_to_coarse(float f0) {
@@ -154,32 +202,114 @@ void change_rms_envelope(const std::vector<float>& src, int src_sr,
 
 }  // namespace
 
+bool VoiceConversionPipeline::set_runtime_params(int f0_up_key, double formant_shift,
+                                                  double index_rate, double rms_mix_rate,
+                                                  double protect, int filter_radius) noexcept {
+    const bool valid_filter = filter_radius == 0 ||
+                              (filter_radius >= 3 && filter_radius <= 31 &&
+                               filter_radius % 2 == 1);
+    if (f0_up_key < -48 || f0_up_key > 48 ||
+        !std::isfinite(formant_shift) || formant_shift != 0.0 ||
+        !std::isfinite(index_rate) || index_rate < 0.0 || index_rate > 1.0 ||
+        (initialized_ && index_rate > 0.0 && !index_loaded_) ||
+        !std::isfinite(rms_mix_rate) || rms_mix_rate < 0.0 || rms_mix_rate > 1.0 ||
+        !std::isfinite(protect) || protect < 0.0 || protect > 1.0 ||
+        !valid_filter) {
+        return false;
+    }
+    config_.f0_up_key = f0_up_key;
+    config_.formant_shift = formant_shift;
+    config_.index_rate = index_rate;
+    config_.rms_mix_rate = rms_mix_rate;
+    config_.protect = protect;
+    config_.filter_radius = filter_radius;
+    return true;
+}
+
 bool VoiceConversionPipeline::init(const VCConfig& config) {
-    config_ = config;
+    VoiceConversionPipeline staged;
+    if (!staged.init_in_place(config)) {
+        // Failed re-initialization invalidates and releases every old mmap,
+        // checkpoint loader, host weight vector, and model configuration.
+        *this = VoiceConversionPipeline{};
+        return false;
+    }
+    *this = std::move(staged);
+    return true;
+}
 
-    hubert_cfg_.model_path = config.hubert_model_path;
-    hubert_cfg_.output_dim = (config.version == ModelVersion::kV2) ? 768 : 768;
-    hubert_cfg_.use_final_proj = (config.version == ModelVersion::kV1);
-    hubert_cfg_.half_precision = config.use_half_precision;
-    hubert_encoder_.init(hubert_cfg_);
-
-    // Optional WavLM-Base+ content encoder (used when config.content_encoder == kWavlm).
+bool VoiceConversionPipeline::init_in_place(const VCConfig& config) {
+    initialized_ = false;
+    index_loaded_ = false;
     wavlm_loaded_ = false;
-    if (!config.wavlm_model_path.empty()) {
+    fcpe_loaded_ = false;
+    config_ = config;
+    if (!supported_version(config.version) ||
+        !supported_content_encoder(config.content_encoder) ||
+        !supported_f0_method(config.f0_method)) {
+        return false;
+    }
+    feature_dim_ = feature_dim_for(config.version);
+
+    const bool invalid_filter = config.filter_radius != 0 &&
+                                (config.filter_radius < 3 || config.filter_radius > 31 ||
+                                 config.filter_radius % 2 == 0);
+    const bool invalid_runtime_range =
+        config.f0_up_key < -48 || config.f0_up_key > 48 ||
+        !std::isfinite(config.index_rate) || config.index_rate < 0.0 || config.index_rate > 1.0 ||
+        !std::isfinite(config.rms_mix_rate) || config.rms_mix_rate < 0.0 || config.rms_mix_rate > 1.0 ||
+        !std::isfinite(config.protect) || config.protect < 0.0 || config.protect > 1.0 ||
+        !std::isfinite(config.edge_pad_sec) || config.edge_pad_sec < 0.0 ||
+        config.edge_pad_sec > 2.0 || !std::isfinite(config.max_chunk_sec) ||
+        config.max_chunk_sec < 1.0 || config.max_chunk_sec > 30.0 ||
+        !std::isfinite(config.chunk_pad_sec) || config.chunk_pad_sec < 0.0 ||
+        config.chunk_pad_sec > 5.0 || !std::isfinite(config.chunk_query_sec) ||
+        config.chunk_query_sec < 0.0 || config.chunk_query_sec > 5.0 ||
+        config.chunk_query_sec > config.max_chunk_sec / 2.0 ||
+        config.model_sample_rate != 40'000;
+    if (config.device != "cuda" || config.use_half_precision ||
+        !std::isfinite(config.formant_shift) || config.formant_shift != 0.0 ||
+        (config.index_rate > 0.0 && config.index_path.empty()) ||
+        (config.target_sample_rate != 0 &&
+         config.target_sample_rate != config.model_sample_rate) ||
+        config.output_format != "wav" ||
+        invalid_filter || invalid_runtime_range) {
+        return false;
+    }
+
+    // The current synthesizer is the NSF/F0 architecture. Reject unsupported
+    // non-F0 checkpoints at the boundary instead of accepting a configuration
+    // that would later dereference absent pitch tensors.
+    if (!config.has_f0) return false;
+
+    if (config.content_encoder == ContentEncoder::kWavlm) {
+        if (config.version != ModelVersion::kV2 ||
+            !validate_wavlm_checkpoint(config.wavlm_model_path)) {
+            return false;
+        }
         wavlm_cfg_.model_path = config.wavlm_model_path;
         wavlm_cfg_.output_dim = 768;
         wavlm_cfg_.num_layers = 12;
         wavlm_loaded_ = wavlm_encoder_.init(wavlm_cfg_);
+        if (!wavlm_loaded_) return false;
+    } else {
+        hubert_cfg_.model_path = config.hubert_model_path;
+        hubert_cfg_.output_dim = feature_dim_;
+        hubert_cfg_.use_final_proj = (config.version == ModelVersion::kV1);
+        hubert_cfg_.num_layers = hubert_cfg_.use_final_proj ? 9 : 12;
+        hubert_cfg_.half_precision = config.use_half_precision;
+        if (!hubert_encoder_.init(hubert_cfg_)) return false;
     }
 
-    f0_cfg_.model_path = config.rmvpe_model_path;
-    f0_extractor_.init(f0_cfg_);
-
-    // Optional FCPE F0 extractor (used when config.f0_method == kFcpe).
-    fcpe_loaded_ = false;
-    if (!config.fcpe_model_path.empty()) {
+    if (config.f0_method == F0Method::kFcpe) {
+        if (config.fcpe_model_path.empty()) return false;
         fcpe_cfg_.model_path = config.fcpe_model_path;
         fcpe_loaded_ = fcpe_extractor_.init(fcpe_cfg_);
+        if (!fcpe_loaded_) return false;
+    } else {
+        if (!validate_rmvpe_checkpoint(config.rmvpe_model_path)) return false;
+        f0_cfg_.model_path = config.rmvpe_model_path;
+        if (!f0_extractor_.init(f0_cfg_)) return false;
     }
 
     synth_cfg_.model_path = config.synthesizer_model_path;
@@ -187,31 +317,30 @@ bool VoiceConversionPipeline::init(const VCConfig& config) {
     synth_cfg_.has_f0 = config.has_f0;
     synth_cfg_.sample_rate = config.model_sample_rate;
     synth_cfg_.spk_embed_dim = config.num_speakers;
-    synth_.init(synth_cfg_);
+    if (!synth_.init(synth_cfg_)) return false;
+    if (synth_.feature_dim() != feature_dim_) return false;
+    config_.num_speakers = synth_.num_speakers();
 
     // Optional feature retrieval index
-    index_loaded_ = false;
     if (!config.index_path.empty()) {
         index_loaded_ = feature_index_.load(config.index_path);
+        if (!index_loaded_ || feature_index_.dim() != feature_dim_) return false;
     }
 
     initialized_ = true;
     return true;
 }
 
-// Dispatch F0 extraction to the configured method. FCPE falls back to RMVPE if
-// it was not loaded (no model path), so callers never silently get zero F0.
+// Dispatch F0 extraction to the model validated during init().
 std::vector<float> VoiceConversionPipeline::extract_f0(const float* audio, int num_samples) {
-    if (config_.f0_method == F0Method::kFcpe && fcpe_loaded_)
+    if (config_.f0_method == F0Method::kFcpe)
         return fcpe_extractor_.infer(audio, num_samples);
     return f0_extractor_.infer(audio, num_samples);
 }
 
-// Dispatch content extraction. WavLM (768-D) falls back to HuBERT if it was not
-// loaded; WavLM only applies to the 768-D v2 path (dimension-compatible synth).
+// Dispatch content extraction to the model validated during init().
 std::vector<float> VoiceConversionPipeline::extract_content(const float* audio, int num_samples) {
-    if (config_.content_encoder == ContentEncoder::kWavlm && wavlm_loaded_ &&
-        config_.version == ModelVersion::kV2)
+    if (config_.content_encoder == ContentEncoder::kWavlm)
         return wavlm_encoder_.extract(audio, num_samples);
     return hubert_encoder_.extract(audio, num_samples);
 }
@@ -225,12 +354,13 @@ AudioBuffer VoiceConversionPipeline::synth_segment(
         int speaker_id, VCResult& timing) {
     using clock = std::chrono::high_resolution_clock;
 
-    // HuBERT content features [T, 768]
+    // Content features [T, feature_dim_]
     auto t0 = clock::now();
     auto feats = extract_content(seg16k, segn);
     timing.hubert_ms += std::chrono::duration<double, std::milli>(clock::now() - t0).count();
     if (feats.empty()) return {};
-    int T = static_cast<int>(feats.size()) / 768;
+    if (feats.size() % static_cast<std::size_t>(feature_dim_) != 0) return {};
+    int T = static_cast<int>(feats.size()) / feature_dim_;
 
     // Keep pre-index features for consonant/breath protection.
     const bool do_protect = config_.protect < 0.5;
@@ -239,37 +369,44 @@ AudioBuffer VoiceConversionPipeline::synth_segment(
 
     // Feature retrieval blending (RVC index_rate)
     t0 = clock::now();
-    if (index_loaded_ && config_.index_rate > 0.0 && feature_index_.dim() == 768) {
-        auto retrieved = feature_index_.retrieve_weighted(feats.data(), T, 8, 768);
-        if (!retrieved.empty()) {
-            index::blend_features(feats.data(), feats.data(), retrieved.data(),
-                                  T, 768, config_.index_rate);
+    if (index_loaded_ && config_.index_rate > 0.0 && feature_index_.dim() == feature_dim_) {
+        auto retrieved = feature_index_.retrieve_weighted(feats.data(), T, 8, feature_dim_);
+        // An explicitly loaded index is part of the requested conversion.  A
+        // failed lookup must fail this segment instead of returning plausible
+        // audio synthesized from the original features while reporting success.
+        if (retrieved.size() != feats.size()) {
+            timing.index_ms += std::chrono::duration<double, std::milli>(
+                clock::now() - t0).count();
+            timing.error_message = "index retrieval failed";
+            return {};
         }
+        index::blend_features(feats.data(), feats.data(), retrieved.data(),
+                              T, feature_dim_, config_.index_rate);
     }
     timing.index_ms += std::chrono::duration<double, std::milli>(clock::now() - t0).count();
 
     // Interpolate features 2x (50Hz -> 100Hz)
-    auto feats_up = interpolate_2x(feats, T, 768);
+    auto feats_up = interpolate_2x(feats, T, feature_dim_);
     std::vector<float> feats0_up;
-    if (do_protect) feats0_up = interpolate_2x(feats0, T, 768);
+    if (do_protect) feats0_up = interpolate_2x(feats0, T, feature_dim_);
     int Tf = 2 * T;
 
     // Align lengths to the provided F0 slice.
     int p_len = std::min(Tf, f0_len);
     if (p_len <= 0) return {};
-    feats_up.resize(static_cast<size_t>(p_len) * 768);
+    feats_up.resize(static_cast<size_t>(p_len) * feature_dim_);
     std::vector<float> f0(f0_slice, f0_slice + p_len);
 
     // Consonant protection: unvoiced frames keep original (pre-index) features.
     if (do_protect) {
-        feats0_up.resize(static_cast<size_t>(p_len) * 768);
+        feats0_up.resize(static_cast<size_t>(p_len) * feature_dim_);
         const float pr = static_cast<float>(config_.protect);
         for (int t = 0; t < p_len; ++t) {
             float w = uv_slice[t] ? pr : 1.0f;  // RVC pitchff
             if (w >= 1.0f) continue;
-            float* f = &feats_up[static_cast<size_t>(t) * 768];
-            const float* g = &feats0_up[static_cast<size_t>(t) * 768];
-            for (int d = 0; d < 768; ++d) f[d] = f[d] * w + g[d] * (1.0f - w);
+            float* f = &feats_up[static_cast<size_t>(t) * feature_dim_];
+            const float* g = &feats0_up[static_cast<size_t>(t) * feature_dim_];
+            for (int d = 0; d < feature_dim_; ++d) f[d] = f[d] * w + g[d] * (1.0f - w);
         }
     }
 
@@ -332,8 +469,10 @@ VCResult VoiceConversionPipeline::convert_long(std::vector<float>& audio16k, int
     int chunk = std::max(hop, static_cast<int>(config_.max_chunk_sec * 16000));
     int query = std::max(hop, static_cast<int>(config_.chunk_query_sec * 16000));
     std::vector<int> bounds{0};
-    for (int target = chunk; target < n; target += chunk) {
-        int lo = std::max(1, target - query), hi = std::min(n - 1, target + query);
+    for (std::int64_t target = chunk; target < n; target += chunk) {
+        const int lo = static_cast<int>(std::max<std::int64_t>(1, target - query));
+        const int hi = static_cast<int>(
+            std::min<std::int64_t>(n - 1, target + query));
         int lof = lo / hop, hif = std::min(nf - 1, hi / hop);
         int best = lof;
         float bestE = std::numeric_limits<float>::max();
@@ -362,7 +501,13 @@ VCResult VoiceConversionPipeline::convert_long(std::vector<float>& audio16k, int
         auto piece = synth_segment(apad.data() + a, segn, f0.data() + fs, uv.data() + fs,
                                    f0_len, speaker_id, result);
         if (piece.data.empty()) {
-            result.error_message = "chunk synthesis failed";
+            if (result.error_message.empty()) {
+                result.error_message = "chunk synthesis failed";
+            }
+            return result;
+        }
+        if (piece.data.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            result.error_message = "chunk synthesis exceeded the supported sample range";
             return result;
         }
         // Absolute output span for this chunk's core [s, e).
@@ -374,10 +519,19 @@ VCResult VoiceConversionPipeline::convert_long(std::vector<float>& audio16k, int
         out.insert(out.end(), static_cast<size_t>(core_len - take), 0.0f);  // keep absolute align
     }
     if (out.empty()) { result.error_message = "long-audio synthesis produced no output"; return result; }
+    if (out.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        result.error_message = "long-audio synthesis exceeded the supported sample range";
+        return result;
+    }
 
     // Match the source's per-frame RMS envelope over the whole output (RVC change_rms).
     if (config_.rms_mix_rate < 1.0)
         change_rms_envelope(src_hp, 16000, out, config_.rms_mix_rate);
+
+    if (!std::all_of(out.begin(), out.end(), [](float value) { return std::isfinite(value); })) {
+        result.error_message = "long-audio synthesis produced non-finite samples";
+        return result;
+    }
 
     result.audio.data = std::move(out);
     result.audio.sample_rate = synth_cfg_.sample_rate;
@@ -396,6 +550,28 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
         result.error_message = "pipeline not initialized";
         return result;
     }
+    // Long-path reflection can add at most 5 s on each side at 16 kHz, plus one
+    // 160-sample tail hop. Also reserve index range for native-rate output.
+    constexpr std::size_t kMaximumPaddingSamples = 2u * 5u * 16'000u + 160u;
+    const std::uint64_t maximum_by_output =
+        static_cast<std::uint64_t>(std::numeric_limits<int>::max()) * 16'000u /
+        static_cast<std::uint64_t>(synth_cfg_.sample_rate);
+    const std::size_t kMaximumUnpaddedSamples = static_cast<std::size_t>(std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(std::numeric_limits<int>::max()) - kMaximumPaddingSamples,
+        maximum_by_output > kMaximumPaddingSamples
+            ? maximum_by_output - kMaximumPaddingSamples
+            : 0));
+    if (input.sample_rate <= 0 || input.data.empty() ||
+        input.data.size() > kMaximumUnpaddedSamples ||
+        !std::all_of(input.data.begin(), input.data.end(),
+                     [](float value) { return std::isfinite(value); })) {
+        result.error_message = "invalid input audio buffer";
+        return result;
+    }
+    if (speaker_id < 0 || speaker_id >= synth_.num_speakers()) {
+        result.error_message = "speaker_id out of range";
+        return result;
+    }
 
     // 1. Resample input to 16kHz mono for feature extraction
     std::vector<float> audio16k;
@@ -406,8 +582,15 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
     } else {
         audio16k = input.data;
     }
+    if (audio16k.empty() || audio16k.size() > kMaximumUnpaddedSamples ||
+        !std::all_of(audio16k.begin(), audio16k.end(),
+                     [](float value) { return std::isfinite(value); })) {
+        result.error_message = "input resampling failed";
+        return result;
+    }
 
-    // Long clips: split at silence and convert per-chunk (bounded memory).
+    // Long clips: split at silence to bound each model/GPU invocation. The
+    // offline path still retains whole-clip host buffers and the final output.
     if (config_.max_chunk_sec > 0.0 &&
         static_cast<double>(audio16k.size()) > config_.max_chunk_sec * 16000.0) {
         return convert_long(audio16k, speaker_id);
@@ -440,7 +623,14 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
     auto synth_audio = synth_segment(audio16k.data(), n16k, f0.data(), uv.data(),
                                      static_cast<int>(f0.size()), speaker_id, result);
     if (synth_audio.data.empty()) {
-        result.error_message = "segment synthesis failed";
+        if (result.error_message.empty()) {
+            result.error_message = "segment synthesis failed";
+        }
+        return result;
+    }
+    if (synth_audio.data.size() >
+        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        result.error_message = "synthesis exceeded the supported sample range";
         return result;
     }
 
@@ -464,6 +654,12 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
         change_rms_envelope(src_core, 16000, synth_audio.data, config_.rms_mix_rate);
     }
 
+    if (!std::all_of(synth_audio.data.begin(), synth_audio.data.end(),
+                     [](float value) { return std::isfinite(value); })) {
+        result.error_message = "synthesis produced non-finite samples";
+        return result;
+    }
+
     result.audio = std::move(synth_audio);
     result.audio.sample_rate = synth_cfg_.sample_rate;
     result.success = true;
@@ -482,6 +678,12 @@ VCResult VoiceConversionPipeline::convert_file(const std::string& input_path,
     }
     result = convert_buffer(*audio, speaker_id);
     if (!result.success) return result;
+    if (result.audio.data.size() >
+        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        result.success = false;
+        result.error_message = "converted audio exceeds the WAV writer range";
+        return result;
+    }
 
     if (!io::write_audio(output_path, result.audio.data.data(),
                          static_cast<int>(result.audio.data.size()),
@@ -493,6 +695,6 @@ VCResult VoiceConversionPipeline::convert_file(const std::string& input_path,
 }
 
 ModelVersion VoiceConversionPipeline::version() const { return config_.version; }
-int VoiceConversionPipeline::num_speakers() const { return config_.num_speakers; }
+int VoiceConversionPipeline::num_speakers() const { return synth_.num_speakers(); }
 
 }  // namespace voxmutatio::pipeline

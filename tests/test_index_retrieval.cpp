@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "voxmutatio/index/cuda_flat_index.h"
+#include "test_artifacts.h"
 
 namespace {
 
@@ -62,7 +63,9 @@ TEST_CASE("Feature index weighted retrieval (real HuBERT)", "[index][retrieval]"
     std::cout << "Database: " << T << " x " << D << std::endl;
 
     // Build index binary from the features
-    std::string idx_path = "../tests/fixtures/test_index.bin";
+    resonantia_test::ScopedArtifact index_artifact(
+        resonantia_test::unique_artifact_path("test-index", ".bin"));
+    const std::string idx_path = index_artifact.path().string();
     REQUIRE(write_index(idx_path, feats, T, D));
 
     CudaFlatIndex index;
@@ -91,6 +94,4 @@ TEST_CASE("Feature index weighted retrieval (real HuBERT)", "[index][retrieval]"
     CHECK(cosine(blended.data(), feats.data(), nq * 768) > 0.9999);
     blend_features(blended.data(), feats.data(), retrieved.data(), nq, 768, 1.0);
     CHECK(cosine(blended.data(), retrieved.data(), nq * 768) > 0.9999);
-
-    std::remove(idx_path.c_str());
 }

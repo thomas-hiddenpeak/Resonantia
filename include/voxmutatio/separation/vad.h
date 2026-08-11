@@ -17,6 +17,7 @@ namespace voxmutatio::separation {
 
 class Vad {
  public:
+  /// Malformed, incompatible, or non-finite model assets leave valid() false.
   explicit Vad(const std::string& dir, const std::string& model = "silero_vad");
   ~Vad();
   Vad(const Vad&) = delete;
@@ -26,11 +27,18 @@ class Vad {
   [[nodiscard]] int sample_rate() const;  // 16000
 
   /// Speech probability per 512-sample chunk for 16 kHz mono audio[n].
+  /// Returns empty when n is shorter than one chunk. Throws std::invalid_argument
+  /// for null, empty, oversized, or non-finite caller input; throws
+  /// std::runtime_error when uninitialized or when execution/output fails.
   [[nodiscard]] std::vector<float> probs(const float* audio16k, int n) const;
 
   /// Speech segments [start,end) (in samples at the input sr) with hysteresis.
   /// Resamples to 16k internally. min_speech_ms / min_silence_ms / pad_ms shape
-  /// the segmentation the way get_speech_timestamps does.
+  /// the segmentation the way get_speech_timestamps does. thresh accepts the
+  /// complete finite [0, 1] range; the lower hysteresis threshold is clamped at 0.
+  /// Invalid parameters and non-finite input throw std::invalid_argument;
+  /// initialization, resampling, execution, and non-finite probability failures
+  /// throw std::runtime_error.
   [[nodiscard]] std::vector<std::pair<int, int>> segments(
       const float* audio, int n, int sr, float thresh = 0.5f,
       int min_speech_ms = 250, int min_silence_ms = 100, int pad_ms = 30) const;

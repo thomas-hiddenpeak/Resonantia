@@ -7,8 +7,48 @@
 
 #include "voxmutatio/f0/rmvpe.h"
 #include "voxmutatio/f0/fcpe.h"
+#include "test_artifacts.h"
 
+#include <cstdint>
 #include <cmath>
+#include <fstream>
+#include <limits>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+static_assert(std::is_copy_constructible_v<voxmutatio::f0::RmvpeExtractor>);
+static_assert(std::is_copy_assignable_v<voxmutatio::f0::RmvpeExtractor>);
+
+namespace {
+
+void append_u64_le(std::vector<std::uint8_t>& bytes, std::uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8) {
+        bytes.push_back(static_cast<std::uint8_t>((value >> shift) & 0xff));
+    }
+}
+
+bool write_fcpe_head_only_checkpoint(const std::filesystem::path& path) {
+    const std::string header =
+        R"({"cent_table":{"dtype":"F32","shape":[360],"data_offsets":[0,1440]},)"
+        R"("output_proj.bias":{"dtype":"F32","shape":[360],"data_offsets":[1440,2880]},)"
+        R"("output_proj.parametrizations.weight.original0":{"dtype":"F32","shape":[360,1],"data_offsets":[2880,4320]},)"
+        R"("output_proj.parametrizations.weight.original1":{"dtype":"F32","shape":[360,512],"data_offsets":[4320,741600]}})";
+
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(sizeof(std::uint64_t) + header.size() + 741'600);
+    append_u64_le(bytes, header.size());
+    bytes.insert(bytes.end(), header.begin(), header.end());
+    bytes.resize(bytes.size() + 741'600, 0);
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) return false;
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    return static_cast<bool>(output);
+}
+
+}  // namespace
 
 TEST_CASE("Pitch shift calculation", "[f0][pitch-shift]") {
     std::vector<float> f0 = {100.0f, 200.0f, 0.0f, 300.0f};  // 0.0 = unvoiced
@@ -60,4 +100,87 @@ TEST_CASE("FCPE pitch shift matches RMVPE", "[f0][pitch-shift]") {
     for (size_t i = 0; i < f0.size(); ++i) {
         REQUIRE(rmvpe_shifted[i] == Catch::Approx(fcpe_shifted[i]).epsilon(1e-6));
     }
+}
+
+TEST_CASE("Pitch shift rejects non-finite input, unsupported range, and overflow",
+          "[f0][pitch-shift][contract]") {
+    using voxmutatio::f0::FcpeExtractor;
+    using voxmutatio::f0::RmvpeExtractor;
+
+    CHECK(RmvpeExtractor::pitch_shift(
+              {std::numeric_limits<float>::quiet_NaN()}, 0).empty());
+    CHECK(FcpeExtractor::pitch_shift(
+              {std::numeric_limits<float>::infinity()}, 0).empty());
+
+    CHECK(RmvpeExtractor::pitch_shift({100.0f}, 49).empty());
+    CHECK(FcpeExtractor::pitch_shift({100.0f}, -49).empty());
+
+    const auto rmvpe_boundary = RmvpeExtractor::pitch_shift({100.0f}, 48);
+    REQUIRE(rmvpe_boundary.size() == 1);
+    CHECK(std::isfinite(rmvpe_boundary.front()));
+    const auto fcpe_boundary = FcpeExtractor::pitch_shift({100.0f}, -48);
+    REQUIRE(fcpe_boundary.size() == 1);
+    CHECK(std::isfinite(fcpe_boundary.front()));
+
+    CHECK(RmvpeExtractor::pitch_shift(
+              {std::numeric_limits<float>::max()}, 48).empty());
+    CHECK(FcpeExtractor::pitch_shift(
+              {std::numeric_limits<float>::max()}, 48).empty());
+}
+
+TEST_CASE("F0 extractors reject missing and incomplete checkpoints",
+          "[f0][contract][init]") {
+    using voxmutatio::f0::FcpeConfig;
+    using voxmutatio::f0::FcpeExtractor;
+    using voxmutatio::f0::RmvpeConfig;
+    using voxmutatio::f0::RmvpeExtractor;
+
+    RmvpeExtractor missing_rmvpe;
+    RmvpeConfig missing_rmvpe_config;
+    missing_rmvpe_config.model_path = "/tmp/resonantia-missing-rmvpe.safetensors";
+    CHECK_FALSE(missing_rmvpe.init(missing_rmvpe_config));
+
+    resonantia_test::ScopedArtifact incomplete(
+        resonantia_test::unique_artifact_path("fcpe-head-only", ".safetensors"));
+    REQUIRE(write_fcpe_head_only_checkpoint(incomplete.path()));
+
+    FcpeExtractor fcpe;
+    FcpeConfig fcpe_config;
+    fcpe_config.model_path = incomplete.path().string();
+    CHECK_FALSE(fcpe.init(fcpe_config));
+
+    RmvpeExtractor rmvpe;
+    RmvpeConfig rmvpe_config;
+    rmvpe_config.model_path = incomplete.path().string();
+    CHECK_FALSE(rmvpe.init(rmvpe_config));
+}
+
+TEST_CASE("F0 extractors reject invalid configuration and public input",
+          "[f0][contract][boundary]") {
+    using voxmutatio::f0::FcpeConfig;
+    using voxmutatio::f0::FcpeExtractor;
+    using voxmutatio::f0::RmvpeConfig;
+    using voxmutatio::f0::RmvpeExtractor;
+
+    RmvpeConfig rmvpe_config;
+    rmvpe_config.model_path = "/tmp/resonantia-missing-rmvpe.safetensors";
+    rmvpe_config.threshold = std::numeric_limits<float>::quiet_NaN();
+    RmvpeExtractor rmvpe;
+    CHECK_FALSE(rmvpe.init(rmvpe_config));
+
+    FcpeConfig fcpe_config;
+    fcpe_config.model_path = "/tmp/resonantia-missing-fcpe.safetensors";
+    fcpe_config.threshold = std::numeric_limits<float>::infinity();
+    FcpeExtractor fcpe;
+    CHECK_FALSE(fcpe.init(fcpe_config));
+
+    int frames = 17;
+    CHECK(rmvpe.infer(nullptr, 0).empty());
+    CHECK(rmvpe.infer_salience(nullptr, 0, frames).empty());
+    CHECK(frames == 0);
+
+    frames = 17;
+    CHECK(fcpe.infer(nullptr, 0).empty());
+    CHECK(fcpe.compute_mel(nullptr, 0, frames).empty());
+    CHECK(frames == 0);
 }

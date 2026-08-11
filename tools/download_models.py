@@ -12,6 +12,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 
 REPO_ID = "lj1995/VoiceConversionWebUI"
+REPO_REVISION = "e6d0c1a17da07c33557852f9dfa2bd44cc75737d"
 
 def download_file(filename, local_dir=None):
     """Download a file from HuggingFace."""
@@ -19,6 +20,7 @@ def download_file(filename, local_dir=None):
     path = hf_hub_download(
         repo_id=REPO_ID,
         filename=filename,
+        revision=REPO_REVISION,
         local_dir=local_dir or MODELS_DIR
     )
     size = os.path.getsize(path) / 1024 / 1024
@@ -42,7 +44,8 @@ def convert_state_dict(pt_path, sf_path):
     from safetensors.torch import save_file
     from collections import OrderedDict
     
-    obj = torch.load(pt_path, map_location="cpu", weights_only=False)
+    # weights_only prevents checkpoint pickle payloads from executing code.
+    obj = torch.load(pt_path, map_location="cpu", weights_only=True)
     
     # Extract state_dict if wrapped
     if hasattr(obj, 'state_dict'):
@@ -88,11 +91,16 @@ def download_hubert():
     os.makedirs(hubert_dir, exist_ok=True)
     
     # Download transformers-format model (not fairseq)
+    downloaded = {}
     for f in ["pytorch_model.bin", "config.json", "preprocessor_config.json"]:
-        download_file(f"hubert_base/{f}", hubert_dir)
+        # Use MODELS_DIR as the Hugging Face local root so the repository's
+        # `hubert_base/...` path is preserved exactly once.  Passing
+        # `hubert_dir` here creates `hubert_base/hubert_base/...` and leaves the
+        # conversion input below missing on a clean checkout.
+        downloaded[f] = download_file(f"hubert_base/{f}")
     
     # Convert to safetensors
-    pt_path = os.path.join(hubert_dir, "pytorch_model.bin")
+    pt_path = downloaded["pytorch_model.bin"]
     sf_path = os.path.join(hubert_dir, "model.safetensors")
     if os.path.exists(pt_path) and not os.path.exists(sf_path):
         convert_state_dict(pt_path, sf_path)

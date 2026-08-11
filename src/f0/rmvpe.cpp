@@ -12,12 +12,20 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace voxmutatio::f0 {
+
+struct RmvpeExtractor::ModelState {
+    io::SafetensorsLoader loader;
+};
 
 namespace {
 
@@ -170,13 +178,188 @@ std::vector<float> mel_spectrogram(const float* audio, int num_samples, int& out
     return logmel;  // [n_mels, T]
 }
 
+bool valid_threshold(float threshold) {
+    return std::isfinite(threshold) && threshold >= 0.0f && threshold <= 1.0f;
+}
+
+bool valid_audio_input(const float* audio, int num_samples) {
+    if (!audio || num_samples <= 0) return false;
+
+    if (num_samples > std::numeric_limits<int>::max() - kNFFT) return false;
+
+    const int frames = 1 + num_samples / kHop;
+    if (frames > std::numeric_limits<int>::max() - 31) return false;
+    const int padded_frames = ((frames + 31) / 32) * 32;
+    // The widest decoder activation is [16, padded_frames, 128], and the
+    // current CUDA operator boundary expresses element counts as int.
+    if (padded_frames > std::numeric_limits<int>::max() / (16 * kNMels)) {
+        return false;
+    }
+    for (int i = 0; i < num_samples; ++i) {
+        if (!std::isfinite(audio[i])) return false;
+    }
+    return true;
+}
+
+bool all_finite(const std::vector<float>& values) {
+    return std::all_of(values.begin(), values.end(),
+                       [](float value) { return std::isfinite(value); });
+}
+
+bool expect_finite_tensor(const io::SafetensorsLoader& loader,
+                          const std::string& name,
+                          const std::vector<std::int64_t>& expected_shape,
+                          bool require_nonnegative = false) {
+    const io::Tensor* tensor = loader.get_tensor(name);
+    if (!tensor || tensor->dtype != "F32" || tensor->shape != expected_shape) {
+        return false;
+    }
+
+    std::size_t elements = 1;
+    for (const std::int64_t dim : expected_shape) {
+        if (dim <= 0 || static_cast<std::uint64_t>(dim) >
+                            std::numeric_limits<std::size_t>::max()) {
+            return false;
+        }
+        const std::size_t size = static_cast<std::size_t>(dim);
+        if (elements > std::numeric_limits<std::size_t>::max() / size) return false;
+        elements *= size;
+    }
+    if (elements > std::numeric_limits<std::size_t>::max() / sizeof(float) ||
+        tensor->data_nbytes != elements * sizeof(float)) {
+        return false;
+    }
+
+    const auto* bytes = loader.data(name);
+    if (!bytes || reinterpret_cast<std::uintptr_t>(bytes) % alignof(float) != 0) {
+        return false;
+    }
+    const auto* values = reinterpret_cast<const float*>(bytes);
+    for (std::size_t i = 0; i < elements; ++i) {
+        if (!std::isfinite(values[i]) || (require_nonnegative && values[i] < 0.0f)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool expect_batch_norm(const io::SafetensorsLoader& loader,
+                       const std::string& prefix, int channels) {
+    const std::vector<std::int64_t> shape = {channels};
+    return expect_finite_tensor(loader, prefix + "weight", shape) &&
+           expect_finite_tensor(loader, prefix + "bias", shape) &&
+           expect_finite_tensor(loader, prefix + "running_mean", shape) &&
+           expect_finite_tensor(loader, prefix + "running_var", shape, true);
+}
+
+bool expect_conv_block(const io::SafetensorsLoader& loader,
+                       const std::string& prefix, int in_channels,
+                       int out_channels) {
+    if (!expect_finite_tensor(loader, prefix + "conv.0.weight",
+                              {out_channels, in_channels, 3, 3}) ||
+        !expect_batch_norm(loader, prefix + "conv.1.", out_channels) ||
+        !expect_finite_tensor(loader, prefix + "conv.3.weight",
+                              {out_channels, out_channels, 3, 3}) ||
+        !expect_batch_norm(loader, prefix + "conv.4.", out_channels)) {
+        return false;
+    }
+    return in_channels == out_channels ||
+           (expect_finite_tensor(loader, prefix + "shortcut.weight",
+                                 {out_channels, in_channels, 1, 1}) &&
+            expect_finite_tensor(loader, prefix + "shortcut.bias", {out_channels}));
+}
+
+bool expect_encoder_block(const io::SafetensorsLoader& loader,
+                          const std::string& prefix, int in_channels,
+                          int out_channels) {
+    if (!expect_conv_block(loader, prefix + "conv.0.", in_channels, out_channels)) {
+        return false;
+    }
+    for (int block = 1; block < kNBlocks; ++block) {
+        if (!expect_conv_block(loader,
+                               prefix + "conv." + std::to_string(block) + ".",
+                               out_channels, out_channels)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool expect_decoder_block(const io::SafetensorsLoader& loader,
+                          const std::string& prefix, int in_channels,
+                          int out_channels) {
+    if (!expect_finite_tensor(loader, prefix + "conv1.0.weight",
+                              {in_channels, out_channels, 3, 3}) ||
+        !expect_batch_norm(loader, prefix + "conv1.1.", out_channels) ||
+        !expect_conv_block(loader, prefix + "conv2.0.", 2 * out_channels,
+                           out_channels)) {
+        return false;
+    }
+    for (int block = 1; block < kNBlocks; ++block) {
+        if (!expect_conv_block(loader,
+                               prefix + "conv2." + std::to_string(block) + ".",
+                               out_channels, out_channels)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool validate_checkpoint(const io::SafetensorsLoader& loader) {
+    if (!expect_finite_tensor(loader, "cnn.weight", {3, 16, 3, 3}) ||
+        !expect_finite_tensor(loader, "cnn.bias", {3}) ||
+        !expect_finite_tensor(loader, "fc.0.gru.weight_ih_l0", {768, 384}) ||
+        !expect_finite_tensor(loader, "fc.0.gru.weight_hh_l0", {768, 256}) ||
+        !expect_finite_tensor(loader, "fc.0.gru.bias_ih_l0", {768}) ||
+        !expect_finite_tensor(loader, "fc.0.gru.bias_hh_l0", {768}) ||
+        !expect_finite_tensor(loader, "fc.0.gru.weight_ih_l0_reverse", {768, 384}) ||
+        !expect_finite_tensor(loader, "fc.0.gru.weight_hh_l0_reverse", {768, 256}) ||
+        !expect_finite_tensor(loader, "fc.0.gru.bias_ih_l0_reverse", {768}) ||
+        !expect_finite_tensor(loader, "fc.0.gru.bias_hh_l0_reverse", {768}) ||
+        !expect_finite_tensor(loader, "fc.1.weight", {kNClass, 512}) ||
+        !expect_finite_tensor(loader, "fc.1.bias", {kNClass}) ||
+        !expect_batch_norm(loader, "unet.encoder.bn.", 1)) {
+        return false;
+    }
+
+    constexpr int encoder_in[kEncDeLayers] = {1, 16, 32, 64, 128};
+    constexpr int encoder_out[kEncDeLayers] = {16, 32, 64, 128, 256};
+    for (int layer = 0; layer < kEncDeLayers; ++layer) {
+        if (!expect_encoder_block(
+                loader, "unet.encoder.layers." + std::to_string(layer) + ".",
+                encoder_in[layer], encoder_out[layer])) {
+            return false;
+        }
+    }
+
+    for (int layer = 0; layer < kInterLayers; ++layer) {
+        const int in_channels = layer == 0 ? 256 : 512;
+        if (!expect_encoder_block(
+                loader, "unet.intermediate.layers." + std::to_string(layer) + ".",
+                in_channels, 512)) {
+            return false;
+        }
+    }
+
+    constexpr int decoder_in[kEncDeLayers] = {512, 256, 128, 64, 32};
+    constexpr int decoder_out[kEncDeLayers] = {256, 128, 64, 32, 16};
+    for (int layer = 0; layer < kEncDeLayers; ++layer) {
+        if (!expect_decoder_block(
+                loader, "unet.decoder.layers." + std::to_string(layer) + ".",
+                decoder_in[layer], decoder_out[layer])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // ---- Weight access (zero-copy mmap) ----
 struct Weights {
-    io::SafetensorsLoader loader;
-    bool load(const std::string& p) { return loader.load(p); }
+    const io::SafetensorsLoader* loader = nullptr;
+
     const float* get(const std::string& n) const {
-        const uint8_t* p = loader.data(n);
-        if (!p) fprintf(stderr, "RMVPE: missing tensor '%s'\n", n.c_str());
+        const std::uint8_t* p = loader ? loader->data(n) : nullptr;
+        if (!p) throw std::logic_error("RMVPE validated tensor became unavailable");
         return reinterpret_cast<const float*>(p);
     }
 };
@@ -312,25 +495,43 @@ std::vector<float> bigru(const Weights& w, const std::string& prefix,
 
 }  // namespace
 
-bool RmvpeExtractor::init(const RmvpeConfig& config) {
+void RmvpeExtractor::reset() noexcept {
+    state_.reset();
+    threshold_ = 0.03f;
+}
+
+bool RmvpeExtractor::init(const RmvpeConfig& config) try {
+    // Reinitialization is deliberately invalidating: no old mmap or threshold
+    // remains observable if any part of the replacement checkpoint is invalid.
+    reset();
+    if (config.model_path.empty() || !valid_threshold(config.threshold)) return false;
+
+    auto staged_state = std::make_shared<ModelState>();
+    if (!staged_state->loader.load(config.model_path) ||
+        !validate_checkpoint(staged_state->loader)) {
+        return false;
+    }
+
+    state_ = std::move(staged_state);
     threshold_ = config.threshold;
-    config_ = config;
     return true;
+} catch (...) {
+    reset();
+    return false;
 }
 
 std::vector<float> RmvpeExtractor::infer_salience(const float* audio, int num_samples,
                                                   int& out_frames) {
-    Weights w;
-    if (!w.load(config_.model_path)) {
-        fprintf(stderr, "RMVPE: failed to load '%s'\n", config_.model_path.c_str());
-        out_frames = 0;
-        return {};
-    }
+    out_frames = 0;
+    if (!state_ || !valid_audio_input(audio, num_samples)) return {};
+
+    try {
+    const auto state = state_;
+    Weights w{&state->loader};
 
     // 1. Mel spectrogram [128, T]
     int T = 0;
     auto logmel = mel_spectrogram(audio, num_samples, T);
-    out_frames = T;
 
     // 2. Pad time to multiple of 32. mel is [128, T]; unet input is [1, H=Tpad, W=128].
     int Tpad = 32 * ((T - 1) / 32 + 1);
@@ -340,7 +541,7 @@ std::vector<float> RmvpeExtractor::infer_salience(const float* audio, int num_sa
         for (int m = 0; m < kNMels; ++m)
             x[t * kNMels + m] = logmel[m * T + t];
 
-    int H = Tpad, W = kNMels, C = 1;
+    int H = Tpad, W = kNMels;
 
     // 3. Encoder.bn (1 channel)
     ops::batchnorm2d(x.data(), 1, H, W, w.get("unet.encoder.bn.weight"),
@@ -356,20 +557,15 @@ std::vector<float> RmvpeExtractor::infer_salience(const float* audio, int num_sa
         x = res_encoder_block(w, "unet.encoder.layers." + std::to_string(i) + ".",
                               std::move(x), enc_in[i], enc_out[i], H, W, true, &pre);
         skips.push_back(std::move(pre));
-        C = enc_out[i];
     }
     // After encoder: C=256, H=Tpad/32, W=4
 
     // Intermediate: 4 layers at 256 channels (no pool)
     for (int i = 0; i < kInterLayers; ++i) {
-        int cin = (i == 0) ? 256 : 512;
         // Intermediate first block: in=256 (encoder.out_channel//2), out=512
-        int cout = 512;
         std::vector<float>* no_pre = nullptr;
         x = res_encoder_block(w, "unet.intermediate.layers." + std::to_string(i) + ".",
                               std::move(x), (i == 0 ? 256 : 512), 512, H, W, false, no_pre);
-        C = 512;
-        (void)cin; (void)cout;
     }
 
     // Decoder: 5 layers, channels 512->256->128->64->32->16, concat skips reversed
@@ -379,7 +575,6 @@ std::vector<float> RmvpeExtractor::infer_salience(const float* audio, int num_sa
         const auto& skip = skips[kEncDeLayers - 1 - i];
         x = res_decoder_block(w, "unet.decoder.layers." + std::to_string(i) + ".",
                               std::move(x), dec_in[i], dec_out[i], H, W, skip);
-        C = dec_out[i];
     }
     // After decoder: C=16, H=Tpad, W=128
 
@@ -406,13 +601,21 @@ std::vector<float> RmvpeExtractor::infer_salience(const float* audio, int num_sa
     // Trim to original T frames
     std::vector<float> result(T * kNClass);
     std::memcpy(result.data(), salience.data(), T * kNClass * sizeof(float));
+    if (!all_finite(result)) return {};
+    out_frames = T;
     return result;  // [T, 360]
+    } catch (...) {
+        out_frames = 0;
+        return {};
+    }
 }
 
 std::vector<float> RmvpeExtractor::infer(const float* audio, int num_samples) {
     int T = 0;
     auto salience = infer_salience(audio, num_samples, T);
-    if (T == 0) return {};
+    if (T <= 0 || salience.size() != static_cast<std::size_t>(T) * kNClass) return {};
+
+    try {
 
     // Cents mapping: 20*i + 1997.3794084376191
     std::vector<float> cents_map(kNClass);
@@ -441,16 +644,21 @@ std::vector<float> RmvpeExtractor::infer(const float* audio, int num_samples) {
 
         f0[t] = (cents > 0) ? 10.0f * std::pow(2.0f, cents / 1200.0f) : 0.0f;
     }
-    return f0;
+    return all_finite(f0) ? f0 : std::vector<float>{};
+    } catch (...) {
+        return {};
+    }
 }
 
 std::vector<float> RmvpeExtractor::pitch_shift(const std::vector<float>& f0,
                                                int semitones) {
+    if (semitones < -48 || semitones > 48 || !all_finite(f0)) return {};
+
     std::vector<float> out(f0.size());
-    float factor = std::pow(2.0f, semitones / 12.0f);
+    const float factor = std::pow(2.0f, semitones / 12.0f);
     for (size_t i = 0; i < f0.size(); ++i)
         out[i] = f0[i] > 0 ? f0[i] * factor : 0.0f;
-    return out;
+    return all_finite(out) ? out : std::vector<float>{};
 }
 
 }  // namespace voxmutatio::f0

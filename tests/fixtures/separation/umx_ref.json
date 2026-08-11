@@ -1,0 +1,8 @@
+{
+  "T": 88200,
+  "nb_frames": 87,
+  "nb_bins": 2049,
+  "nb_channels": 2,
+  "n_fft": 4096,
+  "hop": 1024
+}

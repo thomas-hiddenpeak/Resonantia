@@ -5,12 +5,20 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <vector>
 
+#include "test_artifacts.h"
 #include "voxmutatio/io/audio_io.h"
+#include "voxmutatio/io/safetensors.h"
 #include "voxmutatio/separation/roformer.h"
 #include "voxmutatio/separation/separator.h"
 #include "voxmutatio/separation/stft.h"
@@ -18,6 +26,8 @@
 #include "voxmutatio/training/posterior_encoder.h"
 
 namespace {
+namespace fs = std::filesystem;
+
 bool file_exists(const std::string& p) { std::ifstream f(p); return f.good(); }
 std::vector<float> read_bin(const std::string& p) {
   std::ifstream f(p, std::ios::binary | std::ios::ate);
@@ -37,7 +47,326 @@ double rel_err(const std::vector<float>& a, const std::vector<float>& b) {
   }
   return std::sqrt(num / (den + 1e-12));
 }
+
+class ScopedDirectory {
+ public:
+  explicit ScopedDirectory(fs::path path) : path_(std::move(path)) {
+    if (!fs::create_directories(path_)) {
+      throw std::runtime_error("failed to create separation test directory");
+    }
+  }
+  ScopedDirectory(const ScopedDirectory&) = delete;
+  ScopedDirectory& operator=(const ScopedDirectory&) = delete;
+  ~ScopedDirectory() {
+    std::error_code ignored;
+    fs::remove_all(path_, ignored);
+  }
+  const fs::path& path() const { return path_; }
+
+ private:
+  fs::path path_;
+};
+
+std::uint64_t read_u64_le(const char* bytes) {
+  std::uint64_t value = 0;
+  for (int i = 0; i < 8; ++i) {
+    value |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[i])) << (8 * i);
+  }
+  return value;
+}
+
+// Preserve the complete safetensors header and logical file size while leaving
+// the payload as a sparse zero-filled extent. This keeps malformed-model tests
+// small even for the 400+ MiB RoFormer fixture.
+void make_sparse_safetensors_clone(const fs::path& source, const fs::path& destination,
+                                   std::string_view header_from = {},
+                                   std::string_view header_to = {},
+                                   std::string_view nonfinite_tensor = {}) {
+  if (header_from.size() != header_to.size()) {
+    throw std::invalid_argument("safetensors header replacements must preserve length");
+  }
+  std::ifstream in(source, std::ios::binary | std::ios::ate);
+  if (!in) throw std::runtime_error("failed to open source safetensors");
+  const auto file_size = in.tellg();
+  if (file_size < 8) throw std::runtime_error("source safetensors is truncated");
+  in.seekg(0);
+  char length_bytes[8];
+  in.read(length_bytes, sizeof(length_bytes));
+  const std::uint64_t header_size = read_u64_le(length_bytes);
+  if (header_size > static_cast<std::uint64_t>(file_size) - 8) {
+    throw std::runtime_error("source safetensors header is invalid");
+  }
+  std::string prefix(static_cast<std::size_t>(header_size) + 8, '\0');
+  in.seekg(0);
+  in.read(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+  if (!in) throw std::runtime_error("failed to read source safetensors header");
+
+  if (!header_from.empty()) {
+    const auto at = prefix.find(header_from);
+    if (at == std::string::npos) {
+      throw std::runtime_error("expected safetensors header fragment was not found");
+    }
+    prefix.replace(at, header_from.size(), header_to);
+  }
+
+  std::ofstream out(destination, std::ios::binary | std::ios::trunc);
+  if (!out) throw std::runtime_error("failed to create sparse safetensors clone");
+  out.write(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+  out.seekp(file_size - std::streamoff{1});
+  out.put('\0');
+
+  if (!nonfinite_tensor.empty()) {
+    voxmutatio::io::SafetensorsLoader loader;
+    if (!loader.load(source.string())) throw std::runtime_error("failed to parse source tensor");
+    const auto* tensor = loader.get_tensor(std::string(nonfinite_tensor));
+    if (!tensor || tensor->data_nbytes < sizeof(float)) {
+      throw std::runtime_error("requested source tensor is absent");
+    }
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    out.seekp(static_cast<std::streamoff>(tensor->data_offset));
+    out.write(reinterpret_cast<const char*>(&nan), sizeof(nan));
+  }
+  if (!out) throw std::runtime_error("failed to finish sparse safetensors clone");
+}
+
+void copy_roformer_sidecars(const fs::path& source_dir, const fs::path& destination_dir,
+                            std::string_view model) {
+  constexpr std::string_view suffixes[] = {
+      "_config.i64", "_dim_inputs.i64", "_freq_indices.i64",
+      "_num_bands_per_freq.i64"};
+  for (const auto suffix : suffixes) {
+    const std::string filename = std::string(model) + std::string(suffix);
+    fs::copy_file(source_dir / filename, destination_dir / filename,
+                  fs::copy_options::overwrite_existing);
+  }
+}
+
+void write_i64_at(const fs::path& path, std::size_t index, std::int64_t value) {
+  std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+  if (!file) throw std::runtime_error("failed to open i64 sidecar for mutation");
+  file.seekp(static_cast<std::streamoff>(index * sizeof(value)));
+  file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  if (!file) throw std::runtime_error("failed to mutate i64 sidecar");
+}
 }  // namespace
+
+TEST_CASE("Open-Unmix rejects an exact-size tensor with the wrong shape",
+          "[separation][umx][finite-contract]") {
+  using namespace voxmutatio;
+  const fs::path weights = "../models/separation/umxhq_vocals.safetensors";
+  if (!fs::exists(weights)) {
+    WARN("Open-Unmix weights absent; malformed-model contract unverified");
+    return;
+  }
+  const auto path = resonantia_test::unique_artifact_path("umx-wrong-shape", ".safetensors");
+  resonantia_test::ScopedArtifact cleanup(path);
+  make_sparse_safetensors_clone(
+      weights, path,
+      "\"fc2.weight\":{\"dtype\":\"F32\",\"shape\":[512,1024]",
+      "\"fc2.weight\":{\"dtype\":\"F32\",\"shape\":[1024,512]");
+
+  const separation::Separator malformed(path.string());
+  REQUIRE_FALSE(malformed.valid());
+}
+
+TEST_CASE("Open-Unmix rejects NaN and infinite public audio",
+          "[separation][umx][finite-contract]") {
+  using namespace voxmutatio;
+  const std::string weights = "../models/separation/umxhq_vocals.safetensors";
+  if (!file_exists(weights)) {
+    WARN("Open-Unmix weights absent; finite-input contract unverified");
+    return;
+  }
+  const separation::Separator sep(weights);
+  REQUIRE(sep.valid());
+
+  std::vector<float> stereo(static_cast<std::size_t>(2) * sep.n_fft(), 0.0f);
+  stereo.front() = std::numeric_limits<float>::quiet_NaN();
+  REQUIRE_THROWS_AS(sep.separate_stereo(stereo, sep.n_fft()), std::invalid_argument);
+
+  std::vector<float> mono(sep.n_fft(), 0.0f);
+  mono.back() = std::numeric_limits<float>::infinity();
+  REQUIRE_THROWS_AS(
+      sep.separate_mono(mono.data(), static_cast<int>(mono.size()), sep.sample_rate()),
+      std::invalid_argument);
+
+  try {
+    static_cast<void>(sep.run_model({}, std::numeric_limits<int>::max()));
+    FAIL("oversized UMX frame count was accepted");
+  } catch (const std::invalid_argument& error) {
+    CHECK(std::string(error.what()).find("CUDA int limit") != std::string::npos);
+  }
+}
+
+TEST_CASE("RoFormer rejects non-finite weights", "[separation][roformer][finite-contract]") {
+  using namespace voxmutatio;
+  const fs::path source_dir = "../models/separation";
+  constexpr std::string_view model = "dereverb_roformer";
+  if (!fs::exists(source_dir / (std::string(model) + ".safetensors"))) {
+    WARN("RoFormer weights absent; malformed-model contract unverified");
+    return;
+  }
+  ScopedDirectory temp(
+      resonantia_test::unique_artifact_path("roformer-nonfinite", ".models"));
+  copy_roformer_sidecars(source_dir, temp.path(), model);
+  make_sparse_safetensors_clone(
+      source_dir / (std::string(model) + ".safetensors"),
+      temp.path() / (std::string(model) + ".safetensors"), {}, {},
+      "band_split.to_features.0.0.gamma");
+
+  const separation::Roformer malformed(temp.path().string(), std::string(model));
+  REQUIRE_FALSE(malformed.valid());
+}
+
+TEST_CASE("RoFormer rejects a band-count sidecar inconsistent with its frequency map",
+          "[separation][roformer][finite-contract]") {
+  using namespace voxmutatio;
+  const fs::path source_dir = "../models/separation";
+  constexpr std::string_view model = "dereverb_roformer";
+  if (!fs::exists(source_dir / (std::string(model) + ".safetensors"))) {
+    WARN("RoFormer weights absent; sidecar consistency contract unverified");
+    return;
+  }
+  ScopedDirectory temp(
+      resonantia_test::unique_artifact_path("roformer-bad-band-count", ".models"));
+  copy_roformer_sidecars(source_dir, temp.path(), model);
+  make_sparse_safetensors_clone(
+      source_dir / (std::string(model) + ".safetensors"),
+      temp.path() / (std::string(model) + ".safetensors"));
+  write_i64_at(temp.path() /
+                   (std::string(model) + "_num_bands_per_freq.i64"),
+               0, 2);
+
+  const separation::Roformer malformed(temp.path().string(), std::string(model));
+  REQUIRE_FALSE(malformed.valid());
+}
+
+TEST_CASE("RoFormer rejects NaN and infinite public audio",
+          "[separation][roformer][finite-contract]") {
+  using namespace voxmutatio;
+  const std::string dir = "../models/separation";
+  if (!file_exists(dir + "/dereverb_roformer.safetensors")) {
+    WARN("RoFormer weights absent; finite-input contract unverified");
+    return;
+  }
+  const separation::Roformer roformer(dir);
+  REQUIRE(roformer.valid());
+
+  std::vector<float> stereo(static_cast<std::size_t>(2) * roformer.n_fft(), 0.0f);
+  stereo.front() = std::numeric_limits<float>::quiet_NaN();
+  REQUIRE_THROWS_AS(roformer.separate_stereo(stereo, roformer.n_fft()),
+                    std::invalid_argument);
+
+  std::vector<float> mono(roformer.n_fft(), 0.0f);
+  mono.back() = -std::numeric_limits<float>::infinity();
+  REQUIRE_THROWS_AS(roformer.separate_mono(mono.data(), static_cast<int>(mono.size()),
+                                           roformer.sample_rate()),
+                    std::invalid_argument);
+
+  try {
+    static_cast<void>(
+        roformer.debug_blocks_from({}, std::numeric_limits<int>::max()));
+    FAIL("oversized RoFormer frame count was accepted");
+  } catch (const std::invalid_argument& error) {
+    CHECK(std::string(error.what()).find("CUDA int limit") != std::string::npos);
+  }
+}
+
+TEST_CASE("Silero VAD rejects non-finite weights", "[separation][vad][finite-contract]") {
+  using namespace voxmutatio;
+  const fs::path source_dir = "../models/vad";
+  const fs::path source = source_dir / "silero_vad.safetensors";
+  if (!fs::exists(source)) {
+    WARN("VAD weights absent; malformed-model contract unverified");
+    return;
+  }
+  ScopedDirectory temp(resonantia_test::unique_artifact_path("vad-nonfinite", ".models"));
+  const fs::path destination = temp.path() / "silero_vad.safetensors";
+  make_sparse_safetensors_clone(source, destination, {}, {}, "stft.forward_basis_buffer");
+
+  const separation::Vad malformed(temp.path().string());
+  REQUIRE_FALSE(malformed.valid());
+}
+
+TEST_CASE("Silero VAD rejects NaN and infinite public audio",
+          "[separation][vad][finite-contract]") {
+  using namespace voxmutatio;
+  const std::string dir = "../models/vad";
+  if (!file_exists(dir + "/silero_vad.safetensors")) {
+    WARN("VAD weights absent; finite-input contract unverified");
+    return;
+  }
+  const separation::Vad vad(dir);
+  REQUIRE(vad.valid());
+
+  std::vector<float> audio(512, 0.0f);
+  audio.front() = std::numeric_limits<float>::quiet_NaN();
+  REQUIRE_THROWS_AS(vad.probs(audio.data(), static_cast<int>(audio.size())),
+                    std::invalid_argument);
+  audio.front() = std::numeric_limits<float>::infinity();
+  REQUIRE_THROWS_AS(vad.segments(audio.data(), static_cast<int>(audio.size()), 16'000),
+                    std::invalid_argument);
+
+  // Do not let an untrusted length reach the finite-value scan or any int-sized
+  // CUDA launch calculation. Running this against the old implementation would
+  // read beyond `sample`, so the pre-fix evidence is the demonstrated arithmetic.
+  const float sample = 0.0f;
+  REQUIRE_THROWS_AS(vad.probs(&sample, std::numeric_limits<int>::max()),
+                    std::invalid_argument);
+  REQUIRE_THROWS_AS(
+      vad.segments(&sample, std::numeric_limits<int>::max(), 16'000),
+      std::invalid_argument);
+}
+
+TEST_CASE("Silero VAD accepts the full public threshold range",
+          "[separation][vad][finite-contract]") {
+  using namespace voxmutatio;
+  const std::string dir = "../models/vad";
+  if (!file_exists(dir + "/silero_vad.safetensors")) {
+    WARN("VAD weights absent; threshold boundary contract unverified");
+    return;
+  }
+  const separation::Vad vad(dir);
+  REQUIRE(vad.valid());
+  const std::vector<float> silence(512, 0.0f);
+
+  for (const float threshold : {0.0f, 0.1f, 0.15f}) {
+    CAPTURE(threshold);
+    CHECK(vad.segments(silence.data(), static_cast<int>(silence.size()), 16'000,
+                       threshold).empty());
+  }
+  REQUIRE_THROWS_AS(
+      vad.segments(silence.data(), static_cast<int>(silence.size()), 16'000, -0.01f),
+      std::invalid_argument);
+  REQUIRE_THROWS_AS(
+      vad.segments(silence.data(), static_cast<int>(silence.size()), 16'000, 1.01f),
+      std::invalid_argument);
+}
+
+TEST_CASE("STFT rejects unrepresentable public launch dimensions",
+          "[separation][stft][finite-contract]") {
+  using namespace voxmutatio;
+  separation::Stft stft(2, 1, 2, false, 0);
+  const float sample = 0.0f;
+  std::vector<float> re;
+  std::vector<float> im;
+  int frames = 0;
+
+  try {
+    stft.forward(&sample, std::numeric_limits<int>::max(), re, im, frames);
+    FAIL("oversized STFT forward launch was accepted");
+  } catch (const std::invalid_argument& error) {
+    CHECK(std::string(error.what()).find("CUDA int limit") != std::string::npos);
+  }
+
+  try {
+    static_cast<void>(stft.inverse({}, {}, std::numeric_limits<int>::max() - 1,
+                                   std::numeric_limits<int>::max()));
+    FAIL("oversized STFT inverse launch was accepted");
+  } catch (const std::invalid_argument& error) {
+    CHECK(std::string(error.what()).find("CUDA int limit") != std::string::npos);
+  }
+}
 
 TEST_CASE("STFT/iSTFT round-trip reconstructs real audio", "[separation][stft]") {
   using namespace voxmutatio;
@@ -241,6 +570,7 @@ TEST_CASE("MelBand-RoFormer band-split aligns with reference", "[separation][rof
     auto out = rof.separate_stereo(wave, L);
     auto oref = read_bin(fix + "rof_output_wave.bin");
     int Lout = std::min((int)(out.size() / 2), (int)(oref.size() / 2));
+    REQUIRE(Lout > 4096);
     for (float v : out) REQUIRE(std::isfinite(v));
     // energy-weighted rel error over both channels (ignore istft edge frames).
     double n = 0, d = 0;
@@ -249,7 +579,9 @@ TEST_CASE("MelBand-RoFormer band-split aligns with reference", "[separation][rof
         double e = out[(size_t)c * (out.size()/2) + i] - oref[(size_t)c * (oref.size()/2) + i];
         n += e * e; d += (double)oref[(size_t)c*(oref.size()/2)+i] * oref[(size_t)c*(oref.size()/2)+i];
       }
-    std::printf("[roformer] end-to-end de-reverb rel error = %.3e (Lout=%d)\n", std::sqrt(n/(d+1e-12)), Lout);
+    const double e2e_rel = std::sqrt(n / (d + 1e-12));
+    std::printf("[roformer] end-to-end de-reverb rel error = %.3e (Lout=%d)\n", e2e_rel, Lout);
+    CHECK(e2e_rel < 1.5e-1);
   }
 }
 

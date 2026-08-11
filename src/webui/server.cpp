@@ -3,12 +3,23 @@
 
 #include "voxmutatio/webui/server.h"
 
-#include <cstring>
 #include <fstream>
-#include <iostream>
 #include <sstream>
+#include <stdexcept>
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 
 namespace voxmutatio::webui {
+
+class WebServer::Impl {};
+
+WebServer::WebServer() = default;
+WebServer::~WebServer() = default;
+WebServer::WebServer(WebServer&&) noexcept = default;
+WebServer& WebServer::operator=(WebServer&&) noexcept = default;
 
 void HttpResponse::set_json(const std::string& json_str) {
     headers["Content-Type"] = "application/json";
@@ -88,12 +99,10 @@ void WebServer::register_route(HttpMethod method, const std::string& path,
 }
 
 void WebServer::start() {
-    std::cout << "Starting WebServer on " << config_.host 
-              << ":" << config_.port << std::endl;
-    running_ = true;
-    while (running_) {
-        // TODO: accept connections
-    }
+    running_ = false;
+    throw std::logic_error(
+        "voxmutatio::webui::WebServer is deprecated and unsupported; "
+        "run the vc_serve executable and use its HTTP API instead");
 }
 
 void WebServer::stop() {
@@ -117,3 +126,7 @@ void register_vc_api(WebServer& server) {
 }
 
 }  // namespace voxmutatio::webui
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif

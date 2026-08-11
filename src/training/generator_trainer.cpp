@@ -3,14 +3,19 @@
 
 #include "voxmutatio/training/generator_trainer.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include <unistd.h>
+
 #include "voxmutatio/io/safetensors.h"
+#include "checked_weights.h"
 
 namespace voxmutatio::training {
 
@@ -23,32 +28,28 @@ constexpr int kGin = 256;
 // Reconstruct weight_norm weight: weight[o,inner] = g[o]*v[o,inner]/||v[o]||.
 std::vector<float> reconstruct_wn(const io::SafetensorsLoader& L, const std::string& name,
                                   int out_dim, int inner) {
-  const auto* g = reinterpret_cast<const float*>(L.data(name + ".weight_g"));
-  const auto* v = reinterpret_cast<const float*>(L.data(name + ".weight_v"));
-  std::vector<float> out(static_cast<std::size_t>(out_dim) * inner);
-  for (int o = 0; o < out_dim; ++o) {
-    double n2 = 0.0;
-    for (int i = 0; i < inner; ++i) { float x = v[o * inner + i]; n2 += (double)x * x; }
-    float inv = static_cast<float>(1.0 / std::sqrt(n2));
-    for (int i = 0; i < inner; ++i) out[o * inner + i] = g[o] * v[o * inner + i] * inv;
-  }
-  return out;
+  return detail::reconstruct_weight_norm(L, name, out_dim, inner);
 }
 
 std::vector<float> load_plain(const io::SafetensorsLoader& L, const std::string& name,
                               int count) {
-  const auto* p = reinterpret_cast<const float*>(L.data(name));
-  return std::vector<float>(p, p + count);
+  return detail::load_f32(L, name, count);
 }
 
 }  // namespace
 
 bool GeneratorTrainer::init(const std::string& path, int speaker_id) {
+  // A failed re-initialization must never leave the previous checkpoint usable.
+  // Reset before any I/O, and reset again if loading fails after partial GPU
+  // allocation.
+  *this = GeneratorTrainer{};
   io::SafetensorsLoader L;
   if (!L.load(path)) {
     fprintf(stderr, "GeneratorTrainer: cannot load %s\n", path.c_str());
     return false;
   }
+  try {
+  const float* speaker_embeddings = detail::require_speaker_embedding(L, speaker_id, kGin);
   const std::string P = "model.dec.";
 
   auto param = [&](std::vector<float> host, std::vector<int> shape) {
@@ -62,13 +63,14 @@ bool GeneratorTrainer::init(const std::string& path, int speaker_id) {
   {
     auto pre_b = load_plain(L, P + "conv_pre.bias", 512);
     // cond(g): Conv1d(256,512,1). g = emb_g[sid].
-    const auto* emb_g = reinterpret_cast<const float*>(L.data("model.emb_g.weight"));
-    const auto* cw = reinterpret_cast<const float*>(L.data(P + "cond.weight"));  // [512,256,1]
-    const auto* cb = reinterpret_cast<const float*>(L.data(P + "cond.bias"));
+    const float* cw = detail::require_f32(L, P + "cond.weight", 512 * kGin);
+    const float* cb = detail::require_f32(L, P + "cond.bias", 512);
     cond_g_init_.assign(512, 0.0f);
     for (int co = 0; co < 512; ++co) {
       float s = cb[co];
-      for (int ci = 0; ci < kGin; ++ci) s += cw[co * kGin + ci] * emb_g[speaker_id * kGin + ci];
+      for (int ci = 0; ci < kGin; ++ci)
+        s += cw[co * kGin + ci] * speaker_embeddings[speaker_id * kGin + ci];
+      if (!std::isfinite(s)) throw std::runtime_error("non-finite folded speaker condition");
       cond_g_init_[co] = s;
       pre_b[co] += s;
     }
@@ -112,7 +114,13 @@ bool GeneratorTrainer::init(const std::string& path, int speaker_id) {
   }
 
   conv_post_w_ = param(load_plain(L, P + "conv_post.weight", 32 * 7), {1, 32, 7});
+  initialized_ = true;
   return true;
+  } catch (const std::exception& error) {
+    *this = GeneratorTrainer{};
+    fprintf(stderr, "GeneratorTrainer: invalid checkpoint: %s\n", error.what());
+    return false;
+  }
 }
 
 ag::Tensor GeneratorTrainer::resblock(const ag::Tensor& xn, int idx, int C, int L,
@@ -131,6 +139,9 @@ ag::Tensor GeneratorTrainer::resblock(const ag::Tensor& xn, int idx, int C, int 
 }
 
 ag::Tensor GeneratorTrainer::decode(const ag::Tensor& z, const ag::Tensor& har, int T) {
+  if (!initialized_) {
+    throw std::logic_error("GeneratorTrainer is not initialized");
+  }
   const int rates[4] = {10, 10, 2, 2}, kk[4] = {16, 16, 4, 4};
   const int rbk[3] = {3, 7, 11};
   const int rbd[3][3] = {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}};
@@ -207,20 +218,52 @@ bool write_safetensors(const std::string& path, const std::vector<Entry>& entrie
   }
   json += "}";
 
-  std::FILE* f = std::fopen(path.c_str(), "wb");
-  if (!f) return false;
-  uint64_t hlen = json.size();
-  std::fwrite(&hlen, sizeof(uint64_t), 1, f);
-  std::fwrite(json.data(), 1, json.size(), f);
-  for (const auto& e : entries)
-    std::fwrite(e.data.data(), sizeof(float), e.data.size(), f);
-  std::fclose(f);
+  static_assert(std::endian::native == std::endian::little,
+                "safetensors F32 export requires a little-endian host");
+  std::string temporary = path + ".tmp.XXXXXX";
+  std::vector<char> temporary_name(temporary.begin(), temporary.end());
+  temporary_name.push_back('\0');
+  const int fd = mkstemp(temporary_name.data());
+  if (fd < 0) return false;
+  std::FILE* f = fdopen(fd, "wb");
+  if (!f) {
+    close(fd);
+    unlink(temporary_name.data());
+    return false;
+  }
+
+  const auto write_exact = [&](const void* data, std::size_t bytes) {
+    return bytes == 0 || std::fwrite(data, 1, bytes, f) == bytes;
+  };
+  const std::uint64_t hlen = json.size();
+  unsigned char header_length[8];
+  for (int i = 0; i < 8; ++i)
+    header_length[i] = static_cast<unsigned char>((hlen >> (8 * i)) & 0xffu);
+
+  bool ok = write_exact(header_length, sizeof(header_length)) &&
+            write_exact(json.data(), json.size());
+  for (const auto& e : entries) {
+    if (e.data.size() > std::numeric_limits<std::size_t>::max() / sizeof(float) ||
+        !write_exact(e.data.data(), e.data.size() * sizeof(float))) {
+      ok = false;
+      break;
+    }
+  }
+  if (ok && std::fflush(f) != 0) ok = false;
+  if (std::ferror(f)) ok = false;
+  if (ok && fsync(fd) != 0) ok = false;
+  if (std::fclose(f) != 0) ok = false;
+  if (!ok || rename(temporary_name.data(), path.c_str()) != 0) {
+    unlink(temporary_name.data());
+    return false;
+  }
   return true;
 }
 
 }  // namespace
 
 bool GeneratorTrainer::export_model(const std::string& src, const std::string& out) {
+  if (!initialized_) return false;
   io::SafetensorsLoader L;
   if (!L.load(src)) return false;
 

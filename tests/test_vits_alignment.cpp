@@ -77,6 +77,7 @@ TEST_CASE("VITS TextEncoder alignment (m_p)", "[vits][alignment][encp]") {
 
     SynthesizerConfig cfg;
     cfg.model_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+    cfg.version = voxmutatio::ModelVersion::kV2;
     Synthesizer synth;
     REQUIRE(synth.init(cfg));
 
@@ -101,6 +102,7 @@ TEST_CASE("VITS Flow alignment (z)", "[vits][alignment][flow]") {
 
     SynthesizerConfig cfg;
     cfg.model_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+    cfg.version = voxmutatio::ModelVersion::kV2;
     Synthesizer synth;
     REQUIRE(synth.init(cfg));
 
@@ -124,6 +126,7 @@ TEST_CASE("VITS full inference alignment (audio, SC-003)", "[vits][alignment][au
 
     SynthesizerConfig cfg;
     cfg.model_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+    cfg.version = voxmutatio::ModelVersion::kV2;
     Synthesizer synth;
     REQUIRE(synth.init(cfg));
 

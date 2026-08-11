@@ -1,0 +1,36 @@
+// Copyright 2024 Resonantia Authors.
+// Licensed under the MIT License.
+
+#pragma once
+
+#include <iosfwd>
+#include <string>
+
+#include "tools/app_support/command.h"
+
+namespace voxmutatio::app_support {
+
+struct VcTrainOptions {
+    std::string hubert_path;
+    std::string rmvpe_path;
+    std::string pretrained_path;
+    std::string target_path;
+    std::string output_path;
+    std::string discriminator_path;
+    int speaker = 0;
+    int steps = 300;
+    int segment_frames = 40;
+    int epochs = 0;
+    unsigned seed = 0;
+    float learning_rate = 2e-4f;
+    float learning_rate_decay = 0.999875f;
+    bool gan_mode = false;
+};
+
+[[nodiscard]] ParseStatus parse_vc_train_options(
+    int argc, char* const argv[], VcTrainOptions& options,
+    std::ostream& output, std::ostream& error);
+
+[[nodiscard]] int run_vc_train(VcTrainOptions options);
+
+}  // namespace voxmutatio::app_support

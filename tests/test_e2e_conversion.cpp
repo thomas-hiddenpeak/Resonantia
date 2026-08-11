@@ -16,6 +16,7 @@
 
 #include "voxmutatio/pipeline/pipeline.h"
 #include "voxmutatio/io/audio_io.h"
+#include "test_artifacts.h"
 
 namespace {
 
@@ -100,11 +101,14 @@ TEST_CASE("End-to-end voice conversion (real audio)", "[e2e][integration]") {
     double corr = correlation(result.audio.data, ref);
     std::cout << "End-to-end waveform correlation: " << corr << std::endl;
 
-    // Write the output for manual inspection
-    io::write_audio("../tests/fixtures/e2e_cpp_output.wav",
-                    result.audio.data.data(),
-                    static_cast<int>(result.audio.data.size()),
-                    result.audio.sample_rate, "wav");
+    // Write the output into the build's diagnostic artifact directory rather
+    // than modifying the source fixture tree.
+    const auto output_path =
+        resonantia_test::artifact_path("e2e_cpp_output.wav");
+    REQUIRE(io::write_audio(output_path.string(), result.audio.data.data(),
+                            static_cast<int>(result.audio.data.size()),
+                            result.audio.sample_rate, "wav"));
+    std::cout << "Diagnostic audio: " << output_path << std::endl;
 
     // The full C++ chain should closely match the Python reference.
     CHECK(corr > 0.99);
