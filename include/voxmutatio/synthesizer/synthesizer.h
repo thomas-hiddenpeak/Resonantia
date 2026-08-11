@@ -52,10 +52,24 @@ struct SynthesizerConfig {
     bool half_precision = false;
 };
 
-/// VITS voice synthesizer with NSF (Harmonic + Noisy) vocoder
+/// VITS voice synthesizer with NSF (Harmonic + Noisy) vocoder.
+///
+/// Operations are synchronous. Public initialization, inference, streaming,
+/// and debug entry points fail closed: host allocation, model/I/O, CUDA,
+/// standard-library, and unknown internal exceptions never cross this API.
 class Synthesizer {
 public:
-    /// Initialize and load model weights
+    /// Fixed resource envelope for the supported VITS checkpoint architecture.
+    static constexpr std::size_t kMaxCheckpointBytes = 256U * 1024U * 1024U;
+
+    /// Initialize and load model weights.
+    ///
+    /// The checkpoint must fit kMaxCheckpointBytes and is copied into an
+    /// instance-owned read-only anonymous mapping. A successful initialization
+    /// therefore makes roughly the checkpoint file size resident in host
+    /// memory. Copies of Synthesizer share that immutable snapshot. Any failure
+    /// returns false and leaves the object uninitialized, including when
+    /// replacing a previously valid checkpoint.
     bool init(const SynthesizerConfig& config);
 
     /// Infer (synthesize audio from content features)
@@ -63,7 +77,8 @@ public:
     /// has_f0=false, so features, pitch and pitchf must all be non-null here.
     /// features: [1, T, 256(v1)/768(v2)], pitch/pitchf: [1, T].
     /// NaN/Inf inputs and non-finite synthesized output fail closed with an
-    /// empty AudioBuffer, consistent with other invalid inference inputs.
+    /// empty AudioBuffer at the current model sample rate, consistent with
+    /// invalid inputs and internal execution failures.
     /// speaker_id: speaker embedding index
     /// Returns synthesized audio at model's native sample rate
     AudioBuffer infer(const float* features, int frames,
@@ -72,7 +87,8 @@ public:
 
     /// Legacy windowed helper: runs full inference, then crops the result using
     /// 100 Hz frame windows. It retains no cross-call state and is not a
-    /// real-time streaming session.
+    /// real-time streaming session. Invalid inputs or internal failures return
+    /// an empty AudioBuffer at the current model sample rate.
     AudioBuffer infer_stream(const float* features, int frames,
                              const float* pitch, const float* pitchf,
                              int speaker_id,
@@ -99,37 +115,46 @@ public:
     }
 
     /// Test hook: run TextEncoder only, return m_p [inter_channels, T].
+    /// Invalid inputs or internal failures return an empty vector.
     std::vector<float> debug_text_encoder(const float* features, int frames,
                                           const int* pitch_coarse);
 
     /// Test hook: run TextEncoder + Flow, return z [inter_channels, T].
+    /// Invalid inputs or internal failures return an empty vector.
     std::vector<float> debug_flow(const float* features, int frames,
                                   const int* pitch_coarse, int speaker_id);
 
     /// Test hook: sine source har [T*upp].
+    /// Invalid inputs or internal failures return an empty vector.
     std::vector<float> debug_har(const float* f0, int frames);
 
     /// Test hook: conv_pre + cond output [512, T].
+    /// Invalid inputs or internal failures return an empty vector.
     std::vector<float> debug_convpre(const float* z, int frames, int speaker_id);
 
     /// Test hook: generator intermediates. which: 0=ups0, 1=noiseconv0, 2=stage0.
+    /// Invalid inputs or internal failures return an empty vector.
     std::vector<float> debug_gen_stage0(const float* z, const float* f0,
                                         int frames, int speaker_id, int which);
 
     /// Test hook: full generator (z + f0 -> audio [frames*400]).
+    /// Invalid inputs or internal failures return an empty vector.
     std::vector<float> debug_decode(const float* z, const float* f0,
                                     int frames, int speaker_id);
 
     /// Test hook: prior encoder stats m_p, logs_p [inter, T] each (concatenated).
+    /// Invalid inputs or internal failures return an empty vector.
     std::vector<float> debug_encp(const float* features, int frames,
                                   const int* pitch_coarse, bool want_logs);
 
     /// Test hook: inference flow (reverse) applied to x [inter, T] -> [inter, T].
+    /// Invalid inputs or internal failures return an empty vector.
     std::vector<float> debug_flow_reverse(const float* x, int frames, int speaker_id);
 
 private:
     struct ModelState;
     [[nodiscard]] bool checkpoint_current() const;
+    void reset() noexcept;
 
     SynthesizerConfig config_;
     std::shared_ptr<const ModelState> model_state_;

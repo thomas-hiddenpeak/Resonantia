@@ -8,7 +8,16 @@
 
 namespace voxmutatio::index {
 
-/// Memory-mapped exact Flat Index for feature retrieval (zero FAISS dependency)
+/// Immutable-snapshot exact Flat Index for feature retrieval (zero FAISS
+/// dependency).
+///
+/// load() copies or reflinks the validated source into a private, unlinked
+/// disk-backed snapshot. Search retains the existing mmap exact-scan behavior,
+/// while later replacement, truncation, or overwrite of the source path cannot
+/// mutate the active index or raise SIGBUS. The snapshot consumes index-sized
+/// temporary filesystem capacity when copy-on-write cloning is unavailable
+/// (which may be memory/swap-backed on tmpfs), but does not explicitly allocate
+/// an index-sized anonymous-memory duplicate.
 class CudaFlatIndex {
 public:
     CudaFlatIndex() = default;
@@ -21,7 +30,7 @@ public:
     bool load(const std::string& path);
 
     /// Search K nearest neighbors for each query vector without duplicating the
-    /// memory-mapped database in device memory.
+    /// database in device memory.
     /// queries: [N, dim] row-major
     /// Returns {distances, indices} each [N, K] row-major
     std::pair<std::vector<float>, std::vector<int64_t>>
@@ -54,8 +63,8 @@ private:
     void release() noexcept;
 
     const float* data_ = nullptr; // points into map_base_ (past 16-byte header)
-    void* map_base_ = nullptr;     // mmap base (whole file)
-    std::size_t map_size_ = 0;     // mmap size
+    void* map_base_ = nullptr;     // mmap base of the private disk snapshot
+    std::size_t map_size_ = 0;
     int64_t ntotal_ = 0;
     int dim_ = 0;
 };

@@ -35,6 +35,8 @@ required_files=(
   "docs/adr/0001-modular-runtime-and-orchestration-boundaries.md"
   "docs/adr/0002-persistent-streaming-runtime-and-local-audio-boundary.md"
   "docs/adr/0003-retire-legacy-embedded-webserver.md"
+  "docs/adr/0004-bounded-offline-file-conversion.md"
+  "docs/adr/0005-immutable-flat-index-snapshot.md"
 )
 
 failed=0
@@ -116,6 +118,8 @@ link_documents=(
   "docs/adr/0001-modular-runtime-and-orchestration-boundaries.md"
   "docs/adr/0002-persistent-streaming-runtime-and-local-audio-boundary.md"
   "docs/adr/0003-retire-legacy-embedded-webserver.md"
+  "docs/adr/0004-bounded-offline-file-conversion.md"
+  "docs/adr/0005-immutable-flat-index-snapshot.md"
 )
 markdown_link_pattern='\]\(([^)]*)\)'
 

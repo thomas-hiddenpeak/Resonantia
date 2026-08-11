@@ -9,6 +9,14 @@
 
 namespace voxmutatio::synthesizer::ops {
 
+// Contract for all operations: borrowed input/weight pointers are non-null
+// except an explicitly optional bias. Dimensions, stride, dilation, and groups
+// are positive; padding is nonnegative; grouped-convolution channel counts are
+// divisible by groups; and LeakyReLU slope is finite. Invalid structural
+// arguments throw std::invalid_argument, unrepresentable output, tensor/index,
+// or grid sizes throw std::length_error, and CUDA execution failures throw
+// std::runtime_error before an output is returned.
+
 /// General 1D convolution (channels-first).
 /// input: [Cin, L], weight: [Cout, Cin/groups, K], bias: [Cout] or nullptr.
 /// Returns [Cout, out_len], out_len = (L + 2*pad - dilation*(K-1) - 1)/stride + 1.

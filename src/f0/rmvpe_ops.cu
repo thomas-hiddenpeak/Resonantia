@@ -7,10 +7,16 @@
 
 #include "voxmutatio/core/cuda_buffer.h"
 
+#if defined(VOXMUTATIO_TEST_CUDA_FAILURE_INJECTION)
+#include "cuda_failure_injection.h"
+#endif
+
 #include <cuda_runtime.h>
 
 #include <cmath>
 #include <cstdio>
+#include <initializer_list>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -27,6 +33,60 @@ inline void cuda_check(cudaError_t e, const char* file, int line) {
     }
 }
 #define CK(e) cuda_check((e), __FILE__, __LINE__)
+
+// In production these expand directly to the CUDA runtime calls and add no
+// fault-seam branch or synchronization. The private test build intercepts them
+// and performs an explicit post-launch synchronization for independent fault
+// injection; production keeps the existing blocking D2H copy boundary.
+#if defined(VOXMUTATIO_TEST_CUDA_FAILURE_INJECTION)
+#define CUDA_COPY(...) resonantia_test::cuda_failure::copy(__VA_ARGS__)
+#define BEFORE_KERNEL_LAUNCH() CK(resonantia_test::cuda_failure::before_launch())
+#define AFTER_KERNEL_LAUNCH()                                      \
+    do {                                                           \
+        CK(cudaGetLastError());                                    \
+        CK(resonantia_test::cuda_failure::synchronize());          \
+    } while (false)
+#else
+#define CUDA_COPY(...) cudaMemcpy(__VA_ARGS__)
+#define BEFORE_KERNEL_LAUNCH() ((void)0)
+#define AFTER_KERNEL_LAUNCH() CK(cudaGetLastError())
+#endif
+
+constexpr int kMaxGridYZ = 65'535;
+
+void require_pointer(const void* pointer, const char* operation) {
+    if (!pointer) {
+        throw std::invalid_argument(std::string(operation) +
+                                    " requires a non-null borrowed pointer");
+    }
+}
+
+std::size_t checked_element_count(std::initializer_list<int> dimensions,
+                                  const char* operation) {
+    std::size_t count = 1;
+    constexpr std::size_t kMaxElements =
+        static_cast<std::size_t>(std::numeric_limits<int>::max());
+    for (const int dimension : dimensions) {
+        if (dimension <= 0) {
+            throw std::invalid_argument(std::string(operation) +
+                                        " requires positive dimensions");
+        }
+        if (count > kMaxElements / static_cast<std::size_t>(dimension)) {
+            throw std::length_error(std::string(operation) +
+                                    " tensor exceeds INT_MAX elements");
+        }
+        count *= static_cast<std::size_t>(dimension);
+    }
+    return count;
+}
+
+void require_grid_yz_extent(int extent, int block, const char* operation) {
+    const int blocks = 1 + (extent - 1) / block;
+    if (blocks > kMaxGridYZ) {
+        throw std::length_error(std::string(operation) +
+                                " launch exceeds CUDA y/z grid extent");
+    }
+}
 
 // Conv2d NxN, stride 1, padding P. input [Cin,H,W], weight [Cout,Cin,K,K].
 __global__ void conv2d_kernel(const float* input, const float* weight,
@@ -127,28 +187,37 @@ __global__ void conv_transpose_kernel(const float* input, const float* weight,
 std::vector<float> conv2d_generic(const float* input, int Cin, int H, int W,
                                   const float* weight, const float* bias,
                                   int Cout, int K, int P) {
-    int in_size = Cin * H * W;
-    int w_size = Cout * Cin * K * K;
-    int out_size = Cout * H * W;
+    require_pointer(input, "RMVPE conv2d");
+    require_pointer(weight, "RMVPE conv2d");
+    const std::size_t in_size =
+        checked_element_count({Cin, H, W}, "RMVPE conv2d input");
+    const std::size_t w_size =
+        checked_element_count({Cout, Cin, K, K}, "RMVPE conv2d weights");
+    const std::size_t out_size =
+        checked_element_count({Cout, H, W}, "RMVPE conv2d output");
+    require_grid_yz_extent(H, 16, "RMVPE conv2d");
+    require_grid_yz_extent(Cout, 1, "RMVPE conv2d");
     std::vector<float> output(out_size);
 
-    core::CudaBuffer d_in(static_cast<std::size_t>(in_size));
-    core::CudaBuffer d_w(static_cast<std::size_t>(w_size));
+    core::CudaBuffer d_in(in_size);
+    core::CudaBuffer d_w(w_size);
     core::CudaBuffer d_b;
-    core::CudaBuffer d_out(static_cast<std::size_t>(out_size));
-    CK(cudaMemcpy(d_in.data(), input, in_size * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_w.data(), weight, w_size * sizeof(float), cudaMemcpyHostToDevice));
+    core::CudaBuffer d_out(out_size);
+    CK(CUDA_COPY(d_in.data(), input, in_size * sizeof(float), cudaMemcpyHostToDevice));
+    CK(CUDA_COPY(d_w.data(), weight, w_size * sizeof(float), cudaMemcpyHostToDevice));
     if (bias) {
         d_b.allocate(static_cast<std::size_t>(Cout));
-        CK(cudaMemcpy(d_b.data(), bias, Cout * sizeof(float), cudaMemcpyHostToDevice));
+        CK(CUDA_COPY(d_b.data(), bias, Cout * sizeof(float), cudaMemcpyHostToDevice));
     }
 
     dim3 block(16, 16);
-    dim3 grid((W + 15) / 16, (H + 15) / 16, Cout);
+    dim3 grid(1 + (W - 1) / 16, 1 + (H - 1) / 16, Cout);
+    BEFORE_KERNEL_LAUNCH();
     conv2d_kernel<<<grid, block>>>(d_in.data(), d_w.data(), d_b.data(), d_out.data(),
                                    Cin, H, W, Cout, K, P);
-    CK(cudaMemcpy(output.data(), d_out.data(), out_size * sizeof(float),
-                  cudaMemcpyDeviceToHost));
+    AFTER_KERNEL_LAUNCH();
+    CK(CUDA_COPY(output.data(), d_out.data(), out_size * sizeof(float),
+                 cudaMemcpyDeviceToHost));
     return output;
 }
 
@@ -167,82 +236,151 @@ std::vector<float> conv2d_1x1(const float* input, int Cin, int H, int W,
 void batchnorm2d(float* data, int C, int H, int W,
                  const float* gamma, const float* beta,
                  const float* mean, const float* var, float eps) {
-    int HW = H * W;
-    int total = C * HW;
-    core::CudaBuffer d_data(static_cast<std::size_t>(total));
+    require_pointer(data, "RMVPE batchnorm2d");
+    require_pointer(gamma, "RMVPE batchnorm2d");
+    require_pointer(beta, "RMVPE batchnorm2d");
+    require_pointer(mean, "RMVPE batchnorm2d");
+    require_pointer(var, "RMVPE batchnorm2d");
+    if (!std::isfinite(eps) || eps <= 0.0f) {
+        throw std::invalid_argument("RMVPE batchnorm2d requires finite positive epsilon");
+    }
+    const std::size_t hw_count =
+        checked_element_count({H, W}, "RMVPE batchnorm2d plane");
+    const std::size_t total_count =
+        checked_element_count({C, H, W}, "RMVPE batchnorm2d input");
+    const int HW = static_cast<int>(hw_count);
+    const int total = static_cast<int>(total_count);
+    core::CudaBuffer d_data(total_count);
     core::CudaBuffer d_g(static_cast<std::size_t>(C));
     core::CudaBuffer d_be(static_cast<std::size_t>(C));
     core::CudaBuffer d_m(static_cast<std::size_t>(C));
     core::CudaBuffer d_v(static_cast<std::size_t>(C));
-    CK(cudaMemcpy(d_data.data(), data, total * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_g.data(), gamma, C * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_be.data(), beta, C * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_m.data(), mean, C * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_v.data(), var, C * sizeof(float), cudaMemcpyHostToDevice));
+    CK(CUDA_COPY(d_data.data(), data, total * sizeof(float), cudaMemcpyHostToDevice));
+    CK(CUDA_COPY(d_g.data(), gamma, C * sizeof(float), cudaMemcpyHostToDevice));
+    CK(CUDA_COPY(d_be.data(), beta, C * sizeof(float), cudaMemcpyHostToDevice));
+    CK(CUDA_COPY(d_m.data(), mean, C * sizeof(float), cudaMemcpyHostToDevice));
+    CK(CUDA_COPY(d_v.data(), var, C * sizeof(float), cudaMemcpyHostToDevice));
 
-    int block = 256, grid = (total + block - 1) / block;
+    int block = 256, grid = 1 + (total - 1) / block;
+    BEFORE_KERNEL_LAUNCH();
     batchnorm_kernel<<<grid, block>>>(d_data.data(), C, HW, d_g.data(), d_be.data(),
                                       d_m.data(), d_v.data(), eps);
-    CK(cudaMemcpy(data, d_data.data(), total * sizeof(float), cudaMemcpyDeviceToHost));
+    AFTER_KERNEL_LAUNCH();
+    CK(CUDA_COPY(data, d_data.data(), total * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 void relu_inplace(float* data, int size) {
+    require_pointer(data, "RMVPE relu");
+    checked_element_count({size}, "RMVPE relu input");
     core::CudaBuffer d_data(static_cast<std::size_t>(size));
-    CK(cudaMemcpy(d_data.data(), data, size * sizeof(float), cudaMemcpyHostToDevice));
-    int block = 256, grid = (size + block - 1) / block;
+    CK(CUDA_COPY(d_data.data(), data, size * sizeof(float), cudaMemcpyHostToDevice));
+    int block = 256, grid = 1 + (size - 1) / block;
+    BEFORE_KERNEL_LAUNCH();
     relu_kernel<<<grid, block>>>(d_data.data(), size);
-    CK(cudaMemcpy(data, d_data.data(), size * sizeof(float), cudaMemcpyDeviceToHost));
+    AFTER_KERNEL_LAUNCH();
+    CK(CUDA_COPY(data, d_data.data(), size * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 void sigmoid_inplace(float* data, int size) {
+    require_pointer(data, "RMVPE sigmoid");
+    checked_element_count({size}, "RMVPE sigmoid input");
     core::CudaBuffer d_data(static_cast<std::size_t>(size));
-    CK(cudaMemcpy(d_data.data(), data, size * sizeof(float), cudaMemcpyHostToDevice));
-    int block = 256, grid = (size + block - 1) / block;
+    CK(CUDA_COPY(d_data.data(), data, size * sizeof(float), cudaMemcpyHostToDevice));
+    int block = 256, grid = 1 + (size - 1) / block;
+    BEFORE_KERNEL_LAUNCH();
     sigmoid_kernel<<<grid, block>>>(d_data.data(), size);
-    CK(cudaMemcpy(data, d_data.data(), size * sizeof(float), cudaMemcpyDeviceToHost));
+    AFTER_KERNEL_LAUNCH();
+    CK(CUDA_COPY(data, d_data.data(), size * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 std::vector<float> avgpool2d(const float* input, int C, int H, int W,
                              int kh, int kw) {
-    int OH = H / kh, OW = W / kw;
-    std::vector<float> output(C * OH * OW);
-    core::CudaBuffer d_in(static_cast<std::size_t>(C) * H * W);
-    core::CudaBuffer d_out(static_cast<std::size_t>(C) * OH * OW);
-    CK(cudaMemcpy(d_in.data(), input, C * H * W * sizeof(float), cudaMemcpyHostToDevice));
+    require_pointer(input, "RMVPE avgpool2d");
+    const std::size_t input_count =
+        checked_element_count({C, H, W}, "RMVPE avgpool2d input");
+    if (kh <= 0 || kw <= 0 || kh > H || kw > W) {
+        throw std::invalid_argument(
+            "RMVPE avgpool2d requires a positive kernel within the input");
+    }
+    const int OH = H / kh;
+    const int OW = W / kw;
+    const std::size_t output_count =
+        checked_element_count({C, OH, OW}, "RMVPE avgpool2d output");
+    require_grid_yz_extent(OH, 16, "RMVPE avgpool2d");
+    require_grid_yz_extent(C, 1, "RMVPE avgpool2d");
+    std::vector<float> output(output_count);
+    core::CudaBuffer d_in(input_count);
+    core::CudaBuffer d_out(output_count);
+    CK(CUDA_COPY(d_in.data(), input, input_count * sizeof(float), cudaMemcpyHostToDevice));
     dim3 block(16, 16);
-    dim3 grid((OW + 15) / 16, (OH + 15) / 16, C);
+    dim3 grid(1 + (OW - 1) / 16, 1 + (OH - 1) / 16, C);
+    BEFORE_KERNEL_LAUNCH();
     avgpool_kernel<<<grid, block>>>(d_in.data(), d_out.data(), C, H, W, kh, kw, OH, OW);
-    CK(cudaMemcpy(output.data(), d_out.data(), C * OH * OW * sizeof(float),
-                  cudaMemcpyDeviceToHost));
+    AFTER_KERNEL_LAUNCH();
+    CK(CUDA_COPY(output.data(), d_out.data(), output_count * sizeof(float),
+                 cudaMemcpyDeviceToHost));
     return output;
 }
 
 std::vector<float> conv_transpose2d_s2(const float* input, int Cin, int H, int W,
                                        const float* weight, int Cout) {
-    int K = 3, stride = 2, pad = 1;
-    int OH = 2 * H, OW = 2 * W;  // (H-1)*2 - 2 + 3 + 1 = 2H
-    std::vector<float> output(Cout * OH * OW);
-    int w_size = Cin * Cout * K * K;
-    core::CudaBuffer d_in(static_cast<std::size_t>(Cin) * H * W);
-    core::CudaBuffer d_w(static_cast<std::size_t>(w_size));
-    core::CudaBuffer d_out(static_cast<std::size_t>(Cout) * OH * OW);
-    CK(cudaMemcpy(d_in.data(), input, Cin * H * W * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_w.data(), weight, w_size * sizeof(float), cudaMemcpyHostToDevice));
+    require_pointer(input, "RMVPE conv_transpose2d");
+    require_pointer(weight, "RMVPE conv_transpose2d");
+    constexpr int K = 3;
+    constexpr int stride = 2;
+    constexpr int pad = 1;
+    const std::size_t input_count =
+        checked_element_count({Cin, H, W}, "RMVPE conv_transpose2d input");
+    if (H > std::numeric_limits<int>::max() / 2 ||
+        W > std::numeric_limits<int>::max() / 2) {
+        throw std::length_error("RMVPE conv_transpose2d output extent exceeds int range");
+    }
+    const int OH = 2 * H;
+    const int OW = 2 * W;  // (H-1)*2 - 2 + 3 + 1 = 2H
+    const std::size_t weight_count =
+        checked_element_count({Cin, Cout, K, K}, "RMVPE conv_transpose2d weights");
+    const std::size_t output_count =
+        checked_element_count({Cout, OH, OW}, "RMVPE conv_transpose2d output");
+    require_grid_yz_extent(OH, 16, "RMVPE conv_transpose2d");
+    require_grid_yz_extent(Cout, 1, "RMVPE conv_transpose2d");
+    std::vector<float> output(output_count);
+    core::CudaBuffer d_in(input_count);
+    core::CudaBuffer d_w(weight_count);
+    core::CudaBuffer d_out(output_count);
+    CK(CUDA_COPY(d_in.data(), input, input_count * sizeof(float), cudaMemcpyHostToDevice));
+    CK(CUDA_COPY(d_w.data(), weight, weight_count * sizeof(float), cudaMemcpyHostToDevice));
     dim3 block(16, 16);
-    dim3 grid((OW + 15) / 16, (OH + 15) / 16, Cout);
+    dim3 grid(1 + (OW - 1) / 16, 1 + (OH - 1) / 16, Cout);
+    BEFORE_KERNEL_LAUNCH();
     conv_transpose_kernel<<<grid, block>>>(d_in.data(), d_w.data(), d_out.data(), Cin, H, W,
                                            Cout, OH, OW, K, stride, pad);
-    CK(cudaMemcpy(output.data(), d_out.data(), Cout * OH * OW * sizeof(float),
-                  cudaMemcpyDeviceToHost));
+    AFTER_KERNEL_LAUNCH();
+    CK(CUDA_COPY(output.data(), d_out.data(), output_count * sizeof(float),
+                 cudaMemcpyDeviceToHost));
     return output;
 }
 
 std::vector<float> concat_channels(const float* a, int Ca,
                                     const float* b, int Cb, int H, int W) {
-    std::vector<float> out((Ca + Cb) * H * W);
-    std::copy(a, a + Ca * H * W, out.begin());
-    std::copy(b, b + Cb * H * W, out.begin() + Ca * H * W);
+    require_pointer(a, "RMVPE concat_channels");
+    require_pointer(b, "RMVPE concat_channels");
+    const std::size_t a_count =
+        checked_element_count({Ca, H, W}, "RMVPE concat first input");
+    const std::size_t b_count =
+        checked_element_count({Cb, H, W}, "RMVPE concat second input");
+    if (Ca > std::numeric_limits<int>::max() - Cb) {
+        throw std::length_error("RMVPE concat channel count exceeds int range");
+    }
+    const std::size_t output_count = checked_element_count(
+        {Ca + Cb, H, W}, "RMVPE concat output");
+    std::vector<float> out(output_count);
+    std::copy(a, a + a_count, out.begin());
+    std::copy(b, b + b_count, out.begin() + a_count);
     return out;
 }
 
 }  // namespace voxmutatio::f0::ops
+
+#undef AFTER_KERNEL_LAUNCH
+#undef BEFORE_KERNEL_LAUNCH
+#undef CUDA_COPY

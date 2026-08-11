@@ -17,18 +17,50 @@ namespace voxmutatio::pipeline {
 /// End-to-end voice conversion pipeline
 ///
 /// Orchestrates: Audio I/O → Resample → Content → F0 → Index → Synthesizer → Resample → Output
+/// A pipeline instance is not thread-safe. Callers must externally serialize
+/// init(), set_runtime_params(), and all conversion calls on the same instance.
 class VoiceConversionPipeline {
 public:
-    /// Initialize all sub-modules from config
+    /// Initialize all sub-modules from config.
+    ///
+    /// Validation failures and recoverable model/runtime exceptions return
+    /// false and leave the whole pipeline uninitialized, including when
+    /// replacing a previous configuration. A host allocation failure may
+    /// propagate when even the reset/result state cannot be constructed.
     bool init(const VCConfig& config);
 
     /// Convert a single audio file
     /// Loads input from file, runs full pipeline, writes output to file
+    /// Recoverable model, I/O, CUDA, and runtime exceptions are returned as
+    /// success=false with a non-empty diagnostic when a VCResult can be
+    /// constructed. A host allocation failure may propagate.
     VCResult convert_file(const std::string& input_path,
                           const std::string& output_path,
                           int speaker_id = 0);
 
-    /// Convert raw audio buffer
+    /// Convert a seekable WAV with a duration-independent process working set.
+    ///
+    /// The converted 40 kHz PCM16 WAV is delivered through an atomic file
+    /// replacement. On success the returned AudioBuffer deliberately owns no
+    /// samples; its sample_rate records the model rate. This synchronous
+    /// offline API does not change the owning behavior of convert_file() or
+    /// convert_buffer(), and does not provide a realtime/session contract.
+    /// The bounded path currently accepts qualified HuBERT profiles; a WavLM
+    /// configuration fails before payload I/O until a matching WavLM-trained
+    /// synthesizer asset has passed the bounded numerical gates. Legacy APIs
+    /// retain their existing configuration behavior.
+    /// Recoverable model, I/O, CUDA, and runtime exceptions are returned as
+    /// success=false with a non-empty diagnostic when a VCResult can be
+    /// constructed; a host allocation failure may propagate. Any failure
+    /// before the atomic rename commit keeps an existing target unchanged.
+    VCResult convert_file_bounded(const std::string& input_path,
+                                  const std::string& output_path,
+                                  int speaker_id = 0);
+
+    /// Convert raw audio buffer.
+    /// Recoverable model, CUDA, and runtime exceptions are returned as
+    /// success=false with a non-empty diagnostic when a VCResult can be
+    /// constructed. A host allocation failure may propagate.
     VCResult convert_buffer(const AudioBuffer& input,
                             int speaker_id = 0);
 

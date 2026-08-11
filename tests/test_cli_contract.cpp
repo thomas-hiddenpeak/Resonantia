@@ -1,9 +1,12 @@
 // Copyright 2024 Resonantia Authors.
 // Licensed under the MIT License.
 
-// Asset-free process-level CLI contract tests. The four executable paths are
+// Asset-free process-level CLI contract tests. The five executable paths are
 // supplied by CTest so this test does not assume any particular build layout:
 //   test_cli_contract <vc_convert> <vc_batch> <vc_train> <vc_preprocess>
+//                     <build_index>
+
+#include "tools/app_support/file_conversion_policy.h"
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -165,6 +168,20 @@ struct DependencyCase {
     std::string_view expected_message;
 };
 
+struct FileConversionProbe {
+    int bounded_calls = 0;
+    int legacy_calls = 0;
+
+    int convert_file_bounded(const std::string&, const std::string&, int) {
+        ++bounded_calls;
+        return 11;
+    }
+    int convert_file(const std::string&, const std::string&, int) {
+        ++legacy_calls;
+        return 22;
+    }
+};
+
 std::vector<DependencyCase> dependency_cases(std::vector<std::string> base) {
     auto with = [&base](std::initializer_list<std::string> values) {
         auto arguments = base;
@@ -204,15 +221,33 @@ void expect_dependency_contracts(const std::string& command,
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 5) {
+    if (argc != 6) {
         std::cerr << "usage: test_cli_contract <vc_convert> <vc_batch> <vc_train> "
-                     "<vc_preprocess>\n";
+                     "<vc_preprocess> <build_index>\n";
         return 2;
     }
     const std::string convert = argv[1];
     const std::string batch = argv[2];
     const std::string train = argv[3];
     const std::string preprocess = argv[4];
+    const std::string build_index = argv[5];
+
+    {
+        using voxmutatio::ContentEncoder;
+        using voxmutatio::VCConfig;
+        using voxmutatio::app_support::convert_file_with_policy;
+        FileConversionProbe probe;
+        VCConfig config;
+        config.content_encoder = ContentEncoder::kHubert;
+        const int bounded = convert_file_with_policy(probe, config, "in", "out", 0);
+        config.content_encoder = ContentEncoder::kWavlm;
+        const int legacy = convert_file_with_policy(probe, config, "in", "out", 0);
+        if (bounded != 11 || legacy != 22 || probe.bounded_calls != 1 ||
+            probe.legacy_calls != 1) {
+            ++failures;
+            std::cerr << "FAIL CLI file conversion routing policy\n";
+        }
+    }
 
     expect_success_contains(
         "vc_convert help lists the supported model contract", convert, {"--help"},
@@ -243,6 +278,13 @@ int main(int argc, char** argv) {
                     "Unknown argument: --bogus");
     expect_rejected("vc_preprocess unknown argument without help", preprocess, {"--bogus"},
                     "Unknown argument: --bogus");
+    expect_success_contains(
+        "build_index help lists required paths", build_index, {"--help"},
+        {"--hubert", "--input-dir", "--output"});
+    expect_rejected("build_index unknown argument without help", build_index,
+                    {"--bogus"}, "Unknown argument: --bogus");
+    expect_rejected("build_index missing option value", build_index,
+                    {"--hubert"}, "error: missing value for --hubert");
 
     expect_dependency_contracts(
         "vc_convert", convert,

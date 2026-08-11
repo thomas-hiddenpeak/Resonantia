@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "tools/app_support/cli_parse.h"
+#include "tools/app_support/file_conversion_policy.h"
 #include "voxmutatio/core/device.h"
 #include "voxmutatio/pipeline/pipeline.h"
 
@@ -265,6 +266,12 @@ int run_vc_batch(const VcBatchOptions& options) {
     std::sort(audio_files.begin(), audio_files.end());
 
     std::cout << "Found " << audio_files.size() << " audio files\n";
+    const bool use_bounded_file_path =
+        file_conversion_path_for(options.config.content_encoder) ==
+        FileConversionPath::kBounded;
+    std::cout << "File path: "
+              << (use_bounded_file_path ? "bounded HuBERT" : "legacy WavLM")
+              << "\n";
 
     int success_count = 0;
     int fail_count = 0;
@@ -275,7 +282,9 @@ int run_vc_batch(const VcBatchOptions& options) {
             fs::path(input_path).stem().string() + ".wav";
         std::cout << "[" << index << "/" << audio_files.size() << "] "
                   << fs::path(input_path).filename().string() << " ... " << std::flush;
-        const auto result = pipeline.convert_file(input_path, output_path, options.speaker_id);
+        const auto result = convert_file_with_policy(
+            pipeline, options.config, input_path, output_path,
+            options.speaker_id);
         if (result.success) {
             ++success_count;
             std::cout << "ok (" << static_cast<long>(result.total_ms) << " ms)\n";

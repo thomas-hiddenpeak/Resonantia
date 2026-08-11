@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstring>
 #include <limits>
@@ -25,6 +26,102 @@ namespace {
 constexpr std::uint64_t kMaxHeaderSize = 100'000'000;
 constexpr std::size_t kMaxTensorRank = 32;
 constexpr int kMaxJsonDepth = 64;
+constexpr std::size_t kSnapshotReadChunk = 1U << 20;
+
+class ScopedFd {
+public:
+    explicit ScopedFd(int fd = -1) noexcept : fd_(fd) {}
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    ~ScopedFd() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+
+    [[nodiscard]] int get() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+
+private:
+    int fd_ = -1;
+};
+
+class ScopedMapping {
+public:
+    ScopedMapping(void* data, std::size_t size) noexcept
+        : data_(data), size_(size) {}
+    ScopedMapping(const ScopedMapping&) = delete;
+    ScopedMapping& operator=(const ScopedMapping&) = delete;
+    ~ScopedMapping() {
+        if (data_) ::munmap(data_, size_);
+    }
+
+    [[nodiscard]] void* get() const noexcept { return data_; }
+    [[nodiscard]] void* release() noexcept {
+        return std::exchange(data_, nullptr);
+    }
+
+private:
+    void* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+int open_readonly(const std::string& path) noexcept {
+    int fd = -1;
+    do {
+        // O_NONBLOCK is ignored for regular files, but prevents a path that
+        // names a no-writer FIFO from blocking before fstat rejects it.
+        fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    } while (fd < 0 && errno == EINTR);
+    return fd;
+}
+
+bool read_file_status(int fd, struct stat& status) noexcept {
+    int result = -1;
+    do {
+        result = ::fstat(fd, &status);
+    } while (result < 0 && errno == EINTR);
+    return result == 0;
+}
+
+bool checked_regular_file_size(const struct stat& status,
+                               std::size_t& size) noexcept {
+    if (!S_ISREG(status.st_mode) ||
+        status.st_size < static_cast<off_t>(sizeof(std::uint64_t)) ||
+        static_cast<std::uintmax_t>(status.st_size) >
+            std::numeric_limits<std::size_t>::max()) {
+        return false;
+    }
+    size = static_cast<std::size_t>(status.st_size);
+    return true;
+}
+
+bool same_file_status(const struct stat& before,
+                      const struct stat& after) noexcept {
+    return S_ISREG(after.st_mode) && before.st_dev == after.st_dev &&
+           before.st_ino == after.st_ino && before.st_mode == after.st_mode &&
+           before.st_size == after.st_size &&
+           before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
+           before.st_mtim.tv_nsec == after.st_mtim.tv_nsec &&
+           before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
+           before.st_ctim.tv_nsec == after.st_ctim.tv_nsec;
+}
+
+SafetensorsSourceIdentity source_identity_from(
+    const struct stat& status) noexcept {
+    SafetensorsSourceIdentity identity;
+    identity.device = static_cast<std::uintmax_t>(status.st_dev);
+    identity.inode = static_cast<std::uintmax_t>(status.st_ino);
+    identity.mode = static_cast<std::uintmax_t>(status.st_mode);
+    identity.size = static_cast<std::uintmax_t>(status.st_size);
+    identity.modified_seconds =
+        static_cast<std::int64_t>(status.st_mtim.tv_sec);
+    identity.modified_nanoseconds =
+        static_cast<std::int64_t>(status.st_mtim.tv_nsec);
+    identity.changed_seconds =
+        static_cast<std::int64_t>(status.st_ctim.tv_sec);
+    identity.changed_nanoseconds =
+        static_cast<std::int64_t>(status.st_ctim.tv_nsec);
+    return identity;
+}
 
 bool checked_add(std::size_t a, std::size_t b, std::size_t& result) {
     if (b > std::numeric_limits<std::size_t>::max() - a) return false;
@@ -396,7 +493,10 @@ bool parse_header(const std::uint8_t* data, std::size_t file_size,
 SafetensorsLoader::SafetensorsLoader(SafetensorsLoader&& other) noexcept
     : data_(std::exchange(other.data_, nullptr)),
       data_size_(std::exchange(other.data_size_, 0)),
-      tensors_(std::move(other.tensors_)) {}
+      tensors_(std::move(other.tensors_)),
+      source_identity_(other.source_identity_),
+      source_identity_valid_(
+          std::exchange(other.source_identity_valid_, false)) {}
 
 SafetensorsLoader& SafetensorsLoader::operator=(SafetensorsLoader&& other) noexcept {
     if (this != &other) {
@@ -404,6 +504,9 @@ SafetensorsLoader& SafetensorsLoader::operator=(SafetensorsLoader&& other) noexc
         data_ = std::exchange(other.data_, nullptr);
         data_size_ = std::exchange(other.data_size_, 0);
         tensors_ = std::move(other.tensors_);
+        source_identity_ = other.source_identity_;
+        source_identity_valid_ =
+            std::exchange(other.source_identity_valid_, false);
     }
     return *this;
 }
@@ -413,38 +516,97 @@ void SafetensorsLoader::reset() noexcept {
     data_ = nullptr;
     data_size_ = 0;
     tensors_.clear();
+    source_identity_ = {};
+    source_identity_valid_ = false;
 }
 
 bool SafetensorsLoader::load(const std::string& path) try {
     reset();
 
-    const int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) return false;
+    ScopedFd fd(open_readonly(path));
+    if (!fd.valid()) return false;
 
     struct stat st {};
-    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
-        st.st_size < static_cast<off_t>(sizeof(std::uint64_t)) ||
-        static_cast<std::uintmax_t>(st.st_size) > std::numeric_limits<std::size_t>::max()) {
-        close(fd);
+    std::size_t staged_size = 0;
+    if (!read_file_status(fd.get(), st) ||
+        !checked_regular_file_size(st, staged_size)) {
         return false;
     }
 
-    data_size_ = static_cast<std::size_t>(st.st_size);
-    data_ = mmap(nullptr, data_size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (data_ == MAP_FAILED) {
-        data_ = nullptr;
-        data_size_ = 0;
-        return false;
-    }
+    void* mapped = ::mmap(nullptr, staged_size, PROT_READ, MAP_PRIVATE,
+                          fd.get(), 0);
+    if (mapped == MAP_FAILED) return false;
+    ScopedMapping staged_mapping(mapped, staged_size);
 
     std::unordered_map<std::string, Tensor> parsed;
-    if (!parse_header(static_cast<const std::uint8_t*>(data_), data_size_, parsed)) {
-        reset();
+    if (!parse_header(static_cast<const std::uint8_t*>(staged_mapping.get()),
+                      staged_size, parsed)) return false;
+
+    tensors_ = std::move(parsed);
+    data_size_ = staged_size;
+    data_ = staged_mapping.release();
+    ::madvise(data_, data_size_, MADV_SEQUENTIAL);
+    return true;
+} catch (const std::bad_alloc&) {
+    reset();
+    return false;
+} catch (const std::length_error&) {
+    reset();
+    return false;
+}
+
+bool SafetensorsLoader::load_snapshot(const std::string& path,
+                                      std::size_t max_bytes) try {
+    reset();
+
+    ScopedFd fd(open_readonly(path));
+    if (!fd.valid()) return false;
+
+    struct stat before {};
+    std::size_t staged_size = 0;
+    if (!read_file_status(fd.get(), before) ||
+        !checked_regular_file_size(before, staged_size) ||
+        staged_size > max_bytes) {
         return false;
     }
+
+    void* mapped = ::mmap(nullptr, staged_size, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) return false;
+    ScopedMapping staged_mapping(mapped, staged_size);
+
+    auto* destination = static_cast<std::uint8_t*>(staged_mapping.get());
+    std::size_t copied = 0;
+    while (copied < staged_size) {
+        const std::size_t requested =
+            std::min(kSnapshotReadChunk, staged_size - copied);
+        ssize_t read_size = -1;
+        do {
+            read_size = ::pread(fd.get(), destination + copied, requested,
+                                static_cast<off_t>(copied));
+        } while (read_size < 0 && errno == EINTR);
+        if (read_size <= 0) return false;
+        copied += static_cast<std::size_t>(read_size);
+    }
+
+    struct stat after {};
+    if (!read_file_status(fd.get(), after) ||
+        !same_file_status(before, after) ||
+        ::mprotect(staged_mapping.get(), staged_size, PROT_READ) != 0) {
+        return false;
+    }
+    const SafetensorsSourceIdentity staged_identity =
+        source_identity_from(after);
+
+    std::unordered_map<std::string, Tensor> parsed;
+    if (!parse_header(static_cast<const std::uint8_t*>(staged_mapping.get()),
+                      staged_size, parsed)) return false;
+
     tensors_ = std::move(parsed);
-    madvise(data_, data_size_, MADV_SEQUENTIAL);
+    source_identity_ = staged_identity;
+    source_identity_valid_ = true;
+    data_size_ = staged_size;
+    data_ = staged_mapping.release();
     return true;
 } catch (const std::bad_alloc&) {
     reset();

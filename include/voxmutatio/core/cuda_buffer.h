@@ -7,6 +7,10 @@
 
 #include <cuda_runtime.h>
 
+#if defined(VOXMUTATIO_TEST_CUDA_FAILURE_INJECTION)
+#include "cuda_failure_injection.h"
+#endif
+
 #include <cstddef>
 #include <cstdio>
 #include <limits>
@@ -47,7 +51,12 @@ class CudaBuffer {
     if (n > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
       throw std::length_error("CudaBuffer allocation size overflow");
     }
+#if defined(VOXMUTATIO_TEST_CUDA_FAILURE_INJECTION)
+    cudaError_t e = resonantia_test::cuda_failure::allocate(
+        &ptr_, n * sizeof(float));
+#else
     cudaError_t e = cudaMalloc(&ptr_, n * sizeof(float));
+#endif
     if (e != cudaSuccess) {
       ptr_ = nullptr;
       size_ = 0;
@@ -105,7 +114,11 @@ class CudaBuffer {
 
   void free_() {
     if (ptr_) {
+#if defined(VOXMUTATIO_TEST_CUDA_FAILURE_INJECTION)
+      cudaError_t e = resonantia_test::cuda_failure::release(ptr_);
+#else
       cudaError_t e = cudaFree(ptr_);
+#endif
       if (e != cudaSuccess) {
         // Destructors and move assignment cannot safely throw. Preserve the first
         // CUDA failure in stderr while ensuring ownership is cleared exactly once.

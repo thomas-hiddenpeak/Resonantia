@@ -77,7 +77,7 @@ mel/KL/feature-matching/adversarial 损失。训练 loss 必须有限，错误�
 | FR-007 | WAV 数据发现、前端特征/F0、训练片段采样 | `vc_train` 内实现基线路径；非完整数据产品 |
 | FR-008 | 结构化进度 | 仅 CLI 文本 step/loss；稳定机器可读协议未定义 |
 | FR-009 | inference G safetensors 导出 | 已实现；临时文件 + rename 原子提交 |
-| FR-010 | 独立 Flat Index 构建 | 已由 `build_index` 实现；未与训练事务绑定 |
+| FR-010 | 独立 Flat Index 构建 | `build_index` 按确定路径顺序构建，并以同目录 staging + fsync/close + rename 原子发布；仍未与 G 导出形成同一训练事务 |
 | FR-011 | 持久化 checkpoint 与断点续训 | **未实现** |
 | FR-012 | 旧 `FineTuneTrainer` 门面 | **不支持，必须失败** |
 | FR-013 | 分布式、FP16、多 GPU、从零预训练 | **不支持** |
@@ -93,11 +93,14 @@ mel/KL/feature-matching/adversarial 损失。训练 loss 必须有限，错误�
 - loss 非有限时不得更新或导出伪成功模型。
 - 最终 G 导出使用同目录临时文件、精确 little-endian 写入、flush/close 后 rename；
   失败清理临时产物。
+- `build_index` 对输入 WAV 路径排序，最终 `.index` 使用唯一同目录 staging、`0666` + caller
+  umask、完整写入与 `fsync`/close 后 rename；rename 前失败保留旧目标并清理 staging。
+  `test_build_index_contract` 以真实 HuBERT/语音资产门控确定性字节、旧 inode 保留和失败清理。
 - 功能集成使用真实 WAV；小型合成张量只用于算子梯度/边界测试。
 
 ## 6. Verified Evidence
 
-本地资产齐全的 2026-08-12 current-tip 30/30 CTest（11 contract + 19 integration、0 fail，
+加固前本地资产齐全的 2026-08-12 30/30 CTest（11 contract + 19 integration、0 fail，
 `Total Test time (real) = 356.41 sec`）中包含：
 
 - autograd contract；
@@ -105,6 +108,11 @@ mel/KL/feature-matching/adversarial 损失。训练 loss 必须有限，错误�
 - generator trainer 初始化回滚、训练、导出与推理往返；
 - discriminator、posterior/flow 和完整 GAN step；
 - GAN 初始化回滚与未初始化失败契约。
+
+当前 CMake 资产齐全配置已扩展为 39 个 distinct tests（16 contract-labelled、24
+integration-labelled，WavLM preflight label 重叠），并新增 `test_build_index_contract`；
+当前树的 fresh Release/SM87 全量已 39/39 通过（0 失败，1297.94 秒）。
+旧 30/30 只保留为加固前历史，注册本身也不替代本次实际执行。
 
 这些证据说明训练代码会执行真实优化且关键数值/资源边界受测试，不证明：
 
