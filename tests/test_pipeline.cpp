@@ -9,12 +9,16 @@
 #include "voxmutatio/core/types.h"
 #include "voxmutatio/io/audio_io.h"
 #include "test_artifacts.h"
+#include "vits_checkpoint_fixture.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <cmath>
 #include <limits>
+#include <system_error>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -57,6 +61,23 @@ bool write_constant_index(const fs::path& path, std::int64_t rows,
                  static_cast<std::streamsize>(values.size() * sizeof(float)));
     return static_cast<bool>(output);
 }
+
+class ScopedCurrentPath {
+public:
+    explicit ScopedCurrentPath(const fs::path& replacement)
+        : original_(fs::current_path()) {
+        fs::current_path(replacement);
+    }
+    ScopedCurrentPath(const ScopedCurrentPath&) = delete;
+    ScopedCurrentPath& operator=(const ScopedCurrentPath&) = delete;
+    ~ScopedCurrentPath() {
+        std::error_code ignored;
+        fs::current_path(original_, ignored);
+    }
+
+private:
+    fs::path original_;
+};
 
 }  // namespace
 
@@ -267,6 +288,219 @@ TEST_CASE("Synthesizer validates speaker and pitch bounds before inference",
     config.version = static_cast<ModelVersion>(0xff);
     Synthesizer invalid_version;
     CHECK_FALSE(invalid_version.init(config));
+}
+
+TEST_CASE("Synthesizer fail-closes checkpoint and public numerical boundaries",
+          "[synthesizer][boundary]") {
+    using voxmutatio::ModelVersion;
+    using voxmutatio::synthesizer::Synthesizer;
+    using voxmutatio::synthesizer::SynthesizerConfig;
+
+    resonantia_test::ScopedArtifact checkpoint_path(
+        resonantia_test::unique_artifact_path("vits-sparse", ".safetensors"));
+    resonantia_test::vits_fixture::SparseCheckpoint checkpoint;
+    REQUIRE(resonantia_test::vits_fixture::create_sparse_checkpoint(
+        checkpoint_path.path(), checkpoint));
+
+    SynthesizerConfig config;
+    config.model_path = fs::relative(
+        checkpoint_path.path(), fs::current_path()).string();
+    REQUIRE_FALSE(config.model_path.empty());
+    config.version = ModelVersion::kV2;
+    Synthesizer synth;
+    REQUIRE(synth.init(config));
+    REQUIRE(synth.initialized());
+    REQUIRE(synth.num_speakers() == 1);
+
+    const auto require_config_rejected = [&](SynthesizerConfig rejected) {
+        Synthesizer invalid;
+        CHECK_FALSE(invalid.init(rejected));
+        CHECK_FALSE(invalid.initialized());
+    };
+    auto rejected = config;
+    rejected.half_precision = true;
+    require_config_rejected(rejected);
+    rejected = config;
+    rejected.spec_channels = 513;
+    require_config_rejected(rejected);
+    rejected = config;
+    rejected.segment_size = 0;
+    require_config_rejected(rejected);
+    rejected = config;
+    rejected.p_dropout = 1;
+    require_config_rejected(rejected);
+    // Every runtime-used tensor is part of init validation, including tensors
+    // at the beginning and end of the decoder/encoder manifest.
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.enc_p.emb_phone.bias", 0,
+        std::numeric_limits<float>::quiet_NaN()));
+    CHECK_FALSE(synth.init(config));
+    CHECK_FALSE(synth.initialized());
+    CHECK(synth.num_speakers() == 0);
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.enc_p.emb_phone.bias", 0, 0.0f));
+    REQUIRE(synth.init(config));
+
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(),
+        "model.flow.flows.0.enc.in_layers.0.weight_v", 0, 0.0f));
+    CHECK_FALSE(synth.init(config));
+    CHECK_FALSE(synth.initialized());
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(),
+        "model.flow.flows.0.enc.in_layers.0.weight_v", 0, 1.0f));
+    REQUIRE(synth.init(config));
+
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.dec.conv_post.weight", 0,
+        std::numeric_limits<float>::infinity()));
+    CHECK_FALSE(synth.init(config));
+    CHECK_FALSE(synth.initialized());
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.dec.conv_post.weight", 0, 0.0f));
+    REQUIRE(synth.init(config));
+
+    std::vector<float> features(static_cast<std::size_t>(synth.feature_dim()), 0.0f);
+    float pitch = 1.0f;
+    float f0 = 110.0f;
+    const auto valid = synth.infer(features.data(), 1, &pitch, &f0, 0);
+    REQUIRE(valid.data.size() == 400);
+    CHECK(std::all_of(valid.data.begin(), valid.data.end(),
+                      [](float value) { return std::isfinite(value); }));
+
+    voxmutatio::AudioBuffer after_cwd_change;
+    {
+        ScopedCurrentPath changed_cwd(fs::current_path() / "fixtures");
+        after_cwd_change = synth.infer(features.data(), 1, &pitch, &f0, 0);
+    }
+    REQUIRE(after_cwd_change.data.size() == 400);
+
+    Synthesizer copied = synth;
+    REQUIRE(copied.initialized());
+    REQUIRE(copied.infer(features.data(), 1, &pitch, &f0, 0).data.size() == 400);
+    Synthesizer moved = std::move(copied);
+    CHECK_FALSE(copied.initialized());
+    CHECK(copied.infer(features.data(), 1, &pitch, &f0, 0).data.empty());
+    REQUIRE(moved.initialized());
+    REQUIRE(moved.infer(features.data(), 1, &pitch, &f0, 0).data.size() == 400);
+
+    // The frame-arithmetic gate runs before scanning any caller buffer. A
+    // single-value sentinel is therefore safe for a rejected oversized frame
+    // count in both the full and legacy windowed public entry points.
+    float sentinel = 0.0f;
+    constexpr int kOverflowingAttentionFrames = 40'000;
+    CHECK(synth.infer(&sentinel, kOverflowingAttentionFrames, &sentinel,
+                      &sentinel, 0).data.empty());
+    CHECK(synth.infer_stream(&sentinel, kOverflowingAttentionFrames, &sentinel,
+                             &sentinel, 0, 0, 1).data.empty());
+
+    int pitch_sentinel = 1;
+    CHECK(synth.debug_text_encoder(
+        &sentinel, kOverflowingAttentionFrames, &pitch_sentinel).empty());
+    CHECK(synth.debug_flow(
+        &sentinel, kOverflowingAttentionFrames, &pitch_sentinel, 0).empty());
+    CHECK(synth.debug_encp(
+        &sentinel, kOverflowingAttentionFrames, &pitch_sentinel, false).empty());
+
+    constexpr int kOverflowingHarFrames =
+        std::numeric_limits<int>::max() / 400 + 1;
+    constexpr int kOverflowingConvPreFrames =
+        std::numeric_limits<int>::max() / 512 + 1;
+    constexpr int kOverflowingStageFrames =
+        std::numeric_limits<int>::max() / 2'560 + 1;
+    constexpr int kOverflowingGeneratorFrames =
+        std::numeric_limits<int>::max() / 12'800 + 1;
+    constexpr int kOverflowingFlowFrames =
+        std::numeric_limits<int>::max() / 768 + 1;
+    CHECK(synth.debug_har(&sentinel, kOverflowingHarFrames).empty());
+    CHECK(synth.debug_convpre(&sentinel, kOverflowingConvPreFrames, 0).empty());
+    CHECK(synth.debug_gen_stage0(&sentinel, &sentinel,
+                                 kOverflowingStageFrames, 0, 0).empty());
+    CHECK(synth.debug_decode(&sentinel, &sentinel,
+                             kOverflowingGeneratorFrames, 0).empty());
+    CHECK(synth.debug_flow_reverse(
+        &sentinel, kOverflowingFlowFrames, 0).empty());
+
+    features[0] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(synth.debug_text_encoder(features.data(), 1, &pitch_sentinel).empty());
+    CHECK(synth.debug_flow(features.data(), 1, &pitch_sentinel, 0).empty());
+    CHECK(synth.debug_encp(features.data(), 1, &pitch_sentinel, false).empty());
+    features[0] = 0.0f;
+    std::vector<float> z(192, 0.0f);
+    z[0] = std::numeric_limits<float>::infinity();
+    CHECK(synth.debug_convpre(z.data(), 1, 0).empty());
+    CHECK(synth.debug_gen_stage0(z.data(), &f0, 1, 0, 0).empty());
+    CHECK(synth.debug_decode(z.data(), &f0, 1, 0).empty());
+    CHECK(synth.debug_flow_reverse(z.data(), 1, 0).empty());
+    const float nonfinite_f0 = std::numeric_limits<float>::quiet_NaN();
+    CHECK(synth.debug_har(&nonfinite_f0, 1).empty());
+
+    for (const float nonfinite : {
+             std::numeric_limits<float>::quiet_NaN(),
+             std::numeric_limits<float>::infinity()}) {
+        features[0] = nonfinite;
+        CHECK(synth.infer(features.data(), 1, &pitch, &f0, 0).data.empty());
+        features[0] = 0.0f;
+
+        pitch = nonfinite;
+        CHECK(synth.infer(features.data(), 1, &pitch, &f0, 0).data.empty());
+        pitch = 1.0f;
+
+        f0 = nonfinite;
+        CHECK(synth.infer(features.data(), 1, &pitch, &f0, 0).data.empty());
+        f0 = 110.0f;
+    }
+
+    // Finite caller data and weights can still overflow intermediate FP32.
+    // The public boundary must not return the resulting NaN/Inf waveform.
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.enc_p.emb_phone.weight", 0,
+        std::numeric_limits<float>::max()));
+    REQUIRE(synth.init(config));
+    features[0] = std::numeric_limits<float>::max();
+    CHECK(synth.infer(features.data(), 1, &pitch, &f0, 0).data.empty());
+
+    // Reconstruction uses double g*v/norm. The mathematically valid result is
+    // finite even though the old float multiplication order overflowed first.
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.enc_p.emb_phone.weight", 0, 0.0f));
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.dec.conv_pre.bias", 0, 1.0f));
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.dec.ups.0.weight_g", 0,
+        std::numeric_limits<float>::max() / 4.0f));
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.dec.ups.0.weight_v", 0,
+        std::numeric_limits<float>::max()));
+    REQUIRE(synth.init(config));
+    features[0] = 0.0f;
+    const auto high_but_finite = synth.infer(
+        features.data(), 1, &pitch, &f0, 0);
+    REQUIRE(high_but_finite.data.size() == 400);
+    CHECK(std::all_of(high_but_finite.data.begin(), high_but_finite.data.end(),
+                      [](float value) { return std::isfinite(value); }));
+
+    // A checkpoint changed after init is rejected before the persisted mapping
+    // can materialize the now-degenerate row for CUDA.
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.dec.ups.0.weight_v", 0, 0.0f));
+    CHECK(synth.infer(features.data(), 1, &pitch, &f0, 0).data.empty());
+
+    // Runtime uses the instance-owned validated mapping, but also fingerprints
+    // the path so replacing it with an incompatible checkpoint fails closed.
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.dec.ups.0.weight_v", 0,
+        std::numeric_limits<float>::max()));
+    REQUIRE(synth.init(config));
+    resonantia_test::ScopedArtifact incompatible_path(
+        resonantia_test::unique_artifact_path("vits-v1-replacement", ".safetensors"));
+    resonantia_test::vits_fixture::SparseCheckpoint incompatible;
+    REQUIRE(resonantia_test::vits_fixture::create_sparse_checkpoint(
+        incompatible_path.path(), incompatible, 256));
+    std::filesystem::rename(incompatible_path.path(), checkpoint_path.path());
+    CHECK(synth.infer(features.data(), 1, &pitch, &f0, 0).data.empty());
+    CHECK_FALSE(synth.init(config));
+    CHECK_FALSE(synth.initialized());
 }
 
 TEST_CASE("Pipeline rejects malformed direct audio buffers", "[pipeline][contract]") {
