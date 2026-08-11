@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,7 +40,7 @@ struct SynthesizerConfig {
     std::vector<int> upsample_kernel_sizes = {16, 16, 4, 4};
 
     // Speaker embedding
-    int spk_embed_dim = 0;            // number of speakers (0 = derive from checkpoint)
+    int spk_embed_dim = 0;            // legacy hint; init derives the count from checkpoint
     int gin_channels = 256;
 
     // Sample rate
@@ -60,7 +61,9 @@ public:
     /// Infer (synthesize audio from content features)
     /// Only F0-conditioned checkpoints are currently supported. init() rejects
     /// has_f0=false, so features, pitch and pitchf must all be non-null here.
-    /// features: [1, T, 256(v1)/768(v2)], pitch/pitchf: [1, T]
+    /// features: [1, T, 256(v1)/768(v2)], pitch/pitchf: [1, T].
+    /// NaN/Inf inputs and non-finite synthesized output fail closed with an
+    /// empty AudioBuffer, consistent with other invalid inference inputs.
     /// speaker_id: speaker embedding index
     /// Returns synthesized audio at model's native sample rate
     AudioBuffer infer(const float* features, int frames,
@@ -91,7 +94,9 @@ public:
     [[nodiscard]] bool has_f0() const noexcept { return has_f0_; }
 
     /// Check whether init() accepted the configuration and checkpoint.
-    [[nodiscard]] bool initialized() const noexcept { return initialized_; }
+    [[nodiscard]] bool initialized() const noexcept {
+        return initialized_ && static_cast<bool>(model_state_);
+    }
 
     /// Test hook: run TextEncoder only, return m_p [inter_channels, T].
     std::vector<float> debug_text_encoder(const float* features, int frames,
@@ -123,7 +128,11 @@ public:
     std::vector<float> debug_flow_reverse(const float* x, int frames, int speaker_id);
 
 private:
+    struct ModelState;
+    [[nodiscard]] bool checkpoint_current() const;
+
     SynthesizerConfig config_;
+    std::shared_ptr<const ModelState> model_state_;
     int sample_rate_ = 40'000;
     ModelVersion version_ = ModelVersion::kV1;
     bool has_f0_ = true;

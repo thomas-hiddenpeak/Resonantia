@@ -10,15 +10,19 @@
 #include "voxmutatio/content/cuda/kernels.h"
 #include "voxmutatio/io/safetensors.h"
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <initializer_list>
+#include <limits>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace voxmutatio::synthesizer {
@@ -38,21 +42,12 @@ constexpr int kGin = 256;
 constexpr float kLRelu = 0.1f;
 
 struct Weights {
-    std::shared_ptr<io::SafetensorsLoader> loader;
+    std::shared_ptr<const io::SafetensorsLoader> loader;
     std::string prefix = "model.";
-    // Cache the mmap'd, header-parsed loader per path: repeated w.load() calls in
-    // debug_*/infer reuse it instead of re-mmapping+re-parsing 145MB each time.
     bool load(const std::string& p) {
-        static std::mutex m;
-        static std::unordered_map<std::string, std::shared_ptr<io::SafetensorsLoader>> cache;
-        std::lock_guard<std::mutex> lk(m);
-        auto it = cache.find(p);
-        if (it == cache.end()) {
-            auto l = std::make_shared<io::SafetensorsLoader>();
-            if (!l->load(p)) return false;
-            it = cache.emplace(p, std::move(l)).first;
-        }
-        loader = it->second;
+        auto staged = std::make_shared<io::SafetensorsLoader>();
+        if (!staged->load(p)) return false;
+        loader = std::move(staged);
         return true;
     }
     const float* get(const std::string& n) const {
@@ -66,8 +61,59 @@ struct Weights {
     bool has(const std::string& n) const { return meta(n) != nullptr; }
 };
 
-bool expect_shape(const Weights& w, const std::string& name,
-                  std::initializer_list<int64_t> shape) {
+struct CheckpointIdentity {
+    std::uintmax_t device = 0;
+    std::uintmax_t inode = 0;
+    std::uintmax_t size = 0;
+    std::int64_t modified_seconds = 0;
+    std::int64_t modified_nanoseconds = 0;
+    std::int64_t changed_seconds = 0;
+    std::int64_t changed_nanoseconds = 0;
+};
+
+bool operator==(const CheckpointIdentity& lhs, const CheckpointIdentity& rhs) {
+    return lhs.device == rhs.device && lhs.inode == rhs.inode &&
+           lhs.size == rhs.size &&
+           lhs.modified_seconds == rhs.modified_seconds &&
+           lhs.modified_nanoseconds == rhs.modified_nanoseconds &&
+           lhs.changed_seconds == rhs.changed_seconds &&
+           lhs.changed_nanoseconds == rhs.changed_nanoseconds;
+}
+
+bool read_checkpoint_identity(const std::string& path, CheckpointIdentity& identity) {
+    struct stat status {};
+    if (stat(path.c_str(), &status) != 0 || !S_ISREG(status.st_mode) ||
+        status.st_size <= 0) {
+        return false;
+    }
+    identity.device = static_cast<std::uintmax_t>(status.st_dev);
+    identity.inode = static_cast<std::uintmax_t>(status.st_ino);
+    identity.size = static_cast<std::uintmax_t>(status.st_size);
+    identity.modified_seconds = static_cast<std::int64_t>(status.st_mtim.tv_sec);
+    identity.modified_nanoseconds = static_cast<std::int64_t>(status.st_mtim.tv_nsec);
+    identity.changed_seconds = static_cast<std::int64_t>(status.st_ctim.tv_sec);
+    identity.changed_nanoseconds = static_cast<std::int64_t>(status.st_ctim.tv_nsec);
+    return true;
+}
+
+bool checkpoint_is_current(const std::string& path,
+                           const CheckpointIdentity& expected) {
+    CheckpointIdentity current;
+    return read_checkpoint_identity(path, current) && current == expected;
+}
+
+bool resolve_checkpoint_path(const std::string& configured,
+                             std::string& resolved) {
+    std::error_code error;
+    const std::filesystem::path absolute =
+        std::filesystem::absolute(configured, error);
+    if (error || absolute.empty()) return false;
+    resolved = absolute.lexically_normal().string();
+    return !resolved.empty();
+}
+
+bool expect_finite_tensor(const Weights& w, const std::string& name,
+                          std::initializer_list<int64_t> shape) {
     const io::Tensor* tensor = w.meta(name);
     if (!tensor) {
         fprintf(stderr, "VITS: missing required tensor 'model.%s'\n", name.c_str());
@@ -78,72 +124,151 @@ bool expect_shape(const Weights& w, const std::string& name,
         return false;
     }
     std::size_t elements = 1;
-    for (int64_t dim : shape) elements *= static_cast<std::size_t>(dim);
-    if (tensor->dtype != "F32" || tensor->data_nbytes != elements * sizeof(float)) {
+    for (const int64_t dim : shape) {
+        if (dim <= 0 || static_cast<std::uint64_t>(dim) >
+                            std::numeric_limits<std::size_t>::max()) {
+            fprintf(stderr, "VITS: tensor 'model.%s' has an invalid dimension\n",
+                    name.c_str());
+            return false;
+        }
+        const std::size_t size = static_cast<std::size_t>(dim);
+        if (elements > std::numeric_limits<std::size_t>::max() / size) {
+            fprintf(stderr, "VITS: tensor 'model.%s' size overflows\n", name.c_str());
+            return false;
+        }
+        elements *= size;
+    }
+    if (elements > std::numeric_limits<std::size_t>::max() / sizeof(float) ||
+        tensor->dtype != "F32" ||
+        tensor->data_nbytes != elements * sizeof(float)) {
         fprintf(stderr, "VITS: tensor 'model.%s' is not F32 with the expected size\n",
                 name.c_str());
         return false;
+    }
+    const std::uint8_t* bytes = w.loader->data(w.prefix + name);
+    if (!bytes || reinterpret_cast<std::uintptr_t>(bytes) % alignof(float) != 0) {
+        fprintf(stderr, "VITS: tensor 'model.%s' has unreadable or unaligned data\n",
+                name.c_str());
+        return false;
+    }
+    const auto* values = reinterpret_cast<const float*>(bytes);
+    for (std::size_t i = 0; i < elements; ++i) {
+        if (!std::isfinite(values[i])) {
+            fprintf(stderr, "VITS: tensor 'model.%s' contains a non-finite value\n",
+                    name.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+bool expect_weight_norm(const Weights& w, const std::string& name,
+                        int out_dim,
+                        std::initializer_list<int64_t> value_shape) {
+    if (out_dim <= 0 || value_shape.size() == 0 ||
+        *value_shape.begin() != out_dim ||
+        !expect_finite_tensor(w, name + ".weight_g", {out_dim, 1, 1}) ||
+        !expect_finite_tensor(w, name + ".weight_v", value_shape)) {
+        return false;
+    }
+
+    std::size_t elements = 1;
+    for (const int64_t dim : value_shape) {
+        const std::size_t size = static_cast<std::size_t>(dim);
+        if (elements > std::numeric_limits<std::size_t>::max() / size) return false;
+        elements *= size;
+    }
+    const std::size_t rows = static_cast<std::size_t>(out_dim);
+    if (elements % rows != 0) return false;
+    const std::size_t inner = elements / rows;
+    const float* g = w.get(name + ".weight_g");
+    const float* v = w.get(name + ".weight_v");
+    if (!g || !v) return false;
+
+    for (std::size_t row = 0; row < rows; ++row) {
+        double norm_squared = 0.0;
+        for (std::size_t i = 0; i < inner; ++i) {
+            const double value = v[row * inner + i];
+            norm_squared += value * value;
+        }
+        if (!(norm_squared > 0.0) || !std::isfinite(norm_squared)) {
+            fprintf(stderr, "VITS: weight norm 'model.%s' has a degenerate row\n",
+                    name.c_str());
+            return false;
+        }
+        const double norm = std::sqrt(norm_squared);
+        for (std::size_t i = 0; i < inner; ++i) {
+            const double reconstructed =
+                static_cast<double>(g[row]) * v[row * inner + i] / norm;
+            if (!std::isfinite(reconstructed) ||
+                std::abs(reconstructed) > std::numeric_limits<float>::max()) {
+                fprintf(stderr,
+                        "VITS: weight norm 'model.%s' reconstruction overflows\n",
+                        name.c_str());
+                return false;
+            }
+        }
     }
     return true;
 }
 
 bool validate_checkpoint(const Weights& w, int feature_dim, int& num_speakers) {
     bool ok = true;
-    ok &= expect_shape(w, "enc_p.emb_phone.weight", {kHidden, feature_dim});
-    ok &= expect_shape(w, "enc_p.emb_phone.bias", {kHidden});
-    ok &= expect_shape(w, "enc_p.emb_pitch.weight", {256, kHidden});
+    ok &= expect_finite_tensor(w, "enc_p.emb_phone.weight", {kHidden, feature_dim});
+    ok &= expect_finite_tensor(w, "enc_p.emb_phone.bias", {kHidden});
+    ok &= expect_finite_tensor(w, "enc_p.emb_pitch.weight", {256, kHidden});
     for (int layer = 0; layer < kNLayers; ++layer) {
         const std::string a = "enc_p.encoder.attn_layers." + std::to_string(layer) + ".";
-        ok &= expect_shape(w, a + "emb_rel_k", {1, 2 * kWindow + 1, kHidden / kNHeads});
-        ok &= expect_shape(w, a + "emb_rel_v", {1, 2 * kWindow + 1, kHidden / kNHeads});
+        ok &= expect_finite_tensor(w, a + "emb_rel_k", {1, 2 * kWindow + 1, kHidden / kNHeads});
+        ok &= expect_finite_tensor(w, a + "emb_rel_v", {1, 2 * kWindow + 1, kHidden / kNHeads});
         for (const char* proj : {"conv_q", "conv_k", "conv_v", "conv_o"}) {
-            ok &= expect_shape(w, a + proj + ".weight", {kHidden, kHidden, 1});
-            ok &= expect_shape(w, a + proj + ".bias", {kHidden});
+            ok &= expect_finite_tensor(w, a + proj + ".weight", {kHidden, kHidden, 1});
+            ok &= expect_finite_tensor(w, a + proj + ".bias", {kHidden});
         }
         const std::string f = "enc_p.encoder.ffn_layers." + std::to_string(layer) + ".";
-        ok &= expect_shape(w, f + "conv_1.weight", {kFilter, kHidden, 3});
-        ok &= expect_shape(w, f + "conv_1.bias", {kFilter});
-        ok &= expect_shape(w, f + "conv_2.weight", {kHidden, kFilter, 3});
-        ok &= expect_shape(w, f + "conv_2.bias", {kHidden});
+        ok &= expect_finite_tensor(w, f + "conv_1.weight", {kFilter, kHidden, 3});
+        ok &= expect_finite_tensor(w, f + "conv_1.bias", {kFilter});
+        ok &= expect_finite_tensor(w, f + "conv_2.weight", {kHidden, kFilter, 3});
+        ok &= expect_finite_tensor(w, f + "conv_2.bias", {kHidden});
         for (const char* norm : {"norm_layers_1", "norm_layers_2"}) {
             const std::string n = "enc_p.encoder." + std::string(norm) + "." +
                                   std::to_string(layer) + ".";
-            ok &= expect_shape(w, n + "gamma", {kHidden});
-            ok &= expect_shape(w, n + "beta", {kHidden});
+            ok &= expect_finite_tensor(w, n + "gamma", {kHidden});
+            ok &= expect_finite_tensor(w, n + "beta", {kHidden});
         }
     }
-    ok &= expect_shape(w, "enc_p.proj.weight", {2 * kInter, kHidden, 1});
-    ok &= expect_shape(w, "enc_p.proj.bias", {2 * kInter});
+    ok &= expect_finite_tensor(w, "enc_p.proj.weight", {2 * kInter, kHidden, 1});
+    ok &= expect_finite_tensor(w, "enc_p.proj.bias", {2 * kInter});
 
     for (int coupling = 0; coupling < 4; ++coupling) {
         const std::string p = "flow.flows." + std::to_string(coupling * 2) + ".";
-        ok &= expect_shape(w, p + "pre.weight", {kHidden, kInter / 2, 1});
-        ok &= expect_shape(w, p + "pre.bias", {kHidden});
-        ok &= expect_shape(w, p + "post.weight", {kInter / 2, kHidden, 1});
-        ok &= expect_shape(w, p + "post.bias", {kInter / 2});
+        ok &= expect_finite_tensor(w, p + "pre.weight", {kHidden, kInter / 2, 1});
+        ok &= expect_finite_tensor(w, p + "pre.bias", {kHidden});
+        ok &= expect_finite_tensor(w, p + "post.weight", {kInter / 2, kHidden, 1});
+        ok &= expect_finite_tensor(w, p + "post.bias", {kInter / 2});
         const std::string e = p + "enc.";
-        ok &= expect_shape(w, e + "cond_layer.weight_g", {2 * kHidden * 3, 1, 1});
-        ok &= expect_shape(w, e + "cond_layer.weight_v", {2 * kHidden * 3, kGin, 1});
-        ok &= expect_shape(w, e + "cond_layer.bias", {2 * kHidden * 3});
+        ok &= expect_weight_norm(w, e + "cond_layer", 2 * kHidden * 3,
+                                 {2 * kHidden * 3, kGin, 1});
+        ok &= expect_finite_tensor(w, e + "cond_layer.bias", {2 * kHidden * 3});
         for (int layer = 0; layer < 3; ++layer) {
             const std::string in = e + "in_layers." + std::to_string(layer) + ".";
-            ok &= expect_shape(w, in + "weight_g", {2 * kHidden, 1, 1});
-            ok &= expect_shape(w, in + "weight_v", {2 * kHidden, kHidden, 5});
-            ok &= expect_shape(w, in + "bias", {2 * kHidden});
+            ok &= expect_weight_norm(w, in.substr(0, in.size() - 1), 2 * kHidden,
+                                     {2 * kHidden, kHidden, 5});
+            ok &= expect_finite_tensor(w, in + "bias", {2 * kHidden});
             const int rs_channels = layer < 2 ? 2 * kHidden : kHidden;
             const std::string rs = e + "res_skip_layers." + std::to_string(layer) + ".";
-            ok &= expect_shape(w, rs + "weight_g", {rs_channels, 1, 1});
-            ok &= expect_shape(w, rs + "weight_v", {rs_channels, kHidden, 1});
-            ok &= expect_shape(w, rs + "bias", {rs_channels});
+            ok &= expect_weight_norm(w, rs.substr(0, rs.size() - 1), rs_channels,
+                                     {rs_channels, kHidden, 1});
+            ok &= expect_finite_tensor(w, rs + "bias", {rs_channels});
         }
     }
 
-    ok &= expect_shape(w, "dec.m_source.l_linear.weight", {1, 1});
-    ok &= expect_shape(w, "dec.m_source.l_linear.bias", {1});
-    ok &= expect_shape(w, "dec.conv_pre.weight", {512, kInter, 7});
-    ok &= expect_shape(w, "dec.conv_pre.bias", {512});
-    ok &= expect_shape(w, "dec.cond.weight", {512, kGin, 1});
-    ok &= expect_shape(w, "dec.cond.bias", {512});
+    ok &= expect_finite_tensor(w, "dec.m_source.l_linear.weight", {1, 1});
+    ok &= expect_finite_tensor(w, "dec.m_source.l_linear.bias", {1});
+    ok &= expect_finite_tensor(w, "dec.conv_pre.weight", {512, kInter, 7});
+    ok &= expect_finite_tensor(w, "dec.conv_pre.bias", {512});
+    ok &= expect_finite_tensor(w, "dec.cond.weight", {512, kGin, 1});
+    ok &= expect_finite_tensor(w, "dec.cond.bias", {512});
     const int rates[4] = {10, 10, 2, 2};
     const int kernels[4] = {16, 16, 4, 4};
     const int resblock_kernels[3] = {3, 7, 11};
@@ -151,9 +276,9 @@ bool validate_checkpoint(const Weights& w, int feature_dim, int& num_speakers) {
     for (int stage = 0; stage < 4; ++stage) {
         const int out_channels = channels / 2;
         const std::string up = "dec.ups." + std::to_string(stage) + ".";
-        ok &= expect_shape(w, up + "weight_g", {channels, 1, 1});
-        ok &= expect_shape(w, up + "weight_v", {channels, out_channels, kernels[stage]});
-        ok &= expect_shape(w, up + "bias", {out_channels});
+        ok &= expect_weight_norm(w, up.substr(0, up.size() - 1), channels,
+                                 {channels, out_channels, kernels[stage]});
+        ok &= expect_finite_tensor(w, up + "bias", {out_channels});
         int source_kernel = 1;
         if (stage < 3) {
             int remaining_rate = 1;
@@ -161,8 +286,8 @@ bool validate_checkpoint(const Weights& w, int feature_dim, int& num_speakers) {
             source_kernel = remaining_rate * 2;
         }
         const std::string noise = "dec.noise_convs." + std::to_string(stage) + ".";
-        ok &= expect_shape(w, noise + "weight", {out_channels, 1, source_kernel});
-        ok &= expect_shape(w, noise + "bias", {out_channels});
+        ok &= expect_finite_tensor(w, noise + "weight", {out_channels, 1, source_kernel});
+        ok &= expect_finite_tensor(w, noise + "bias", {out_channels});
         for (int block = 0; block < 3; ++block) {
             const int rb = stage * 3 + block;
             const int kernel = resblock_kernels[block];
@@ -170,20 +295,22 @@ bool validate_checkpoint(const Weights& w, int feature_dim, int& num_speakers) {
             for (int layer = 0; layer < 3; ++layer) {
                 for (const char* group : {"convs1", "convs2"}) {
                     const std::string c = p + group + "." + std::to_string(layer) + ".";
-                    ok &= expect_shape(w, c + "weight_g", {out_channels, 1, 1});
-                    ok &= expect_shape(w, c + "weight_v", {out_channels, out_channels, kernel});
-                    ok &= expect_shape(w, c + "bias", {out_channels});
+                    ok &= expect_weight_norm(w, c.substr(0, c.size() - 1),
+                                             out_channels,
+                                             {out_channels, out_channels, kernel});
+                    ok &= expect_finite_tensor(w, c + "bias", {out_channels});
                 }
             }
         }
         channels = out_channels;
     }
-    ok &= expect_shape(w, "dec.conv_post.weight", {1, channels, 7});
+    ok &= expect_finite_tensor(w, "dec.conv_post.weight", {1, channels, 7});
 
     const io::Tensor* speakers = w.meta("emb_g.weight");
     if (!speakers || speakers->shape.size() != 2 || speakers->shape[0] <= 0 ||
-        speakers->shape[1] != kGin || speakers->dtype != "F32" ||
-        speakers->data_nbytes != static_cast<std::size_t>(speakers->shape[0] * kGin) * sizeof(float)) {
+        speakers->shape[0] > std::numeric_limits<int>::max() ||
+        speakers->shape[1] != kGin ||
+        !expect_finite_tensor(w, "emb_g.weight", {speakers->shape[0], kGin})) {
         fprintf(stderr, "VITS: tensor 'model.emb_g.weight' has incompatible shape or dtype\n");
         ok = false;
     } else {
@@ -195,9 +322,11 @@ bool validate_checkpoint(const Weights& w, int feature_dim, int& num_speakers) {
 bool supported_architecture(const SynthesizerConfig& config) {
     return (config.version == ModelVersion::kV1 ||
             config.version == ModelVersion::kV2) &&
+           config.spec_channels == 1025 && config.segment_size == 3200 &&
            config.inter_channels == kInter && config.hidden_channels == kHidden &&
            config.filter_channels == kFilter && config.n_heads == kNHeads &&
            config.n_layers == kNLayers && config.kernel_size == 3 &&
+           config.p_dropout == 0 && !config.half_precision &&
            config.gin_channels == kGin && config.upsample_initial_channel == 512 &&
            config.resblock == "1" &&
            config.upsample_rates == std::vector<int>({10, 10, 2, 2}) &&
@@ -210,6 +339,39 @@ bool supported_architecture(const SynthesizerConfig& config) {
 
 bool valid_speaker(int speaker_id, int num_speakers) {
     return speaker_id >= 0 && speaker_id < num_speakers;
+}
+
+bool valid_frame_count(int frames, int max_elements_per_frame,
+                       bool uses_attention) {
+    if (frames <= 0 || max_elements_per_frame <= 0) return false;
+    // Current attention and CUDA operator boundaries use int element counts.
+    // Reject before scanning caller memory or forming a signed product.
+    const std::int64_t frame_count = frames;
+    const std::int64_t max_int = std::numeric_limits<int>::max();
+    if (frames > std::numeric_limits<int>::max() / max_elements_per_frame ||
+        (uses_attention && frame_count > max_int / (2 * frame_count))) {
+        return false;
+    }
+    return true;
+}
+
+bool valid_float_input(const float* values, int frames, int width,
+                       int max_elements_per_frame, bool uses_attention) {
+    if (!values || width <= 0 || max_elements_per_frame < width ||
+        !valid_frame_count(frames, max_elements_per_frame, uses_attention)) {
+        return false;
+    }
+    const std::size_t elements = static_cast<std::size_t>(frames) * width;
+    for (std::size_t i = 0; i < elements; ++i) {
+        if (!std::isfinite(values[i])) return false;
+    }
+    return true;
+}
+
+bool valid_features(const float* features, int frames, int feature_dim) {
+    // The widest generator stage has 12,800 channel-time elements per input
+    // frame; attention additionally forms T*(2T) int-indexed intermediates.
+    return valid_float_input(features, frames, feature_dim, 12'800, true);
 }
 
 bool valid_pitch(const float* pitch, const float* pitchf, int frames) {
@@ -230,18 +392,44 @@ bool valid_coarse_pitch(const int* pitch, int frames) {
     return true;
 }
 
+bool all_finite(const std::vector<float>& values) {
+    return std::all_of(values.begin(), values.end(),
+                       [](float value) { return std::isfinite(value); });
+}
+
 // Reconstruct weight_norm weight: weight[o,inner] = g[o] * v[o,inner] / ||v[o]||.
 std::vector<float> reconstruct_wn(const Weights& w, const std::string& name,
                                   int out_dim, int inner) {
+    if (out_dim <= 0 || inner <= 0 ||
+        static_cast<std::size_t>(out_dim) >
+            std::numeric_limits<std::size_t>::max() /
+                static_cast<std::size_t>(inner)) {
+        return {};
+    }
     const float* g = w.get(name + ".weight_g");
     const float* v = w.get(name + ".weight_v");
-    std::vector<float> out(out_dim * inner);
+    if (!g || !v) return {};
+    std::vector<float> out(static_cast<std::size_t>(out_dim) * inner);
     for (int o = 0; o < out_dim; ++o) {
+        if (!std::isfinite(g[o])) return {};
         double n2 = 0.0;
-        for (int i = 0; i < inner; ++i) { float x = v[o * inner + i]; n2 += (double)x * x; }
-        float inv = (float)(1.0 / std::sqrt(n2));
-        float gg = g[o];
-        for (int i = 0; i < inner; ++i) out[o * inner + i] = gg * v[o * inner + i] * inv;
+        for (int i = 0; i < inner; ++i) {
+            const float value = v[static_cast<std::size_t>(o) * inner + i];
+            if (!std::isfinite(value)) return {};
+            n2 += static_cast<double>(value) * value;
+        }
+        if (!(n2 > 0.0) || !std::isfinite(n2)) return {};
+        const double norm = std::sqrt(n2);
+        for (int i = 0; i < inner; ++i) {
+            const std::size_t index = static_cast<std::size_t>(o) * inner + i;
+            const double reconstructed =
+                static_cast<double>(g[o]) * static_cast<double>(v[index]) / norm;
+            if (!std::isfinite(reconstructed) ||
+                std::abs(reconstructed) > std::numeric_limits<float>::max()) {
+                return {};
+            }
+            out[index] = static_cast<float>(reconstructed);
+        }
     }
     return out;
 }
@@ -487,6 +675,9 @@ std::vector<float> wn_forward(const Weights& w, const std::string& p,
     const int H = kHidden, nLayers = 3, kernel = 5;
     // cond: Conv1d(gin, 2H*nLayers, 1). g is [gin,1] -> broadcast to [2H*nLayers, T]
     auto cond_w = reconstruct_wn(w, p + "cond_layer", 2 * H * nLayers, kGin);
+    if (cond_w.size() != static_cast<std::size_t>(2 * H * nLayers * kGin)) {
+        return {};
+    }
     const float* cond_b = w.get(p + "cond_layer.bias");
     // g_cond[c] = bias[c] + sum_gi cond_w[c,gi]*g[gi]
     std::vector<float> g_cond(2 * H * nLayers);
@@ -502,6 +693,7 @@ std::vector<float> wn_forward(const Weights& w, const std::string& p,
         int dilation = 1;  // dilation_rate=1
         int pad = (kernel * dilation - dilation) / 2;  // 2
         auto in_w = reconstruct_wn(w, il, 2 * H, H * kernel);
+        if (in_w.size() != static_cast<std::size_t>(2 * H * H * kernel)) return {};
         const float* in_b = w.get(il + ".bias");
         auto x_in = op::conv1d(x.data(), H, T, in_w.data(), in_b, 2 * H, kernel, 1, pad, dilation, 1);
         // fused add tanh sigmoid multiply with g_l
@@ -517,6 +709,7 @@ std::vector<float> wn_forward(const Weights& w, const std::string& p,
         std::string rl = p + "res_skip_layers." + std::to_string(i);
         int rs_ch = (i < nLayers - 1) ? 2 * H : H;
         auto rs_w = reconstruct_wn(w, rl, rs_ch, H);
+        if (rs_w.size() != static_cast<std::size_t>(rs_ch * H)) return {};
         const float* rs_b = w.get(rl + ".bias");
         auto rs = conv1x1(acts, H, T, rs_w.data(), rs_b, rs_ch);
         if (i < nLayers - 1) {
@@ -554,6 +747,7 @@ std::vector<float> flow_reverse(const Weights& w, std::vector<float> x, int T,
         auto h = conv1x1(x0, half, T, w.get(p + "pre.weight"), w.get(p + "pre.bias"), kHidden);
         // h = enc(h, g)  [WN]
         h = wn_forward(w, p + "enc.", std::move(h), T, g);
+        if (h.size() != static_cast<std::size_t>(kHidden * T)) return {};
         // stats = post(h): Conv1d(hidden, half, 1) (mean_only)
         auto m = conv1x1(h, kHidden, T, w.get(p + "post.weight"), w.get(p + "post.bias"), half);
         // x1 = (x1 - m) * exp(-logs); logs=0 -> x1 = x1 - m
@@ -615,11 +809,13 @@ std::vector<float> resblock1(const Weights& w, const std::string& p,
         op::leaky_relu_inplace(xt.data(), C * T, kLRelu);
         std::string c1 = p + "convs1." + std::to_string(j);
         auto w1 = reconstruct_wn(w, c1, C, C * kernel);
+        if (w1.size() != static_cast<std::size_t>(C * C * kernel)) return {};
         int pad1 = dil[j] * (kernel - 1) / 2;
         xt = op::conv1d(xt.data(), C, T, w1.data(), w.get(c1 + ".bias"), C, kernel, 1, pad1, dil[j], 1);
         op::leaky_relu_inplace(xt.data(), C * T, kLRelu);
         std::string c2 = p + "convs2." + std::to_string(j);
         auto w2 = reconstruct_wn(w, c2, C, C * kernel);
+        if (w2.size() != static_cast<std::size_t>(C * C * kernel)) return {};
         int pad2 = (kernel - 1) / 2;
         xt = op::conv1d(xt.data(), C, T, w2.data(), w.get(c2 + ".bias"), C, kernel, 1, pad2, 1, 1);
         for (int i = 0; i < C * T; ++i) x[i] += xt[i];
@@ -661,6 +857,7 @@ std::vector<float> generator(const Weights& w, std::vector<float> x, int T,
         int Cout = C / 2;
         int u = upsample_rates[i], kk = upsample_kernels[i], pad = (kk - u) / 2;
         auto up_w = reconstruct_wn(w, "dec.ups." + std::to_string(i), C, Cout * kk);
+        if (up_w.size() != static_cast<std::size_t>(C * Cout * kk)) return {};
         // weight layout [C, Cout, kk]
         auto up = op::conv_transpose1d(xc.data(), C, L, up_w.data(),
                                        w.get("dec.ups." + std::to_string(i) + ".bias"),
@@ -695,6 +892,7 @@ std::vector<float> generator(const Weights& w, std::vector<float> x, int T,
         for (int jr = 0; jr < 3; ++jr) {
             std::string rp = "dec.resblocks." + std::to_string(i * 3 + jr) + ".";
             auto rb = resblock1(w, rp, xn, Cout, use_len, resblock_k[jr], resblock_d[jr]);
+            if (rb.size() != static_cast<std::size_t>(Cout * use_len)) return {};
             for (int idx = 0; idx < Cout * use_len; ++idx) acc[idx] += rb[idx];
         }
         for (auto& v : acc) v /= 3.0f;
@@ -713,8 +911,15 @@ std::vector<float> generator(const Weights& w, std::vector<float> x, int T,
 
 }  // namespace
 
+struct Synthesizer::ModelState {
+    std::shared_ptr<const io::SafetensorsLoader> loader;
+    CheckpointIdentity identity;
+    std::string resolved_path;
+};
+
 bool Synthesizer::init(const SynthesizerConfig& config) {
     initialized_ = false;
+    model_state_.reset();
     num_speakers_ = 0;
     has_f0_ = false;
     if (!config.has_f0) {
@@ -727,14 +932,28 @@ bool Synthesizer::init(const SynthesizerConfig& config) {
     }
 
     const int feature_dim = config.version == ModelVersion::kV1 ? 256 : 768;
+    std::string resolved_path;
+    CheckpointIdentity identity_before;
+    CheckpointIdentity identity_loaded;
+    CheckpointIdentity identity_validated;
     Weights weights;
     int checkpoint_speakers = 0;
-    if (!weights.load(config.model_path) ||
-        !validate_checkpoint(weights, feature_dim, checkpoint_speakers)) {
+    if (!resolve_checkpoint_path(config.model_path, resolved_path) ||
+        !read_checkpoint_identity(resolved_path, identity_before) ||
+        !weights.load(resolved_path) ||
+        !read_checkpoint_identity(resolved_path, identity_loaded) ||
+        !(identity_before == identity_loaded) ||
+        !validate_checkpoint(weights, feature_dim, checkpoint_speakers) ||
+        !read_checkpoint_identity(resolved_path, identity_validated) ||
+        !(identity_loaded == identity_validated)) {
         fprintf(stderr, "VITS: checkpoint validation failed for '%s'\n",
                 config.model_path.c_str());
         return false;
     }
+    auto staged_state = std::make_shared<ModelState>();
+    staged_state->loader = weights.loader;
+    staged_state->identity = identity_validated;
+    staged_state->resolved_path = std::move(resolved_path);
 
     config_ = config;
     config_.spk_embed_dim = checkpoint_speakers;
@@ -743,44 +962,62 @@ bool Synthesizer::init(const SynthesizerConfig& config) {
     has_f0_ = true;
     num_speakers_ = checkpoint_speakers;
     feature_dim_ = feature_dim;
+    model_state_ = std::move(staged_state);
     initialized_ = true;
     return true;
 }
 
+bool Synthesizer::checkpoint_current() const {
+    return model_state_ &&
+           checkpoint_is_current(model_state_->resolved_path,
+                                 model_state_->identity);
+}
+
 std::vector<float> Synthesizer::debug_text_encoder(const float* features, int frames,
                                                    const int* pitch_coarse) {
-    if (!initialized_ || !features || !valid_coarse_pitch(pitch_coarse, frames)) return {};
+    if (!initialized_ || !checkpoint_current() ||
+        !valid_features(features, frames, feature_dim_) ||
+        !valid_coarse_pitch(pitch_coarse, frames)) return {};
     Weights w;
-    if (!w.load(config_.model_path)) return {};
-    return text_encoder(w, features, frames, feature_dim_, pitch_coarse, nullptr);
+    w.loader = model_state_->loader;
+    auto result = text_encoder(w, features, frames, feature_dim_, pitch_coarse, nullptr);
+    return all_finite(result) ? result : std::vector<float>{};
 }
 
 std::vector<float> Synthesizer::debug_flow(const float* features, int frames,
                                            const int* pitch_coarse, int speaker_id) {
-    if (!initialized_ || !features || !valid_coarse_pitch(pitch_coarse, frames) ||
+    if (!initialized_ || !checkpoint_current() ||
+        !valid_features(features, frames, feature_dim_) ||
+        !valid_coarse_pitch(pitch_coarse, frames) ||
         !valid_speaker(speaker_id, num_speakers_)) return {};
     Weights w;
-    if (!w.load(config_.model_path)) return {};
+    w.loader = model_state_->loader;
     auto m_p = text_encoder(w, features, frames, feature_dim_, pitch_coarse, nullptr);
     const float* emb_g = w.get("emb_g.weight");  // [num_spk, gin]
     std::vector<float> g(kGin);
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
-    return flow_reverse(w, std::move(m_p), frames, g.data());
+    auto result = flow_reverse(w, std::move(m_p), frames, g.data());
+    return all_finite(result) ? result : std::vector<float>{};
 }
 
 std::vector<float> Synthesizer::debug_har(const float* f0, int frames) {
-    if (!initialized_ || !f0 || frames <= 0) return {};
-    for (int frame = 0; frame < frames; ++frame)
-        if (!std::isfinite(f0[frame]) || f0[frame] < 0.0f) return {};
+    if (!initialized_ || !checkpoint_current() ||
+        !valid_float_input(f0, frames, 1, 400, false)) return {};
+    for (int frame = 0; frame < frames; ++frame) {
+        if (f0[frame] < 0.0f) return {};
+    }
     Weights w;
-    if (!w.load(config_.model_path)) return {};
-    return sine_source(f0, frames, 400, sample_rate_, w);
+    w.loader = model_state_->loader;
+    auto result = sine_source(f0, frames, 400, sample_rate_, w);
+    return all_finite(result) ? result : std::vector<float>{};
 }
 
 std::vector<float> Synthesizer::debug_convpre(const float* z, int frames, int speaker_id) {
-    if (!initialized_ || !z || frames <= 0 || !valid_speaker(speaker_id, num_speakers_)) return {};
+    if (!initialized_ || !checkpoint_current() ||
+        !valid_float_input(z, frames, kInter, 512, false) ||
+        !valid_speaker(speaker_id, num_speakers_)) return {};
     Weights w;
-    if (!w.load(config_.model_path)) return {};
+    w.loader = model_state_->loader;
     const float* emb_g = w.get("emb_g.weight");
     std::vector<float> g(kGin);
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
@@ -794,17 +1031,21 @@ std::vector<float> Synthesizer::debug_convpre(const float* z, int frames, int sp
         for (int gi = 0; gi < kGin; ++gi) s += cw[c * kGin + gi] * g[gi];
         for (int t = 0; t < frames; ++t) xc[c * frames + t] += s;
     }
-    return xc;
+    return all_finite(xc) ? xc : std::vector<float>{};
 }
 
 std::vector<float> Synthesizer::debug_gen_stage0(const float* z, const float* f0,
                                                  int frames, int speaker_id, int which) {
-    if (!initialized_ || !z || !f0 || frames <= 0 || which < 0 || which > 2 ||
+    if (!initialized_ || !checkpoint_current() ||
+        !valid_float_input(z, frames, kInter, 2'560, false) ||
+        !valid_float_input(f0, frames, 1, 400, false) ||
+        which < 0 || which > 2 ||
         !valid_speaker(speaker_id, num_speakers_)) return {};
-    for (int frame = 0; frame < frames; ++frame)
-        if (!std::isfinite(f0[frame]) || f0[frame] < 0.0f) return {};
+    for (int frame = 0; frame < frames; ++frame) {
+        if (f0[frame] < 0.0f) return {};
+    }
     Weights w;
-    if (!w.load(config_.model_path)) return {};
+    w.loader = model_state_->loader;
     const float* emb_g = w.get("emb_g.weight");
     std::vector<float> g(kGin);
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
@@ -824,16 +1065,19 @@ std::vector<float> Synthesizer::debug_gen_stage0(const float* z, const float* f0
     op::leaky_relu_inplace(xc.data(), C * L, kLRelu);
     int Cout = 256, u = 10, kk = 16, pad = 3;
     auto up_w = reconstruct_wn(w, "dec.ups.0", C, Cout * kk);
+    if (up_w.size() != static_cast<std::size_t>(C * Cout * kk)) return {};
     auto up = op::conv_transpose1d(xc.data(), C, L, up_w.data(),
                                    w.get("dec.ups.0.bias"), Cout, kk, u, pad);
     int Lout = (L - 1) * u - 2 * pad + kk;
-    if (which == 0) return up;  // [256, Lout]
+    if (which == 0) {
+        return all_finite(up) ? up : std::vector<float>{};  // [256, Lout]
+    }
 
     int stride_f0 = 10 * 2 * 2;  // 40
     auto xsrc = op::conv1d(har.data(), 1, (int)har.size(),
                            w.get("dec.noise_convs.0.weight"), w.get("dec.noise_convs.0.bias"),
                            Cout, stride_f0 * 2, stride_f0, stride_f0 / 2, 1, 1);
-    if (which == 1) return xsrc;
+    if (which == 1) return all_finite(xsrc) ? xsrc : std::vector<float>{};
 
     int use_len = std::min(Lout, (int)xsrc.size() / Cout);
     std::vector<float> xn(Cout * use_len);
@@ -845,48 +1089,58 @@ std::vector<float> Synthesizer::debug_gen_stage0(const float* z, const float* f0
     std::vector<float> acc(Cout * use_len, 0.0f);
     for (int jr = 0; jr < 3; ++jr) {
         auto rb = resblock1(w, "dec.resblocks." + std::to_string(jr) + ".", xn, Cout, use_len, rk[jr], rd[jr]);
+        if (rb.size() != static_cast<std::size_t>(Cout * use_len)) return {};
         for (int i = 0; i < Cout * use_len; ++i) acc[i] += rb[i];
     }
     for (auto& v : acc) v /= 3.0f;
-    return acc;
+    return all_finite(acc) ? acc : std::vector<float>{};
 }
 
 std::vector<float> Synthesizer::debug_decode(const float* z, const float* f0,
                                              int frames, int speaker_id) {
-    if (!initialized_ || !z || !f0 || frames <= 0 ||
+    if (!initialized_ || !checkpoint_current() ||
+        !valid_float_input(z, frames, kInter, 12'800, false) ||
+        !valid_float_input(f0, frames, 1, 400, false) ||
         !valid_speaker(speaker_id, num_speakers_)) return {};
-    for (int frame = 0; frame < frames; ++frame)
-        if (!std::isfinite(f0[frame]) || f0[frame] < 0.0f) return {};
+    for (int frame = 0; frame < frames; ++frame) {
+        if (f0[frame] < 0.0f) return {};
+    }
     Weights w;
-    if (!w.load(config_.model_path)) return {};
+    w.loader = model_state_->loader;
     const float* emb_g = w.get("emb_g.weight");
     std::vector<float> g(kGin);
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
     std::vector<float> x(z, z + kInter * frames);
-    return generator(w, std::move(x), frames, f0, g.data(), sample_rate_);
+    auto result = generator(w, std::move(x), frames, f0, g.data(), sample_rate_);
+    return all_finite(result) ? result : std::vector<float>{};
 }
 
 std::vector<float> Synthesizer::debug_encp(const float* features, int frames,
                                            const int* pitch_coarse, bool want_logs) {
-    if (!initialized_ || !features || !valid_coarse_pitch(pitch_coarse, frames)) return {};
+    if (!initialized_ || !checkpoint_current() ||
+        !valid_features(features, frames, feature_dim_) ||
+        !valid_coarse_pitch(pitch_coarse, frames)) return {};
     Weights w;
-    if (!w.load(config_.model_path)) return {};
+    w.loader = model_state_->loader;
     std::vector<float> logs;
     auto m_p = text_encoder(w, features, frames, feature_dim_, pitch_coarse,
                             want_logs ? &logs : nullptr);
     if (want_logs) m_p.insert(m_p.end(), logs.begin(), logs.end());  // [m_p ; logs_p]
-    return m_p;
+    return all_finite(m_p) ? m_p : std::vector<float>{};
 }
 
 std::vector<float> Synthesizer::debug_flow_reverse(const float* x, int frames, int speaker_id) {
-    if (!initialized_ || !x || frames <= 0 || !valid_speaker(speaker_id, num_speakers_)) return {};
+    if (!initialized_ || !checkpoint_current() ||
+        !valid_float_input(x, frames, kInter, kFilter, false) ||
+        !valid_speaker(speaker_id, num_speakers_)) return {};
     Weights w;
-    if (!w.load(config_.model_path)) return {};
+    w.loader = model_state_->loader;
     const float* emb_g = w.get("emb_g.weight");
     std::vector<float> g(kGin);
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
     std::vector<float> in(x, x + kInter * frames);
-    return flow_reverse(w, std::move(in), frames, g.data());
+    auto result = flow_reverse(w, std::move(in), frames, g.data());
+    return all_finite(result) ? result : std::vector<float>{};
 }
 
 AudioBuffer Synthesizer::infer(const float* features, int frames,
@@ -895,13 +1149,15 @@ AudioBuffer Synthesizer::infer(const float* features, int frames,
     AudioBuffer result;
     result.sample_rate = sample_rate_;
 
-    if (!initialized_ || !features || !valid_speaker(speaker_id, num_speakers_) ||
+    if (!initialized_ || !checkpoint_current() ||
+        !valid_features(features, frames, feature_dim_) ||
+        !valid_speaker(speaker_id, num_speakers_) ||
         !valid_pitch(pitch, pitchf, frames)) {
         return result;
     }
 
     Weights w;
-    if (!w.load(config_.model_path)) return result;
+    w.loader = model_state_->loader;
 
     // pitch here is coarse (int stored as float); pitchf is f0 in Hz.
     std::vector<int> pitch_coarse(frames);
@@ -914,10 +1170,13 @@ AudioBuffer Synthesizer::infer(const float* features, int frames,
 
     // enc_p -> m_p  (deterministic: z_p = m_p)
     auto m_p = text_encoder(w, features, frames, feature_dim_, pitch_coarse.data(), nullptr);
+    if (m_p.size() != static_cast<std::size_t>(kInter * frames)) return result;
     // flow reverse -> z
     auto z = flow_reverse(w, m_p, frames, g.data());
+    if (z.size() != static_cast<std::size_t>(kInter * frames)) return result;
     // generator -> audio
     auto audio = generator(w, std::move(z), frames, pitchf, g.data(), sample_rate_);
+    if (audio.empty() || !all_finite(audio)) return result;
 
     result.data = std::move(audio);
     return result;

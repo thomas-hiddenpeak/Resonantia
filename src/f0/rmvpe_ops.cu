@@ -5,6 +5,8 @@
 
 #include "voxmutatio/f0/rmvpe_ops.h"
 
+#include "voxmutatio/core/cuda_buffer.h"
+
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -130,23 +132,23 @@ std::vector<float> conv2d_generic(const float* input, int Cin, int H, int W,
     int out_size = Cout * H * W;
     std::vector<float> output(out_size);
 
-    float *d_in, *d_w, *d_b = nullptr, *d_out;
-    CK(cudaMalloc(&d_in, in_size * sizeof(float)));
-    CK(cudaMalloc(&d_w, w_size * sizeof(float)));
-    CK(cudaMalloc(&d_out, out_size * sizeof(float)));
-    CK(cudaMemcpy(d_in, input, in_size * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_w, weight, w_size * sizeof(float), cudaMemcpyHostToDevice));
+    core::CudaBuffer d_in(static_cast<std::size_t>(in_size));
+    core::CudaBuffer d_w(static_cast<std::size_t>(w_size));
+    core::CudaBuffer d_b;
+    core::CudaBuffer d_out(static_cast<std::size_t>(out_size));
+    CK(cudaMemcpy(d_in.data(), input, in_size * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_w.data(), weight, w_size * sizeof(float), cudaMemcpyHostToDevice));
     if (bias) {
-        CK(cudaMalloc(&d_b, Cout * sizeof(float)));
-        CK(cudaMemcpy(d_b, bias, Cout * sizeof(float), cudaMemcpyHostToDevice));
+        d_b.allocate(static_cast<std::size_t>(Cout));
+        CK(cudaMemcpy(d_b.data(), bias, Cout * sizeof(float), cudaMemcpyHostToDevice));
     }
 
     dim3 block(16, 16);
     dim3 grid((W + 15) / 16, (H + 15) / 16, Cout);
-    conv2d_kernel<<<grid, block>>>(d_in, d_w, d_b, d_out, Cin, H, W, Cout, K, P);
-    CK(cudaMemcpy(output.data(), d_out, out_size * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_in); cudaFree(d_w); cudaFree(d_out);
-    if (d_b) cudaFree(d_b);
+    conv2d_kernel<<<grid, block>>>(d_in.data(), d_w.data(), d_b.data(), d_out.data(),
+                                   Cin, H, W, Cout, K, P);
+    CK(cudaMemcpy(output.data(), d_out.data(), out_size * sizeof(float),
+                  cudaMemcpyDeviceToHost));
     return output;
 }
 
@@ -167,57 +169,51 @@ void batchnorm2d(float* data, int C, int H, int W,
                  const float* mean, const float* var, float eps) {
     int HW = H * W;
     int total = C * HW;
-    float *d_data, *d_g, *d_be, *d_m, *d_v;
-    CK(cudaMalloc(&d_data, total * sizeof(float)));
-    CK(cudaMalloc(&d_g, C * sizeof(float)));
-    CK(cudaMalloc(&d_be, C * sizeof(float)));
-    CK(cudaMalloc(&d_m, C * sizeof(float)));
-    CK(cudaMalloc(&d_v, C * sizeof(float)));
-    CK(cudaMemcpy(d_data, data, total * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_g, gamma, C * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_be, beta, C * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_m, mean, C * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_v, var, C * sizeof(float), cudaMemcpyHostToDevice));
+    core::CudaBuffer d_data(static_cast<std::size_t>(total));
+    core::CudaBuffer d_g(static_cast<std::size_t>(C));
+    core::CudaBuffer d_be(static_cast<std::size_t>(C));
+    core::CudaBuffer d_m(static_cast<std::size_t>(C));
+    core::CudaBuffer d_v(static_cast<std::size_t>(C));
+    CK(cudaMemcpy(d_data.data(), data, total * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_g.data(), gamma, C * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_be.data(), beta, C * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_m.data(), mean, C * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_v.data(), var, C * sizeof(float), cudaMemcpyHostToDevice));
 
     int block = 256, grid = (total + block - 1) / block;
-    batchnorm_kernel<<<grid, block>>>(d_data, C, HW, d_g, d_be, d_m, d_v, eps);
-    CK(cudaMemcpy(data, d_data, total * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_data); cudaFree(d_g); cudaFree(d_be); cudaFree(d_m); cudaFree(d_v);
+    batchnorm_kernel<<<grid, block>>>(d_data.data(), C, HW, d_g.data(), d_be.data(),
+                                      d_m.data(), d_v.data(), eps);
+    CK(cudaMemcpy(data, d_data.data(), total * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 void relu_inplace(float* data, int size) {
-    float* d_data;
-    CK(cudaMalloc(&d_data, size * sizeof(float)));
-    CK(cudaMemcpy(d_data, data, size * sizeof(float), cudaMemcpyHostToDevice));
+    core::CudaBuffer d_data(static_cast<std::size_t>(size));
+    CK(cudaMemcpy(d_data.data(), data, size * sizeof(float), cudaMemcpyHostToDevice));
     int block = 256, grid = (size + block - 1) / block;
-    relu_kernel<<<grid, block>>>(d_data, size);
-    CK(cudaMemcpy(data, d_data, size * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_data);
+    relu_kernel<<<grid, block>>>(d_data.data(), size);
+    CK(cudaMemcpy(data, d_data.data(), size * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 void sigmoid_inplace(float* data, int size) {
-    float* d_data;
-    CK(cudaMalloc(&d_data, size * sizeof(float)));
-    CK(cudaMemcpy(d_data, data, size * sizeof(float), cudaMemcpyHostToDevice));
+    core::CudaBuffer d_data(static_cast<std::size_t>(size));
+    CK(cudaMemcpy(d_data.data(), data, size * sizeof(float), cudaMemcpyHostToDevice));
     int block = 256, grid = (size + block - 1) / block;
-    sigmoid_kernel<<<grid, block>>>(d_data, size);
-    CK(cudaMemcpy(data, d_data, size * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_data);
+    sigmoid_kernel<<<grid, block>>>(d_data.data(), size);
+    CK(cudaMemcpy(data, d_data.data(), size * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 std::vector<float> avgpool2d(const float* input, int C, int H, int W,
                              int kh, int kw) {
     int OH = H / kh, OW = W / kw;
     std::vector<float> output(C * OH * OW);
-    float *d_in, *d_out;
-    CK(cudaMalloc(&d_in, C * H * W * sizeof(float)));
-    CK(cudaMalloc(&d_out, C * OH * OW * sizeof(float)));
-    CK(cudaMemcpy(d_in, input, C * H * W * sizeof(float), cudaMemcpyHostToDevice));
+    core::CudaBuffer d_in(static_cast<std::size_t>(C) * H * W);
+    core::CudaBuffer d_out(static_cast<std::size_t>(C) * OH * OW);
+    CK(cudaMemcpy(d_in.data(), input, C * H * W * sizeof(float), cudaMemcpyHostToDevice));
     dim3 block(16, 16);
     dim3 grid((OW + 15) / 16, (OH + 15) / 16, C);
-    avgpool_kernel<<<grid, block>>>(d_in, d_out, C, H, W, kh, kw, OH, OW);
-    CK(cudaMemcpy(output.data(), d_out, C * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_in); cudaFree(d_out);
+    avgpool_kernel<<<grid, block>>>(d_in.data(), d_out.data(), C, H, W, kh, kw, OH, OW);
+    CK(cudaMemcpy(output.data(), d_out.data(), C * OH * OW * sizeof(float),
+                  cudaMemcpyDeviceToHost));
     return output;
 }
 
@@ -227,17 +223,17 @@ std::vector<float> conv_transpose2d_s2(const float* input, int Cin, int H, int W
     int OH = 2 * H, OW = 2 * W;  // (H-1)*2 - 2 + 3 + 1 = 2H
     std::vector<float> output(Cout * OH * OW);
     int w_size = Cin * Cout * K * K;
-    float *d_in, *d_w, *d_out;
-    CK(cudaMalloc(&d_in, Cin * H * W * sizeof(float)));
-    CK(cudaMalloc(&d_w, w_size * sizeof(float)));
-    CK(cudaMalloc(&d_out, Cout * OH * OW * sizeof(float)));
-    CK(cudaMemcpy(d_in, input, Cin * H * W * sizeof(float), cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(d_w, weight, w_size * sizeof(float), cudaMemcpyHostToDevice));
+    core::CudaBuffer d_in(static_cast<std::size_t>(Cin) * H * W);
+    core::CudaBuffer d_w(static_cast<std::size_t>(w_size));
+    core::CudaBuffer d_out(static_cast<std::size_t>(Cout) * OH * OW);
+    CK(cudaMemcpy(d_in.data(), input, Cin * H * W * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_w.data(), weight, w_size * sizeof(float), cudaMemcpyHostToDevice));
     dim3 block(16, 16);
     dim3 grid((OW + 15) / 16, (OH + 15) / 16, Cout);
-    conv_transpose_kernel<<<grid, block>>>(d_in, d_w, d_out, Cin, H, W, Cout, OH, OW, K, stride, pad);
-    CK(cudaMemcpy(output.data(), d_out, Cout * OH * OW * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_in); cudaFree(d_w); cudaFree(d_out);
+    conv_transpose_kernel<<<grid, block>>>(d_in.data(), d_w.data(), d_out.data(), Cin, H, W,
+                                           Cout, OH, OW, K, stride, pad);
+    CK(cudaMemcpy(output.data(), d_out.data(), Cout * OH * OW * sizeof(float),
+                  cudaMemcpyDeviceToHost));
     return output;
 }
 
