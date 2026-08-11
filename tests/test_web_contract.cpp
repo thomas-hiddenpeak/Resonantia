@@ -948,11 +948,53 @@ void run_open_server_contracts(Checks& checks, const fs::path& server,
                       !fs::exists(root / "convert-invoked"),
                   "an unknown custom voice must fail before launching conversion");
 
+    fs::remove(root / "convert-invoked", ignored);
+    const HttpResponse base_without_index = request(
+        process.port(), "POST", "/api/convert",
+        multipart_body({{"voice", "base"}, {"index_rate", "0.75"}},
+                       {{"input.wav", minimal_wav("base-without-index")}}),
+        kMultipartType);
+    checks.expect(
+        base_without_index.status == 400 &&
+            base_without_index.body.find("index") != std::string::npos &&
+            !fs::exists(root / "convert-invoked"),
+        "a positive index rate for a base voice without an index must fail before "
+        "launching conversion");
+
+    write_file(root / "runs/no-index-voice/model.safetensors", "no-index-model");
+    fs::remove(root / "convert-invoked", ignored);
+    const HttpResponse custom_without_index = request(
+        process.port(), "POST", "/api/convert",
+        multipart_body({{"voice", "no-index-voice"}, {"index_rate", "0.25"}},
+                       {{"input.wav", minimal_wav("custom-without-index")}}),
+        kMultipartType);
+    checks.expect(
+        custom_without_index.status == 400 &&
+            custom_without_index.body.find("index") != std::string::npos &&
+            !fs::exists(root / "convert-invoked"),
+        "a positive index rate for a custom voice without an index must fail "
+        "before launching conversion");
+
+    write_file(root / "runs/no-index-voice/model.index", "optional-index");
+    const HttpResponse explicit_no_index = request(
+        process.port(), "POST", "/api/convert",
+        multipart_body({{"voice", "no-index-voice"}, {"index_rate", "0"}},
+                       {{"input.wav", minimal_wav("explicit-no-index")}}),
+        kMultipartType);
+    const std::string no_index_arguments = read_file(root / "convert-invoked");
+    checks.expect(
+        explicit_no_index.status == 200 &&
+            no_index_arguments.find(
+                (root / "runs/no-index-voice/model.safetensors").string()) !=
+                std::string::npos &&
+            no_index_arguments.find("--index") == std::string::npos,
+        "an explicit zero index rate must keep no-index conversion available");
+
     write_file(root / "runs/known-voice/model.safetensors", "known-model");
     write_file(root / "runs/known-voice/model.index", "known-index");
     const HttpResponse known_voice = request(
         process.port(), "POST", "/api/convert",
-        multipart_body({{"voice", "known-voice"}},
+        multipart_body({{"voice", "known-voice"}, {"index_rate", "0.75"}},
                        {{"input.wav", minimal_wav("known-voice")}}),
         kMultipartType);
     const std::string known_arguments = read_file(root / "convert-invoked");
@@ -962,8 +1004,10 @@ void run_open_server_contracts(Checks& checks, const fs::path& server,
                 (root / "runs/known-voice/model.safetensors").string()) !=
                 std::string::npos &&
             known_arguments.find((root / "runs/known-voice/model.index").string()) !=
-                std::string::npos,
-        "an installed custom voice must pass its model and index to conversion");
+                std::string::npos &&
+            known_arguments.find("--index-rate 0.750000") != std::string::npos,
+        "an installed custom voice must pass its model, index and positive index "
+        "rate to conversion");
 
     write_file(root / "convert-cli-fail.trigger", "1");
     const HttpResponse convert_failure = request(
