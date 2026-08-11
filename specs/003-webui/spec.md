@@ -2,6 +2,7 @@
 
 **Feature**: `003-webui`
 **Created from implementation**: 2026-08-09
+**Updated**: 2026-08-12
 **Status**: Implementation present; acceptance partially verified; deployment/training experimental
 
 ## 1. Scope
@@ -51,7 +52,7 @@ Bearer token 只保护 `/api/` 路径；静态 Web 资源仍可公开读取。�
 | `POST /api/preprocess` | 对单个 WAV 执行可选预处理并返回 WAV preview |
 | `POST /api/train` | 启动单个 decoder 或 GAN 实验训练任务 |
 | `GET /api/train/status` | 返回 stage/running/done/error 和受限 log tail |
-| `POST /api/convert` | 对上传或 material session 的 WAV 运行离线转换，返回 WAV |
+| `POST /api/convert` | 对上传或 material session 的 WAV 运行离线转换，返回 WAV；正数 `index_rate` 要求所选声线存在 Index，零值显式 no-index |
 
 未知 API 返回 404；已知 API 的方法不匹配返回 405 并带对应 `Allow`；非 API 静态路径
 的非 GET 请求返回 405/`Allow: GET`。这些方法语义由 `test_web_contract` 真实 socket
@@ -85,6 +86,9 @@ Bearer token 只保护 `/api/` 路径；静态 Web 资源仍可公开读取。�
   material 的 raw/work 副本只有在 `steps.txt` 记录了成功 step 且 work 含有效 WAV 时才视为
   已预处理，否则训练必须从 raw 执行请求的 cleanup flags。step 的新 work 与更新后的
   `steps.txt` marker 必须作为同一事务发布；marker staging/commit 失败不得留下新 work。
+  `/api/convert` 的 `index_rate > 0` 若找不到所选 base/custom voice 的非空常规 Index 文件，
+  必须在启动 `vc_convert` 前返回 400；只有正数 rate 配合该文件才传递
+  `--index/--index-rate`，`index_rate=0` 必须显式省略这两个 flags。
 
 ## 5. Request and Resource Boundaries
 
@@ -131,8 +135,10 @@ root、默认开放、Bearer auth、404/405、step GPU busy、发布失败保留
 preprocess/step/train/index/convert 的非零退出传播，以及训练成功
 但 clips/model/index 为空或无有效 WAV 时不得报告 `done`、失败重训保留旧三产物、新声线
 失败不暴露部分产物、unknown voice 不回退到 base、空/非 WAV/超限音频响应失败，以及长寿命
-CLI 不继承 HTTP socket。boolean 严格语法以及训练 raw+flags / step-marked work 两条 source
-分支也由真实 HTTP 与假 CLI argv 门禁。路径穿越和越界 symlink 仍只有既有手工 smoke 证据，
+CLI 不继承 HTTP socket。boolean 严格语法、训练 raw+flags / step-marked work 两条 source
+分支，以及 base/custom voice 在正数 rate 缺 Index 时 400 且不启动 CLI、零 rate 显式
+no-index、非空 Index+正数 rate 的 argv 传播，也由真实 HTTP 与假 CLI argv 门禁。路径穿越和
+越界 symlink 仍只有既有手工 smoke 证据，
 以下资源与恶意输入门禁也未全部完成，因此不能据此宣称整份 Web 规格 Complete：
 
 - CLI 参数和非法目录必须非零退出。

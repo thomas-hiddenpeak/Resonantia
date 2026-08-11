@@ -1,6 +1,6 @@
 # Resonantia 项目状态
 
-**状态日期：2026-08-11**
+**状态日期：2026-08-12**
 
 本文件是当前实现与验证结果的**描述性快照**，不是替代 feature spec 的规范来源。
 规格意图和需求归属见 [`specs/README.md`](README.md) 及各 feature spec；可执行边界以
@@ -9,15 +9,12 @@
 
 ## 验证基线
 
-- 2026-08-11 在 Jetson Orin NX Engineering Reference Developer Kit（SM87）、
-  CUDA 13.2.78、CMake 3.28.3 上，以 `/tmp/resonantia-audit-final.VbIWW3` 完成 current-tree
-  out-of-tree configure/build；clean build 为 **213/213** steps，终审修正后受影响目标
-  重新构建并由 `ninja: no work to do` 复核同步。默认无模型资产的 contract 门为 **11/11**，
-  其中 7 项使用 GPU lock，另有真实 CLI 进程、真实 HTTP socket、legacy Web API 与 realtime
-  报告 validator 四项 host contract。
-- 启用 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON` 且 `models/` 与 `tests/fixtures/` 中 19 个
-  integration 用例声明的资产齐全时，current-tree 完整验证为 **30/30 CTest 通过**
-  （11 个 contract、19 个 integration、0 失败，real 335.05 秒）。复现命令为：
+- 2026-08-12 在 Jetson Orin NX Engineering Reference Developer Kit（SM87）、
+  CUDA 13.2.78、CMake 3.28.3 上，以 `/tmp/resonantia-audit-final.VbIWW3` 成功构建 current tip。
+  启用 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON` 且 19 个 integration 用例声明的资产齐全时，
+  完整验证为 **30/30 CTest 通过**（11 个 contract、19 个 integration、0 失败，
+  `Total Test time (real) = 356.41 sec`）；其中 `test_long_audio_chunking` 为 223.61 秒。
+  复现命令为：
 
   ```bash
   cmake -S . -B <build-dir> -DCMAKE_BUILD_TYPE=Release \
@@ -37,8 +34,8 @@
   provenance-tracked 目标声线 v2/40 kHz
   model，以及与同一份有授权 corpus 匹配的 Flat Index 缺失而按设计失败，不能解释为
   realtime 资产已就绪。
-- SDD/格式门禁同日复核：`bash scripts/check_sdd.sh` 的 30 个 required files 全部通过；
-  `git diff --check` 退出 0 且无输出。
+- SDD/格式门禁于 2026-08-12 current tip 复核：`bash scripts/check_sdd.sh` 的 30 个
+  required files 全部通过；`git diff --check` 退出 0 且无输出。
 - ADR-0001 R0–R5 已实施：12 个内部 OBJECT 组件聚合为公共 `voxmutatio` static facade；
   四个主要 CLI 分别使用内部 command-scoped app-support target；`vc_serve` 使用内部 Web
   support 模块。既有 target 名、安装面和公共库 API 未因重构扩大。
@@ -51,13 +48,13 @@
 | safetensors | 已实现 | C++ 运行时读取；PyTorch 权重仅可离线转换 |
 | HuBERT | 已实现、默认 | v1 输出 256D，v2 输出 768D |
 | WavLM | 已实现、可选 | 需要与 WavLM 特征匹配训练的 synthesizer；不是默认 RVC 路径 |
-| RMVPE | 已实现、默认 | 完整运行时 tensor manifest、有限值/输入边界和失败重初始化均有门禁；持久共享只读 checkpoint 映射 |
+| RMVPE | 已实现、默认 | 完整运行时 tensor manifest、有限值/输入边界和失败重初始化均有门禁；持久共享只读 checkpoint 映射；算子临时 device buffer 由 RAII 管理 |
 | FCPE | 已实现、可选 | 完整 tensor manifest、weight-norm 安全物化、有限值/输入边界和失败重初始化均有门禁；R0 已固定精确来源与 same-filesystem staged + rollback 事务式发布，不据此承诺实时性能 |
 | Flat Index | 已实现 | 产品实现为 host 内存映射、精确加权 k-NN；离线 Pipeline 对非零 rate fail-closed；standalone GPU probe 不构成产品 backend |
-| F0 VITS v1/v2 | 已实现 | CUDA FP32；v1/256D、v2/768D；当前仅 40 kHz；拒绝 non-F0 |
+| F0 VITS v1/v2 | 已实现 | CUDA FP32；v1/256D、v2/768D；完整校验所有运行时已用 tensor 的 F32/shape/nbytes/alignment/finite 与 weight-norm 非退化、可表示重建；实例持有已验证 mmap 与绝对模型路径，并以文件身份变化检测拒绝加载后替换；所有公开推理/debug 入口对各自尺寸乘积、非有限输入和可观察输出 fail-closed；当前仅 40 kHz，拒绝 non-F0 |
 | 离线变声 pipeline | 已实现 | WAV → HuBERT → RMVPE/可选 FCPE → Index → VITS → WAV |
 | 训练 | 实验性、部分完成 | `vc_train` 有 decoder/GAN 路径；旧 `FineTuneTrainer` 不支持 |
-| Web/CLI 编排 | 实现存在、验收部分 | `vc_serve` 是唯一受支持 Web 入口；默认 `0.0.0.0` 且无认证；旧嵌入式 `WebServer` 已 deprecated/fail-fast；非实时服务 |
+| Web/CLI 编排 | 实现存在、验收部分 | `vc_serve` 是唯一受支持 Web 入口；`/api/convert` 的正数 `index_rate` 缺 voice Index 时返回 400 且不启动 CLI，零值显式走 no-index；默认 `0.0.0.0` 且无认证；旧嵌入式 `WebServer` 已 deprecated/fail-fast；非实时服务 |
 | 声源分离 | runner 实现完成、实验性 | UMX、MelBand-RoFormer、Silero VAD；完整已用权重及公开 finite 边界有资产门禁，质量仍未产品化 |
 | 端到端实时变声 | Spec 006 approved / R0 部分完成，产品未实现 | 已有 legacy `infer_stream` characterization、模式感知报告 validator、asset manifest、离线 Index fail-closed 与独立 Index 诊断 probe；仍没有 persistent runtime、session、`vc_realtime` 或 ALSA 产品路径 |
 
@@ -84,7 +81,7 @@
 |---|---|---|
 | 001 Voice Conversion Engine | 实现基线已具备 / 规格验证部分完成 | 库/pipeline、原子 WAV 和 CLI 严格失败有门禁；真实模型 CLI 成功、`vc_probe` 验收仍缺 |
 | 002 Voice Training | 实验性 / 部分完成 | 可运行的 decoder/GAN 实验路径；无生产质量与 resume 保证 |
-| 003 WebUI | 实现存在 / 验证部分完成 | 默认开放、可选 token、严格参数、step work+marker/训练三产物事务、FD 隔离与四类 CLI 失败传播有 HTTP 门禁；资源/恶意输入矩阵仍缺 |
+| 003 WebUI | 实现存在 / 验证部分完成 | 默认开放、可选 token、严格参数、正数 Index rate fail-closed、显式 no-index、step work+marker/训练三产物事务、FD 隔离与四类 CLI 失败传播有 HTTP 门禁；资源/恶意输入矩阵仍缺 |
 | 004 Source Separation | runner 实现完成 / 实验性 | 模型集成、CLI model/task 拒绝和 Web step 事务有门禁；五任务质量/资产覆盖仍不完整 |
 | 006 Realtime Voice Conversion | Approved / R0 evidence 部分完成 / 产品未实现 | ALSA、v2/HuBERT/FCPE/40k + 有效 Index、250/350 ms SLO、drop-oldest 已批准；独立 probe 只证明 exact retrieval 的诊断可行性。目标 model+matching Index/licensed corpus 缺失，产品 realtime/质量/SLO 仍未资格化 |
 

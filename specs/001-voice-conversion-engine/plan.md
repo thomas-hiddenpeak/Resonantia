@@ -2,7 +2,7 @@
 
 **Branch**: `001-voice-conversion-engine`
 **Status**: Library/pipeline implemented; CLI acceptance incomplete
-**Updated**: 2026-08-09
+**Updated**: 2026-08-12
 
 ## Current Delivery
 
@@ -33,7 +33,7 @@ WAV -> 16 kHz front-end -> HuBERT(default) -> optional Flat Index
 
 - [x] HuBERT 默认路径：v1 256D、v2 768D。
 - [x] WavLM 可选实现与资产门控对齐；要求匹配训练的 synthesizer。
-- [x] RMVPE 默认实现。
+- [x] RMVPE 默认实现；算子临时 device allocation 使用 RAII buffer。
 - [x] FCPE 可选实现与资产门控对齐。
 - [x] PM 保留枚举但在 pipeline 明确拒绝。
 
@@ -42,6 +42,10 @@ WAV -> 16 kHz front-end -> HuBERT(default) -> optional Flat Index
 - [x] 内存映射 Flat Index 与精确加权 k-NN。
 - [x] F0 VITS v1/v2：TextEncoder、Flow、NSF/HiFi-GAN Generator。
 - [x] 版本、特征维度、speaker、pitch、F0 指针和尺寸边界校验。
+- [x] 完整已用 tensor 的 F32/shape/nbytes/alignment/finite 与 weight-norm 不变量校验；
+  实例持有已验证 mmap/绝对模型路径，并在 checkpoint 文件身份变化、任一公开入口尺寸
+  溢出或输入/可观察输出非有限时 fail-closed。
+- [x] VITS 算子临时 device allocation 使用 RAII buffer。
 - [x] non-F0 明确拒绝。
 
 ### P4 — Pipeline and CLI
@@ -56,10 +60,10 @@ WAV -> 16 kHz front-end -> HuBERT(default) -> optional Flat Index
 
 ### P5 — Verification
 
-- [x] 默认 contract：最近一次验证 11/11，包含 CLI/HTTP 进程、legacy Web API 与 realtime 报告
-  validator；后者不扩大 Spec 001 产品范围。
-- [x] 本地资产齐全时：最近一次完整验证 30/30 CTest（11 contract + 19 integration、
-  0 fail，real 335.05 秒）。
+- [x] 2026-08-12 current tip 的默认 contract 为 11/11，包含 CLI/HTTP 进程、legacy Web API
+  与 realtime 报告 validator；后者不扩大 Spec 001 产品范围。
+- [x] 2026-08-12 current tip 在本地资产齐全时完成 30/30 CTest（11 contract +
+  19 integration、0 fail，`Total Test time (real) = 356.41 sec`）；长音频用例为 223.61 秒。
 - [x] HuBERT、RMVPE、FCPE、WavLM、VITS、端到端和长音频均由资产门控的
   integration 测试覆盖。
 - [x] `vc_convert`/`vc_batch` 非法参数语法与退出码的真实进程 CTest。
@@ -68,8 +72,8 @@ WAV -> 16 kHz front-end -> HuBERT(default) -> optional Flat Index
 - [ ] 真实模型 `vc_convert` 成功 WAV 的 CLI 资产门禁，以及 `vc_probe` 的产品验收；
   当前 `vc_probe` 仍是骨架。
 
-因此 30/30 是当前库/模型与已注册 CLI/HTTP/R0 scaffold 契约证据，不是整个 001 规格
-Complete 的依据。
+上述 30/30 是 current-tip 库/模型与已注册 CLI/HTTP/R0 scaffold 契约证据；全量通过仍不是
+整个 001 规格 Complete 的依据。
 
 ## Current Constraints
 
