@@ -25,6 +25,8 @@ private:
     // Read-only access in the isolated lifecycle test targets post-reservation
     // allocation faults without adding a production fault callback.
     friend struct WebServiceLifecycleTestAccess;
+    // The isolated ownership test replays late finalization with an old ticket.
+    friend struct WebServiceJobOwnershipTestAccess;
 
     enum class JobKind { kNone, kStep, kTraining };
     enum class TrainingOutcome { kDone, kError, kCancelled };

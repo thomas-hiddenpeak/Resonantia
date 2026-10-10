@@ -1,6 +1,6 @@
 # Resonantia 项目状态
 
-**状态日期：2026-10-10（Web 硬化与已授权训练取消增量）；模型与全量集成基线为 2026-08-12**
+**状态日期：2026-10-10（Web 硬化、训练取消与作业所有权host验证）；模型与全量集成基线为 2026-08-12**
 
 本文件是当前实现与验证结果的**描述性快照**，不是替代 feature spec 的规范来源。
 规格意图和需求归属见 [`specs/README.md`](README.md) 及各 feature spec；可执行边界以
@@ -8,6 +8,18 @@
 未来目标、历史研究结论和配置结构中的预留字段都不等于已支持能力。
 
 ## 验证基线
+
+- 2026-10-10，基于本地/远端一致的`main@0955500`，新增`test_web_job_ownership`普通host门禁：
+  上传自然校验拒绝/worker先于响应退休各配合正常响应/普通异常，**4/4确定性交错通过**。
+  B活动时旧A的training/step finish各重复两次，B状态/id不变、C仍409；B结束后C可重试，
+  旧素材/模型保留、staging清理、FD无增量。两个临时负对照分别移除generation保护后均按预期
+  失败。接缝仅在私有测试目标编译，普通服务对象/库/`vc_serve`重编译哈希与增量前相同。
+  明确选择10项host回归**10/10通过、0失败/skip，3.43秒**，当前注册24项、其余14项未运行；
+  没有GPU测试、真实训练、rename/pthread拦截或进程注入。编译/测试并发1、nice10，结束时
+  可用内存13752MiB、swap0。详细场景、选择清单和证据边界见[验收计划§8](003-webui/acceptance-plan.md#8-abc所有权与重复finish后续普通host验证)。
+  本轮补齐等价所有权语义，未发现新的生产缺陷；原受限探针未重跑，也未新增独立审查结论。
+  现有CI的通用`self-hosted,linux,ARM64`标签不能证明只路由OrinNX，已查询仓库runner列表为0；
+  此增量仅本地提交，不推送、不改workflow/runner，专属设备CI仅另存方案。
 
 - 2026-10-10，已审查的 211 文件修正版提交为 `a08b61c`。发布前追加的 CI 调整仅隔离
   `test_web_transaction_failure`：保留源码，以精确名称从所有会进入设备作业的 CI
@@ -288,7 +300,7 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
 | FR-007 素材事务 | raw/work/marker 一起替换；常规失败回滚、非常规 marker 拒绝；material/step/train 分配异常保留备份；23 项独立故障断言 | 更多清理/回滚组合未穷尽；异常备份可能需人工恢复，无外部写者或崩溃原子性保证 |
 | FR-007 预览一致性 | 256 上传/1024 预览、六项暂停 rename 的成功/回滚窗口；8 MiB 慢预览不阻塞提交 | 锁内文件 I/O 无硬延迟保证；大音频 streaming 尚未设计 |
 | FR-008 / FR-010 临时资源与终态 | HTTP 假 CLI 非零退出、空产物、step/训练发布失败及旧产物保留；默认门禁验证 staging 清理 | 自然launch/exec/signal runner分类、回收及再次调用已有门禁；P2指定三类结果×7消费路径已通过；底层真实wait/I/O和清理失败诊断仍缺 |
-| P1 生命周期 / FR-006、010 | 握手与元数据初始化失败造成永久 busy 已有 17 点门禁；既有上传失败重复 finish 已按部分审查修正，原默认门禁通过 | 重复释放修复待专用 A/B/C 独立复验；未覆盖全局/worker OOM；预留前 filesystem 分配探针曾触发标准库 terminate，需单独调查；训练取消阶段边界见FR-011；timeout/process-group仍未实施，不启动真实训练验证 |
+| P1 生命周期 / FR-006、010 | 初始化失败已有17点门禁；既有重复finish修复后，新增普通host A/B/C四种交错、旧training/step完成重放及两个负对照通过 | 原受限探针未重跑，未新增独立审查；未覆盖全局/worker OOM；预留前filesystem分配曾触发标准库terminate，待单独调查；训练取消阶段边界见FR-011；timeout/process-group仍未实施，不启动真实训练验证 |
 
 ## 下一步
 
@@ -299,10 +311,11 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
 3. **P1：Web 本轮指定轻量硬化收口**——上传解析、材料/步骤/训练事务与预览、作业启动17点、
    EOF/RST请求资源门禁，以及D1/D2/P1/P2指定验收均已有证据；边界与集中闭合清单见
    [Web验收计划§6](003-webui/acceptance-plan.md#6-本轮收口与用户决策)。不把整份Spec003标为完成。
-   v5重复finish窄修复已有静态复核，精确A/B/C动态复验仍未完成；预留前filesystem分配
-   terminate的既有观察亦保留待调查。它们和更广OS/压力未验证项不自动扩展为追加实验。
+   v5重复finish窄修复现有[§8普通host等价所有权门禁](003-webui/acceptance-plan.md#8-abc所有权与重复finish后续普通host验证)；
+   原受限A/B/C探针未重跑，预留前filesystem分配terminate仍待调查。更广OS/压力未验证项不自动扩展为追加实验。
    用户已批准并完成训练阶段及完整迭代协作取消编排（FR-011/TR-FR-015），有host证据；真实GPU取消未验收，timeout与强制终止未实施。
-   本次可逆改动与测试已保存为审查快照；不自动扩展到真实训练、部署或已中止探针。
+   本次所有权增量保持本地提交；下一步先审定专属OrinNX CI路由和runner归属，再决定安全推送。
+   不自动扩展到真实训练、部署或已中止探针，也不配置/注册runner。
 4. **实时能力暂缓**——Spec 006/ADR-0002 保持 Approved / R0 evidence 部分完成 / 产品未实现；
    本轮不接 persistent runtime、session 或 ALSA。恢复时仍需有授权 corpus、匹配 target
    model+Index 及 Index-enabled 质量/SLO 证据。

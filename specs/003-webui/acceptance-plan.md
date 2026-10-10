@@ -189,7 +189,8 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
    同步500、后台error终态、旧产物保留、停止下游和最终清理。
 
 仍保留的已有缺口（不伪装为完成，也不自动追加实验）：
-- 上传提交失败重复finish的窄修复已有静态复核；精确A/B/C修复后动态复验未完成。
+- 上传提交失败重复finish的原受限A/B/C探针未重跑；后续§8已补齐普通host等价所有权门禁，
+  不将其称为原OS故障探针或独立审查通过。
 - 预留前filesystem分配异常触发标准库terminate的既有观察未单独调查。
 - P2不证明OS层wait/I/O故障生成与恢复；完整大上传、极端并发、更多异常组合、真实模型/质量等
   仍是未验证范围。它们不改变本轮已批准D1/D2/P1/P2验收完成的事实。
@@ -211,3 +212,40 @@ stale-id/token isolation and retry; existing material-commit tests remain.
 No real model training or GPU acceptance is implied. Run bounded host tests serially;
 exclude syscall-interposition, signal-using server/process tests and GPU labels in this
 increment. Keep explicit selected/passed/excluded counts with the delivery evidence.
+
+## 8. A/B/C所有权与重复finish：后续普通host验证
+
+基线为`main@0955500`。既有`test_web_job_lifecycle`覆盖初始化分配点和活动worker响应异常，
+此前没有“worker已退休但旧接受响应仍等待，新B已运行”的确定性门禁，也没有旧generation
+完成回调重复到达时B状态不变的直接断言。本增量只补这些证据，不改变公共API或生产行为。
+
+`test_web_job_ownership`以测试目标私有宏、两个显式响应接缝和ProcessRunner替身覆盖4/4场景：
+
+| A的路径 | 正常响应 | 普通C++响应异常 |
+|---|---|---|
+| 上传因目录型marker自然校验拒绝 | 响应/staging收尾前B/C均409，收尾后B可接受 | 异常展开释放A后B可接受，无A worker |
+| A worker先于延迟接受响应退休 | B可接受，A响应仍返回A id | A异常展开不清除B |
+
+每种场景均在B活动期间重复两次重放A generation的training及step finish，检查B完整状态
+不变、C仍409；B自然结束后C可重试。旧raw/work与已发布model/index不变，无staging/FD泄漏。
+每个屏障最长2秒、请求≤4KiB/响应≤8KiB、CTest上限15秒；首个preprocess替身返回错误，
+不启动子进程、模型、GPU或训练，不使用rename/pthread拦截或进程注入。
+
+无响应接缝时测试按预期因屏障未观测而失败；接缝就绪后4/4通过，0.03秒。
+另在自有临时源码中分别移除training和step的generation保护，两个负对照均因旧finish修改B
+而失败，仓库源码保持不变。宏关闭的生产对象/库/`vc_serve`哈希保持一致且没有回调符号。
+这是等价所有权语义的普通host验证，不证明原OS故障生成，也不构成新的独立审查。
+
+同一OrinNX独立build串行、低优先级运行以下10项，**10/10通过、0失败、0skip，3.43秒**：
+
+```bash
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 nice -n 10 ctest \
+  --test-dir /tmp/resonantia-web-20261010.ycTBxI --output-on-failure --parallel 1 \
+  -R '^(test_bounded_audio_io|test_cli_contract|test_web_job_lifecycle|test_web_job_ownership|test_web_result_contract|test_web_train_cancel|test_web_train_cancel_commit|test_training_cancel|test_vc_train_entry|test_legacy_webserver_contract)$'
+```
+
+24项已注册测试中其余14项未运行：10项GPU用例、`test_web_contract`、
+`test_web_transaction_failure`、`test_web_process_contract`和`test_realtime_benchmark_report`。
+未运行不计skip/通过，未扩大已有独立审查结论；原受限探针、真实GPU取消、最终发布窗口、
+预留前filesystem terminate及更广OS/OOM边界仍未闭合。本增量不修改CI或其他测试，
+保持本地提交，待专属OrinNX路由方案单独获批并核实后再考虑推送。

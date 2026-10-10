@@ -23,6 +23,11 @@ namespace resonantia::web {
 
 namespace fs = std::filesystem;
 
+#ifdef RESONANTIA_TEST_JOB_OWNERSHIP
+// Defined only by the private host test; the regular service has no callback.
+void test_training_response_boundary(std::uint64_t generation, bool accepted);
+#endif
+
 namespace {
 
 constexpr std::uintmax_t kMaximumStepHistoryBytes = 64 * 1024;
@@ -627,6 +632,9 @@ void WebService::handle_train(int fd, const Request& req) {
         send_response(fd, 503, "Service Unavailable", "application/json", "{\"error\":\"cannot prepare job\"}"); return;
     }
     const auto accepted = [&] {
+#ifdef RESONANTIA_TEST_JOB_OWNERSHIP
+        test_training_response_boundary(ticket.generation, true);
+#endif
         send_json(fd, "{\"job\":\"" + json_escape(name) + "\",\"job_id\":\"" + ticket.public_id +
                       "\",\"files\":" + std::to_string(nfiles) + "}");
     };
@@ -652,6 +660,9 @@ void WebService::handle_train(int fd, const Request& req) {
         }
         if (!committed) {
             // The request owner retires the reservation after upload staging.
+#ifdef RESONANTIA_TEST_JOB_OWNERSHIP
+            test_training_response_boundary(ticket.generation, false);
+#endif
             send_response(fd, 500, "Internal Server Error", "application/json", "{\"error\":\"upload commit failed\"}");
             return;
         }

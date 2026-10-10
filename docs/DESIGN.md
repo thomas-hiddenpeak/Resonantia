@@ -374,7 +374,8 @@ close等已开始写操作结束，关闭后旧shared_ptr不能写或重建路�
 单次初始化/clip/step/export或底层驱动卡住时仍无停止时限。token写/close的OS故障分支未做系统调用拦截验证；
 既有GPU析构的cudaFree错误仅日志记录、TempDir清理失败及进程异常guard的旧行为不在本增量修复范围。
 取消丢弃进度，没有resume；未改变页面刷新/提交响应丢失后的跟踪限制，也未确定性命中最终发布窗口。
-正式ADR仍Proposed，Spec003仍部分验收。原A/B/C和其他既有未验证项保持未完成。
+正式ADR仍Proposed，Spec003仍部分验收。当时原A/B/C和其他既有未验证项保持未完成；
+后续普通host等价所有权验证见下文，原受限探针仍未重跑。
 
 本轮验证结果：首个真实CLI预取消红测失败（旧参数不支持）；实现后3个focused门禁通过，0.25秒。
 补充自然host helper后，明确选择8项串行回归8/8通过、0失败/skip，3.38秒；当前注册22项，
@@ -396,3 +397,26 @@ SDD32项、git diff --check、Node mock UI门禁通过；vc_train/vc_serve已编
 marker断言普通栈对象恰好展开一次。取消后body抛异常仍1。加既有CLI及取消门禁3/3通过、3.18秒。
 这不是在真实CUDA上制造异常；不覆盖noexcept析构异常、信号/崩溃、硬件/驱动致命故障、
 静态析构失败或所有GPU错误后的释放保证。原209文件审查包保持固定，本修复另存增量。
+
+### 作业所有权与延迟响应：普通host门禁（2026-10-10）
+
+`test_web_job_ownership`补齐此前A/B/C所有权与重复finish的动态证据。它以私有宏
+`RESONANTIA_TEST_JOB_OWNERSHIP`单独编译Web实现，在训练接受响应和上传拒绝响应前设置
+显式有界屏障；普通服务不定义此宏，没有回调或运行时开关。测试friend仅重放旧generation
+的training/step完成回调，不改对象布局。普通`web_service.cpp.o`、支持库和`vc_serve`
+重编译后SHA-256与本增量前相同，宏关闭对象中没有测试回调符号。
+
+四种确定性交错为“自然上传校验拒绝/worker先于响应结束”分别配合“正常响应/普通C++响应异常”：
+前者使用目录型`steps.txt`，在素材移动前被既有校验拒绝；A响应及staging收尾期间B/C均409。
+后者让A的替身worker自然结束后接受B，再释放A的延迟响应；正常响应仍报告A的id，异常展开
+不修改B。B的替身worker保持活动时，重复两次重放A的training和step finish，B的状态/id
+保持不变且C仍409；B自然完成后C可重试。全程核对旧raw/work/model/index、staging清理和FD数。
+替身在首个preprocess阶段返回错误，不执行任何CLI、模型、CUDA或训练；屏障等待上限2秒，
+CTest上限15秒，没有rename/pthread拦截、进程注入或信号操作。
+
+缺少响应接缝的测试先因无法观测屏障而失败，这仅验证观测能力，不代表发现生产缺陷。
+随后4/4交错通过；临时源码负对照分别移除training/step的generation检查，均按预期检测到
+旧finish修改B。负对照不修改仓库实现。本轮10项明确选择的host回归10/10通过、0失败/skip，
+3.43秒；当前注册24项，其余14项未运行。该证据闭合所列等价所有权语义，但不是原受限
+OS故障探针的复跑或新的独立审查；真实OS异常生成、全局/worker OOM、预留前filesystem
+terminate、真实GPU取消和最终三产物发布窗口仍未验证。复现范围与命令见验收计划§8。

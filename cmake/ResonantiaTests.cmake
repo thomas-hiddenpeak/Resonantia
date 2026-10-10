@@ -195,6 +195,21 @@ target_link_libraries(test_web_job_lifecycle PRIVATE resonantia_web_support)
 resonantia_register_test(test_web_job_lifecycle test_web_job_lifecycle
     LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
 
+# Response barriers exist only in this private recompilation. No system-call
+# interposition, real CLI worker, or production runtime test callback is used.
+resonantia_add_process_test_executable(test_web_job_ownership
+    "${PROJECT_SOURCE_DIR}/tests/test_web_job_ownership.cpp")
+target_sources(test_web_job_ownership PRIVATE
+    "${PROJECT_SOURCE_DIR}/tools/web/http_transport.cpp"
+    "${PROJECT_SOURCE_DIR}/tools/web/workflow_support.cpp"
+    "${PROJECT_SOURCE_DIR}/tools/web/web_service.cpp")
+target_include_directories(test_web_job_ownership PRIVATE "${PROJECT_SOURCE_DIR}")
+target_compile_definitions(test_web_job_ownership PRIVATE
+    RESONANTIA_TEST_JOB_OWNERSHIP=1)
+target_link_libraries(test_web_job_ownership PRIVATE voxmutatio resonantia_training_control)
+resonantia_register_test(test_web_job_ownership test_web_job_ownership
+    LABELS "contract;web;host" TIMEOUT 15 NO_GPU_LOCK)
+
 resonantia_add_process_test_executable(test_web_process_contract
     "${PROJECT_SOURCE_DIR}/tests/test_web_process_contract.cpp")
 target_link_libraries(test_web_process_contract PRIVATE resonantia_web_support)
