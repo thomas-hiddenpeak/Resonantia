@@ -61,7 +61,7 @@
 | TR-FR-012 Legacy `FineTuneTrainer` | `training/fine_tuning.cpp` | `test_core` 仅验证畸形 dataset | **不支持**：门面必须失败 |
 | TR-FR-013 Distributed/FP16/multi-GPU/from-scratch | 无 | 无 | **不支持** |
 | TR-FR-014 Production voice quality | 无当前可复现客观/盲听门禁 | 无 | **未知/未验证**；不得从短步 loss 推断音质或相似度 |
-| TR-FR-015 Cooperative cancellation | `app_support/training_cancel.*` + `vc_train_app.cpp`，可选token/完整迭代/export gate/退出2 | `test_training_cancel`：host协议、共享fake step、实际CLI预取消、自然helper | **编排已实现·host证据**；真实GPU取消/资源峰值/延迟未验收 |
+| TR-FR-015 Cooperative cancellation | `app_support/training_cancel.*` + `vc_train_app.cpp`，可选token/完整迭代/export gate/退出2 | `test_training_cancel_protocol`：原样拆出的host协议、fake step与自然helper；`test_training_cancel`保留参数解析/实际CLI预取消 | **编排已实现·host证据**；真实GPU取消/资源峰值/延迟未验收 |
 | 训练初始化事务与失败后不可用 | Generator、PosteriorEncoder、Flow、Discriminator、GANTrainer reset/guards | generator/GAN rollback cases（资产门禁） | **已实现·可选门禁** |
 
 ## 声源分离与预处理
@@ -93,7 +93,7 @@
 | WEB-FR-008 Temporary cleanup | `TempDir`/`mkdtemp` RAII | `test_web_contract` step/训练事务成功与 rollback 后检查产物/backup；一次性 convert/preprocess 未故障注入 | **部分**：`TempDir` 析构清理失败仍未上报 |
 | WEB-FR-009 Path containment | component 拒绝、canonical webroot containment | 无 traversal/symlink CTest | **部分** |
 | WEB-FR-010 Error honesty | `ProcessResult` 精确保留退出/信号/launch/wait/log I/O 状态；严格 boolean；有效 WAV/voice；step work+marker 及训练 clips/model/index staging + rollback 发布；convert 正数 `index_rate` 缺非空 Index 时在启动 CLI 前 400，零 rate 不传 Index flags | `test_web_contract` 404/405/Allow、busy、step work+marker commit/rollback、四类 CLI 非零退出、invalid boolean、raw+flags/work-marker argv、空/非 WAV/超限输出、unknown voice、base/custom 缺 Index fail-closed、zero-rate no-index、非空 Index+正数 rate argv、旧训练三产物回滚、新声线无 partial artifact、成功链（默认） | **部分**：另有 `test_web_job_lifecycle` 的 17 个 post-reservation 单次分配故障、启动失败 503/可重试、假 CLI error 终态和 staging 清理；已消除 shell filter/index/旧产物/unknown voice/ignored cleanup flag/marker 假成功；`test_web_process_contract` 已覆盖runner自然launch/exec/signal结果与回收；另有`test_web_result_contract`的signal/wait/exit0+I/O三类模拟结果×7消费路径（21失败+21正常重试）；底层真实wait/I/O仍缺 |
-| WEB-FR-011 Training cancellation | service-instance+generation job_id、训练owner、GPU可唤醒等待、阶段检查点、取消API与UI；见ADR-0006 | `test_web_train_cancel`：排队/阶段/重复/过期/重试/8次完成竞争/素材保留/错误/step排除；HTTP鉴权/方法/参数；手动Node UI状态测试 | **阶段边界增量已实现**；活动CLI自然结束后停，最终发布过晚409；私有编译期接缝的`test_web_train_cancel_commit`已确定性验证raw/work安装之间取消、完整提交后才停、旧模型保留、busy/id/重试；生产对象不变。无循环内stop/timeout/强杀；最终发布已进入窗口未保证动态命中，会话恢复未支持；ADR Proposed，用户已授权实施 |
+| WEB-FR-011 Training cancellation | service-instance+generation job_id、训练owner、可唤醒等待、阶段/完整迭代协议、取消API与UI；见ADR-0006 | `test_web_train_cancel`阶段/id/错误竞争；`test_web_train_cancel_commit`素材中途取消；`test_web_train_cancel_publish`最终clips已安装窗口的409/状态/busy/完整收尾/重试；HTTP与UI既有门禁 | **编排已实现·host证据**；私有显式屏障不进入生产宏关闭代码；真实GPU取消/时延、OS故障、崩溃原子性仍未验收，无timeout/强杀或会话恢复；ADR Proposed |
 | WEB resource boundaries | `HttpTransport`：64 KiB header、128 MiB body、256 MiB inflight、64 MiB file/缓冲音频响应、16 KiB field、128 parts、32 connections、deadlines | 超限 preview/preprocess/convert、16 KiB field/128 parts 上限及超限、multipart boundary/quoted-string/framing 为真实 HTTP 默认门禁；128 MiB+1 声明提前 413、两份 128 MiB 声明占满预留后 503、EOF/RST 后容量恢复和 socket 关闭、33 串行 EOF 连接复用及无 job/material 副作用 | **部分**：最多3客户端、body215 bytes；另有53 bytes/最多2客户端真实10秒header门禁，400关闭且job/CLI不变；完整大body、header/file上限、同时连接上限仍缺；120秒body已有独立opt-in门禁（声明1024/实传216 bytes，120708 ms，400/EOF及后续200） |
 | WEB 部署边界 | Spec 003：无 TLS、无默认认证、无用户/角色/多租户/rate limiting/WebSocket | README/Spec 003 | **不支持**直接不可信公网部署或实时音频 |
 | WEB-MIG-001..004 Legacy public C++ API | `include/voxmutatio/webui/server.h`、`src/webui/server.cpp` deprecated compatibility surface；真实服务仍为 `vc_serve` | `test_legacy_webserver_contract`（默认）验证最小消费者生命周期与 `start()` fail-fast；`test_web_contract` 验证真实服务未回退 | **已实现·默认门禁**：保留一个迁移窗口，后续不兼容版本才可删除；不提供嵌入式 HTTP server |
@@ -150,7 +150,7 @@ fail-closed 和 standalone exact-retrieval 诊断 probe；这些 scaffold 不等
 | BUILD-005：GPU 测试串行与 timeout | CTest `RESOURCE_LOCK voxmutatio_gpu`、每测试 timeout | CTest properties | **已实现** |
 | BUILD-006：自动检查与自托管runner安全边界 | `.github/workflows/ci.yml` | push/PR只用托管Ubuntu；设备需manual/main/opt-in/ready且固定专属标签；24种事件组合静态验证 | **已实现**；标签为配置约定，runner身份/唯一归属未核实，设备测试未运行；无通用ARM64兜底 |
 | BUILD-007：SDD/Codex bridge | 根 `AGENTS.md`、`scripts/check_sdd.sh`、SDD 索引与 ADR 模板 | repository-policy + 本地 32-required-file/link contract | **已实现**；ADR-0004/0005 追踪本轮离线迁移；ADR-0002/Spec006 实现状态未改变 |
-| BUILD-008：无CUDA的托管host子集 | `cmake/host-tests/CMakeLists.txt`，复用6项现有Web/CLI测试 | 独立C++20构建与串行CTest；实际运行结果见对应SHA的host-contract-tests日志 | **限定子集**；不加载模型/执行GPU；其余测试保持根CMake设备路径，受限rename探针仍不执行 |
+| BUILD-008：无CUDA的托管host子集 | `cmake/host-tests/CMakeLists.txt`，10项Web/CLI/IO门禁；共享`ResonantiaCatch2.cmake`依赖策略 | 独立C++20构建与串行CTest；完整性差异见验收计划§9，运行结果见对应SHA的host-contract-tests日志 | **限定子集**；真实CLI的两项仍需完整CUDA链接；无模型/GPU，受限rename探针不执行 |
 
 ## 更新规则
 

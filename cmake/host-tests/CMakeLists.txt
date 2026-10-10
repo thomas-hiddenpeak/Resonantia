@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
 enable_testing()
 get_filename_component(RESONANTIA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+include("${RESONANTIA_ROOT}/cmake/ResonantiaCatch2.cmake")
 
 add_library(host_transport STATIC
     "${RESONANTIA_ROOT}/tools/web/http_transport.cpp"
@@ -53,6 +54,33 @@ add_executable(test_web_train_cancel_commit
 target_compile_definitions(test_web_train_cancel_commit PRIVATE RESONANTIA_TEST_MATERIAL_COMMIT_GATE=1)
 target_link_libraries(test_web_train_cancel_commit PRIVATE host_transport)
 register_host_contract(test_web_train_cancel_commit 30)
+
+add_executable(test_web_train_cancel_publish
+    "${RESONANTIA_ROOT}/tests/test_web_train_cancel.cpp"
+    "${RESONANTIA_ROOT}/tools/web/web_service.cpp"
+    "${RESONANTIA_ROOT}/tools/web/workflow_support.cpp")
+target_compile_definitions(test_web_train_cancel_publish PRIVATE RESONANTIA_TEST_TRAINING_PUBLISH_GATE=1)
+target_link_libraries(test_web_train_cancel_publish PRIVATE host_transport)
+register_host_contract(test_web_train_cancel_publish 15)
+
+add_executable(test_training_cancel_protocol
+    "${RESONANTIA_ROOT}/tests/test_training_cancel_protocol.cpp")
+target_link_libraries(test_training_cancel_protocol PRIVATE host_workflow)
+register_host_contract(test_training_cancel_protocol 30)
+
+add_executable(test_bounded_audio_io
+    "${RESONANTIA_ROOT}/tests/test_bounded_audio_io.cpp"
+    "${RESONANTIA_ROOT}/src/io/bounded_audio_io.cpp")
+target_include_directories(test_bounded_audio_io PRIVATE "${RESONANTIA_ROOT}/src")
+target_link_libraries(test_bounded_audio_io PRIVATE Catch2::Catch2WithMain)
+register_host_contract(test_bounded_audio_io 60)
+
+add_executable(test_legacy_webserver_contract
+    "${RESONANTIA_ROOT}/tests/test_legacy_webserver_contract.cpp"
+    "${RESONANTIA_ROOT}/src/webui/server.cpp")
+target_include_directories(test_legacy_webserver_contract PRIVATE "${RESONANTIA_ROOT}/include")
+target_link_libraries(test_legacy_webserver_contract PRIVATE Catch2::Catch2WithMain)
+register_host_contract(test_legacy_webserver_contract 30)
 
 add_executable(vc_train_entry_exception_fixture
     "${RESONANTIA_ROOT}/tools/vc_train.cpp"

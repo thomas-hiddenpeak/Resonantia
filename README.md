@@ -95,7 +95,8 @@ CLI 参数、默认值和错误行为见 [`docs/CLI.md`](docs/CLI.md) 与各命�
 ## 测试
 
 每次 `main` push、PR 和手动 workflow 都在 GitHub 托管的 `ubuntu-24.04` 上运行仓库检查
-和以下独立 Linux host 子集；不需要 CUDA、模型、第三方测试框架或设备 runner：
+和以下独立 Linux host 子集；不需要 CUDA、模型或设备 runner。Catch2 使用与完整构建相同的
+系统包优先/固定3.4.0归档及SHA-256策略：
 
 ```bash
 cmake -S cmake/host-tests -B build-host-ci -DCMAKE_BUILD_TYPE=Release
@@ -103,9 +104,12 @@ cmake --build build-host-ci --parallel 2
 ctest --test-dir build-host-ci --output-on-failure --parallel 1 --no-tests=error
 ```
 
-该入口复用现有 6 项：作业初始化、A/B/C所有权、结果消费、训练取消、素材提交中取消、
-CLI异常入口。它使用现有替身和临时文件，没有真实模型或训练，也不代表完整设备套件通过。
-根 CMake 的其余测试源码与注册保持不变。
+该入口有10项host门禁：作业初始化、A/B/C所有权、结果消费、训练取消、素材提交中取消、
+最终发布中拒绝取消、取消令牌/完整迭代协议、bounded音频I/O、旧Web API兼容和CLI异常入口。
+它使用替身和临时文件，没有真实模型或训练，也不代表完整设备套件通过。
+原`test_training_cancel`的纯协议断言已原样移至`test_training_cancel_protocol`；真实CLI预取消
+与参数解析仍由原测试保留。它和`test_cli_contract`需要实际CUDA链接的CLI，留在完整构建路径。
+具体差异和边界见[验收计划§9](specs/003-webui/acceptance-plan.md#9-托管host覆盖完整性与最终发布窗口)。
 
 设备作业仅在 `main` 上手动勾选 `run_orinnx`，并且仓库变量 `ORINNX_RUNNER_READY`
 为字符串 `true` 时才可调度。它固定要求全部标签
