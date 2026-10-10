@@ -237,8 +237,13 @@ resonantia_add_app_support(resonantia_vc_convert_app_support
     tools/app_support/vc_convert_app.cpp)
 resonantia_add_app_support(resonantia_vc_preprocess_app_support
     tools/app_support/vc_preprocess_app.cpp)
+add_library(resonantia_training_control STATIC tools/app_support/training_cancel.cpp)
+target_include_directories(resonantia_training_control PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(resonantia_training_control PUBLIC Threads::Threads)
+
 resonantia_add_app_support(resonantia_vc_train_app_support
     tools/app_support/vc_train_app.cpp)
+target_link_libraries(resonantia_vc_train_app_support PRIVATE resonantia_training_control)
 
 add_library(resonantia_web_support STATIC
     tools/web/http_transport.cpp
@@ -249,6 +254,7 @@ target_include_directories(resonantia_web_support PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
 )
 target_link_libraries(resonantia_web_support PRIVATE
+    resonantia_training_control
     voxmutatio
     Threads::Threads
 )
@@ -288,6 +294,9 @@ resonantia_add_tool(build_index tools/build_index.cpp CUDA::cublas)
 option(VOXMUTATIO_BUILD_TESTS "Build reproducible contract test executables" ON)
 option(VOXMUTATIO_ENABLE_MODEL_TESTS
        "Build/register tests that require ignored model weights and reference fixtures" OFF)
+
+option(VOXMUTATIO_ENABLE_SLOW_WEB_TESTS
+       "Register opt-in real 120-second Web body deadline acceptance test" OFF)
 
 if(VOXMUTATIO_BUILD_TESTS)
     enable_testing()

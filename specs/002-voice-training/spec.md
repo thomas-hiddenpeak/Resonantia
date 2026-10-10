@@ -82,6 +82,7 @@ mel/KL/feature-matching/adversarial 损失。训练 loss 必须有限，错误�
 | FR-012 | 旧 `FineTuneTrainer` 门面 | **不支持，必须失败** |
 | FR-013 | 分布式、FP16、多 GPU、从零预训练 | **不支持** |
 | FR-014 | 生产级音质/声线相似度保证 | **未验证** |
+| FR-015 | 可选作业令牌、完整迭代协作取消和独立退出码 | CLI/Web编排已实现；host验证，真实GPU取消未验收 |
 
 ## 5. Safety and Correctness Gates
 
@@ -132,3 +133,14 @@ integration-labelled，WavLM preflight label 重叠），并新增 `test_build_i
 - [ ] 定义失败恢复、磁盘配额、产物保留和版本兼容策略。
 - [ ] 决定旧 `FineTuneTrainer` 的正式实现或移除计划。
 - [x] 使用严格数值解析并以真实进程测试 malformed、非有限、溢出、尾随字符和越界参数。
+
+## 9. Cooperative cancellation (FR-015)
+
+后续用户授权增加`--cancel-file <path>`。0/1一字节令牌在初始化/clip边界、完整GAN D/G对或decoder
+整步之间及导出前检查；退出0=完成、1=错误、2=取消且未开始导出。已开始导出完成，错误优先。
+无参数不访问令牌且保留旧训练参数、采样、数值更新顺序。取消丢弃进度，不属于FR-011 resume。
+协议、Web收尾、host证据与未验证GPU边界见[DESIGN](../../docs/DESIGN.md#完整迭代协作取消2026-10-10-后续授权tr-fr-015--web-fr-011)。
+
+普通异常退出边界：`tools/vc_train.cpp`捕获options/parse/run期间的标准/未知C++异常，
+普通栈展开后返回1；异常诊断失败也保持1，不覆盖正常0/取消2。`test_vc_train_entry`
+以生产main+host替身验证此契约，不宣称覆盖noexcept析构异常、崩溃或致命GPU故障的清理。

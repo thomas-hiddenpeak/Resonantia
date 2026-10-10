@@ -8,6 +8,9 @@
 #include <fstream>
 #include <future>
 #include <optional>
+#include <limits>
+#include <random>
+#include <chrono>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -23,6 +26,17 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr std::uintmax_t kMaximumStepHistoryBytes = 64 * 1024;
+
+std::string service_instance_id() {
+    std::random_device entropy;
+    std::string id;
+    for (int i = 0; i < 4; ++i) {
+        char hex[9];
+        std::snprintf(hex, sizeof hex, "%08x", static_cast<unsigned>(entropy()));
+        id += hex;
+    }
+    return id;
+}
 
 bool nonempty_regular_file(const fs::path& path) {
     std::error_code error;
@@ -66,22 +80,88 @@ std::optional<fs::path> first_valid_wav(const fs::path& directory) {
 }  // namespace
 
 WebService::WebService(Paths paths, std::shared_ptr<const ProcessRunner> process_runner)
-    : paths_(std::move(paths)), process_runner_(std::move(process_runner)) {
+    : paths_(std::move(paths)), process_runner_(std::move(process_runner)),
+      instance_id_(service_instance_id()) {
     if (!process_runner_) throw std::invalid_argument("process runner is required");
 }
 
 // ---- workflow ----
-void WebService::set_stage(const std::string& s) { std::lock_guard<std::mutex> lk(job_.mu); job_.stage = s; }
-void WebService::finish(const std::string& stage, bool error) {
-    std::lock_guard<std::mutex> lk(job_.mu);
+bool WebService::reserve_job(const std::string& name, JobKind kind, JobTicket& ticket) {
+    std::lock_guard<std::mutex> lock(job_.mu);
+    if (job_.running) return false;
+    if (job_.generation == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("job generation exhausted");
+    ticket.generation = job_.generation + 1;
+    ticket.public_id = instance_id_ + "-" + std::to_string(ticket.generation);
+    // Prepare all allocating metadata before reserving. Moves after CAS cannot
+    // strand a reservation or expose half-initialized identity to cancellation.
+    std::string stored_id = ticket.public_id, stored_name = name, stage = "queued";
+    bool expected = false;
+    if (!job_.running.compare_exchange_strong(expected, true)) return false;
+    job_.generation = ticket.generation;
+    job_.public_id = std::move(stored_id); job_.name = std::move(stored_name);
+    job_.stage = std::move(stage); job_.kind = kind;
+    job_.done = false; job_.error = false;
+    job_.cancel_requested = false; job_.cancelled = false;
+    job_.cancel_error = false; job_.cancel_source.reset();
+    return true;
+}
+void WebService::set_stage(std::uint64_t generation, const std::string& stage) {
+    std::lock_guard<std::mutex> lock(job_.mu);
+    if (job_.generation == generation) job_.stage = stage;
+}
+void WebService::finish(std::uint64_t generation, const std::string& stage, bool error) {
+    std::lock_guard<std::mutex> lock(job_.mu);
+    if (job_.generation != generation) return;
     job_.stage = stage; job_.error = error; job_.done = true; job_.running = false;
 }
+WebService::TrainingCancelLease::~TrainingCancelLease() {
+    // Wait out any already-started request write before staging can disappear.
+    // Never nest the channel mutex and job mutex in either lock order.
+    const bool clean = source->close();
+    std::lock_guard<std::mutex> lock(service.job_.mu);
+    if (service.job_.generation == generation) {
+        service.job_.cancel_error = service.job_.cancel_error || !clean;
+        service.job_.cancel_source.reset();
+    }
+}
+void WebService::finish_training(std::uint64_t generation, TrainingOutcome outcome) {
+    std::lock_guard<std::mutex> lock(job_.mu);
+    if (job_.generation != generation || job_.kind != JobKind::kTraining) return;
+    if (job_.cancel_error) outcome = TrainingOutcome::kError;
+    job_.cancelled = outcome == TrainingOutcome::kCancelled;
+    job_.error = outcome == TrainingOutcome::kError;
+    job_.stage = job_.cancelled ? "cancelled" : job_.error ? "error" : "done";
+    job_.done = true;
+    // Called only after the request owner's staging scope, or the worker's
+    // run_training scope (child reap, staging and GPU lock), has ended.
+    job_.running = false;
+}
+bool WebService::cancellation_requested(std::uint64_t generation) {
+    std::lock_guard<std::mutex> lock(job_.mu);
+    return job_.generation != generation || job_.cancel_requested;
+}
+bool WebService::training_checkpoint(std::uint64_t generation, const std::string& stage) {
+    std::lock_guard<std::mutex> lock(job_.mu);
+    if (job_.generation != generation || job_.cancel_requested || job_.cancel_error) return false;
+    job_.stage = stage;
+    return true;
+}
 
-void WebService::run_training(std::string name, std::string mode, int steps,
+WebService::TrainingOutcome WebService::run_training(std::uint64_t generation, std::string name, std::string mode, int steps,
                               int segment, int epochs, bool separate,
                               bool dereverb, bool deecho, bool denoise,
                               bool deharmony, bool vad) {
-    std::lock_guard<std::mutex> gpu_lock(gpu_mutex_);
+    std::unique_lock<std::mutex> gpu_lock(gpu_mutex_, std::defer_lock);
+    while (!gpu_lock.try_lock()) {
+        std::unique_lock<std::mutex> lock(job_.mu);
+        if (job_.generation != generation || job_.cancel_requested)
+            return TrainingOutcome::kCancelled;
+        job_.changed.wait_for(lock, std::chrono::milliseconds(20), [&] {
+            return job_.generation != generation || job_.cancel_requested;
+        });
+    }
+    if (!training_checkpoint(generation, "preparing")) return TrainingOutcome::kCancelled;
     const fs::path directory = fs::path(paths_.runs) / name;
     const fs::path log = directory / "train.log";
     TempDir staged(directory, ".train_stage_");
@@ -96,8 +176,7 @@ void WebService::run_training(std::string name, std::string mode, int steps,
                               : " steps=" + std::to_string(steps))
                << " seg=" << segment << (separate ? " +separate" : "") << '\n';
         if (!output) {
-            finish("error", true);
-            return;
+            return TrainingOutcome::kError;
         }
     }
 
@@ -109,7 +188,8 @@ void WebService::run_training(std::string name, std::string mode, int steps,
     const fs::path source = preprocessed ? work : directory / "raw";
     const bool has_separation =
         separate || deharmony || dereverb || deecho || denoise;
-    set_stage(!preprocessed && has_separation ? "separating" : "preprocessing");
+    if (!training_checkpoint(generation, !preprocessed && has_separation ? "separating" : "preprocessing"))
+        return TrainingOutcome::kCancelled;
 
     ProcessSpec preprocess;
     preprocess.argv = {paths_.build + "/vc_preprocess", "--input", source.string(),
@@ -137,11 +217,10 @@ void WebService::run_training(std::string name, std::string mode, int steps,
                                    "separation", "reverb", "noise",
                                    "speech", "enabled"};
     if (!process_runner_->run(preprocess).success() || !first_valid_wav(clips)) {
-        finish("error", true);
-        return;
+        return TrainingOutcome::kError;
     }
 
-    set_stage("training");
+    if (!training_checkpoint(generation, "training")) return TrainingOutcome::kCancelled;
     ProcessSpec training;
     training.argv = {paths_.build + "/vc_train"};
     if (mode == "gan") {
@@ -161,14 +240,38 @@ void WebService::run_training(std::string name, std::string mode, int steps,
     training.argv.insert(training.argv.end(), {"--seg", std::to_string(segment)});
     training.log_path = log;
     training.log_filter_terms = {"step", "mel", "Device", "frames", "Epochs",
-                                 "Exported", "clips", "done", "error", "GAN"};
-    if (!process_runner_->run(training).success() ||
-        !nonempty_regular_file(model)) {
-        finish("error", true);
-        return;
+                                 "Exported", "clips", "done", "error", "GAN", "cancelled"};
+    ProcessResult training_result;
+    {
+        const auto token = staged_root / "cancel";
+        TrainingCancelLease channel(*this, generation,
+            std::make_shared<training_control::TrainingCancelSource>(token.string()));
+        training.argv.insert(training.argv.end(), {"--cancel-file", token.string()});
+        {
+            std::lock_guard<std::mutex> lock(job_.mu);
+            // Covers cancellation between the stage checkpoint and registration.
+            if (job_.generation != generation || job_.cancel_requested)
+                return TrainingOutcome::kCancelled;
+            job_.cancel_source = channel.source;
+        }
+        // Cancellation only changes the job channel. The synchronous runner
+        // drains logs and naturally reaps the child before this lease closes.
+        training_result = process_runner_->run(training);
     }
+    bool requested;
+    {
+        std::lock_guard<std::mutex> lock(job_.mu);
+        if (job_.generation != generation || job_.cancel_error) return TrainingOutcome::kError;
+        requested = job_.cancel_requested;
+    }
+    if (training_result.termination != ProcessTermination::kExited ||
+        training_result.io_error || training_result.system_error || training_result.signal_number)
+        return TrainingOutcome::kError;
+    if (training_result.exit_code == static_cast<int>(training_control::TrainingResult::kCancelled))
+        return requested ? TrainingOutcome::kCancelled : TrainingOutcome::kError;
+    if (!training_result.success() || !nonempty_regular_file(model)) return TrainingOutcome::kError;
 
-    set_stage("indexing");
+    if (!training_checkpoint(generation, "indexing")) return TrainingOutcome::kCancelled;
     ProcessSpec indexing;
     indexing.argv = {paths_.build + "/build_index", "--hubert", paths_.hubert,
                      "--input-dir", clips.string(), "--output", index.string()};
@@ -176,19 +279,18 @@ void WebService::run_training(std::string name, std::string mode, int steps,
     indexing.log_filter_terms = {"Wrote", "index", "error", "frames"};
     if (!process_runner_->run(indexing).success() ||
         !nonempty_regular_file(index)) {
-        finish("error", true);
-        return;
+        return TrainingOutcome::kError;
     }
 
+    if (!training_checkpoint(generation, "publishing")) return TrainingOutcome::kCancelled;
     std::string publish_error;
     if (!replace_training_artifacts(directory, clips, model, index, publish_error)) {
         std::fprintf(stderr, "[vc_serve] training publish failed for '%s': %s\n",
                      name.c_str(), publish_error.c_str());
-        finish("error", true);
-        return;
+        return TrainingOutcome::kError;
     }
     std::ofstream(log, std::ios::app) << "[serve] done.\n";
-    finish("done", false);
+    return TrainingOutcome::kDone;
 }
 
 std::string WebService::voices_json() {
@@ -230,7 +332,7 @@ std::string WebService::separation_models_json() const {
     return j;
 }
 
-void WebService::run_step(std::string name, std::string step, std::string model,
+void WebService::run_step(std::uint64_t generation, std::string name, std::string step, std::string model,
               std::unique_lock<std::mutex> gpu_lk) {
     if (!gpu_lk.owns_lock()) throw std::logic_error("step worker does not own GPU reservation");
     const fs::path dir = fs::path(paths_.runs) / name;
@@ -242,7 +344,7 @@ void WebService::run_step(std::string name, std::string step, std::string model,
     const fs::path log = dir / "train.log";
     std::ofstream(log, std::ios::app) << "[serve] preprocess step '" << step << "'"
         << (model.empty() ? "" : " model '" + model + "'") << " on '" << name << "'\n";
-    set_stage("step:" + step);
+    set_stage(generation, "step:" + step);
     const std::string flag =
         step == "separate" ? "--separate"
         : step == "dereverb" ? "--dereverb"
@@ -263,14 +365,14 @@ void WebService::run_step(std::string name, std::string step, std::string model,
     process.log_filter_terms = {"processed", "error", "enabled"};
     const ProcessResult process_result = process_runner_->run(process);
     if (!process_result.success() || !first_valid_wav(staged_work)) {
-        finish("error", true);
+        finish(generation, "error", true);
         return;
     }
     const fs::path steps = dir / "steps.txt";
     std::error_code marker_error;
     const bool has_steps = fs::exists(steps, marker_error);
     if (marker_error) {
-        finish("error", true);
+        finish(generation, "error", true);
         return;
     }
     if (has_steps) {
@@ -279,12 +381,12 @@ void WebService::run_step(std::string name, std::string step, std::string model,
             regular && !marker_error ? fs::file_size(steps, marker_error) : 0;
         if (!regular || marker_error || step.size() + 1 > kMaximumStepHistoryBytes ||
             size > kMaximumStepHistoryBytes - step.size() - 1) {
-            finish("error", true);
+            finish(generation, "error", true);
             return;
         }
         fs::copy_file(steps, staged_steps, fs::copy_options::none, marker_error);
         if (marker_error) {
-            finish("error", true);
+            finish(generation, "error", true);
             return;
         }
     }
@@ -293,18 +395,23 @@ void WebService::run_step(std::string name, std::string step, std::string model,
         marker << step << '\n';
         marker.close();
         if (!marker) {
-            finish("error", true);
+            finish(generation, "error", true);
             return;
         }
     }
     std::string error;
-    if (!replace_step_artifacts(dir, staged_work, staged_steps, error)) {
+    bool committed = false;
+    {
+        std::lock_guard<std::mutex> material_lock(material_mutex_);
+        committed = replace_step_artifacts(dir, staged_work, staged_steps, error);
+    }
+    if (!committed) {
         std::fprintf(stderr, "[vc_serve] step publish failed for '%s': %s\n",
                      name.c_str(), error.c_str());
-        finish("error", true);
+        finish(generation, "error", true);
         return;
     }
-    finish("step-done", false);
+    finish(generation, "step-done", false);
 }
 
 // POST /api/material : multipart {name, files[]} -> store raw + init work set.
@@ -334,13 +441,16 @@ void WebService::handle_material(int fd, const Request& req) {
         send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"workflow busy; upload not committed\"}");
         return;
     }
-    if (!replace_material_dirs(dir, staged_raw, staged_work, error)) {
+    bool committed = false;
+    {
+        std::lock_guard<std::mutex> material_lock(material_mutex_);
+        committed = replace_material_dirs(dir, staged_raw, staged_work, error);
+    }
+    if (!committed) {
         send_response(fd, 500, "Internal Server Error", "application/json",
                       "{\"error\":\"upload commit failed\"}");
         return;
     }
-    std::error_code ignored;
-    fs::remove(dir / "steps.txt", ignored);
     send_json(fd, "{\"name\":\"" + json_escape(name) + "\",\"files\":" + std::to_string(uploads.size()) + "}");
 }
 
@@ -358,18 +468,27 @@ void WebService::handle_step(int fd, const Request& req) {
          !voxmutatio::separation::sep_model_available(paths_.models + "/separation", step, model))) {
         send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"unknown model\"}"); return;
     }
-    bool expected = false;
-    if (!job_.running.compare_exchange_strong(expected, true)) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"busy\"}"); return; }
-    std::promise<bool> gpu_ready;
-    std::future<bool> gpu_ready_result = gpu_ready.get_future();
-    const std::shared_ptr<WebService> self = shared_from_this();
+    JobTicket ticket;
     try {
-        std::thread worker([self, name, step, model, ready = std::move(gpu_ready)]() mutable {
+        if (!reserve_job(name, JobKind::kStep, ticket)) {
+            send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"busy\"}"); return;
+        }
+    } catch (const std::exception&) {
+        send_response(fd, 503, "Service Unavailable", "application/json", "{\"error\":\"cannot prepare job\"}"); return;
+    }
+    std::future<bool> gpu_ready_result;
+    try {
+        // Every fallible preparation after reservation must release the slot on
+        // failure, including promise allocation before a worker exists.
+        std::promise<bool> gpu_ready;
+        gpu_ready_result = gpu_ready.get_future();
+        const std::shared_ptr<WebService> self = shared_from_this();
+        std::thread worker([self, generation = ticket.generation, name, step, model, ready = std::move(gpu_ready)]() mutable {
             bool readiness_reported = false;
             try {
                 std::unique_lock<std::mutex> gpu_lk(self->gpu_mutex_, std::try_to_lock);
                 if (!gpu_lk.owns_lock()) {
-                    self->job_.running.store(false);
+                    self->finish(generation, "error", true);
                     ready.set_value(false);
                     return;
                 }
@@ -382,29 +501,29 @@ void WebService::handle_step(int fd, const Request& req) {
                 }
                 ready.set_value(true);
                 readiness_reported = true;
-                self->run_step(name, step, model, std::move(gpu_lk));
+                self->run_step(generation, name, step, model, std::move(gpu_lk));
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[vc_serve] preprocessing exception: %s\n", e.what());
                 if (!readiness_reported) {
-                    self->job_.running.store(false);
+                    self->finish(generation, "error", true);
                     try { ready.set_exception(std::current_exception()); } catch (...) {}
                 } else {
-                    self->finish("error", true);
+                    self->finish(generation, "error", true);
                 }
             } catch (...) {
                 std::fprintf(stderr, "[vc_serve] preprocessing exception\n");
                 if (!readiness_reported) {
-                    self->job_.running.store(false);
+                    self->finish(generation, "error", true);
                     try { ready.set_exception(std::current_exception()); } catch (...) {}
                 } else {
-                    self->finish("error", true);
+                    self->finish(generation, "error", true);
                 }
             }
         });
         worker.detach();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[vc_serve] cannot start preprocessing worker: %s\n", e.what());
-        job_.running.store(false);
+        finish(ticket.generation, "error", true);
         send_response(fd, 503, "Service Unavailable", "application/json", "{\"error\":\"cannot start worker\"}");
         return;
     }
@@ -426,16 +545,19 @@ void WebService::handle_step(int fd, const Request& req) {
 void WebService::handle_preview(int fd, const Request& req) {
     std::string name = query_get(req.query, "name");
     if (!safe_name(name)) { send_response(fd, 400, "Bad Request", "text/plain", "bad name"); return; }
+    std::unique_lock<std::mutex> material_lock(material_mutex_);
     std::string work = paths_.runs + "/" + name + "/work";
-    if (!fs::exists(work)) { send_response(fd, 404, "Not Found", "text/plain", "no material"); return; }
+    if (!fs::exists(work)) { material_lock.unlock(); send_response(fd, 404, "Not Found", "text/plain", "no material"); return; }
     const std::optional<fs::path> first = first_valid_wav(work);
-    if (!first) { send_response(fd, 404, "Not Found", "text/plain", "empty"); return; }
+    if (!first) { material_lock.unlock(); send_response(fd, 404, "Not Found", "text/plain", "empty"); return; }
     if (exceeds_buffered_response_limit(*first)) {
+        material_lock.unlock();
         send_response(fd, 413, "Payload Too Large", "application/json",
                       "{\"error\":\"audio response exceeds 64 MiB\"}");
         return;
     }
     const std::string wav = read_file(first->string());
+    material_lock.unlock();
     if (wav.empty()) {
         send_response(fd, 500, "Internal Server Error", "text/plain",
                       "preview read failed");
@@ -481,6 +603,7 @@ void WebService::handle_train(int fd, const Request& req) {
     bool has_work = fs::exists(paths_.runs + "/" + name + "/work") && !fs::is_empty(paths_.runs + "/" + name + "/work");
     if (nfiles == 0 && !has_work) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"no audio files uploaded\"}"); return; }
 
+    TrainingOwner owner(*this); // Declared first: staging retires before the reservation.
     std::optional<TempDir> staged;
     fs::path staged_raw, staged_work;
     if (!uploads.empty()) {
@@ -494,67 +617,136 @@ void WebService::handle_train(int fd, const Request& req) {
         }
     }
 
-    bool expected = false;
-    if (!job_.running.compare_exchange_strong(expected, true)) {
-        send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"a training job is already running\"}"); return; }
-    { std::lock_guard<std::mutex> lk(job_.mu); job_.name = name; job_.stage = "queued"; job_.done = false; job_.error = false; }
+    JobTicket ticket;
+    try {
+        if (!reserve_job(name, JobKind::kTraining, ticket)) {
+            send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"a training job is already running\"}"); return;
+        }
+        owner.generation = ticket.generation;
+    } catch (const std::exception&) {
+        send_response(fd, 503, "Service Unavailable", "application/json", "{\"error\":\"cannot prepare job\"}"); return;
+    }
+    const auto accepted = [&] {
+        send_json(fd, "{\"job\":\"" + json_escape(name) + "\",\"job_id\":\"" + ticket.public_id +
+                      "\",\"files\":" + std::to_string(nfiles) + "}");
+    };
     if (staged) {
         std::unique_lock<std::mutex> gpu_lk(gpu_mutex_, std::try_to_lock);
         if (!gpu_lk.owns_lock()) {
-            finish("error", true);
             send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"GPU busy; upload not committed\"}");
             return;
         }
         std::string error;
+        bool committed = false, cancelled_before_commit = false;
         try {
-            if (!replace_material_dirs(voice_dir, staged_raw, staged_work, error)) {
-                finish("error", true);
-                send_response(fd, 500, "Internal Server Error", "application/json", "{\"error\":\"upload commit failed\"}");
-                return;
-            }
+            std::lock_guard<std::mutex> material_lock(material_mutex_);
+            cancelled_before_commit = !training_checkpoint(ticket.generation, "material-commit");
+            if (!cancelled_before_commit)
+                committed = replace_material_dirs(voice_dir, staged_raw, staged_work, error);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[vc_serve] upload commit exception: %s\n", e.what());
-            finish("error", true);
+        }
+        if (cancelled_before_commit) {
+            gpu_lk.unlock();
+            owner.outcome = TrainingOutcome::kCancelled; accepted(); return;
+        }
+        if (!committed) {
+            // The request owner retires the reservation after upload staging.
             send_response(fd, 500, "Internal Server Error", "application/json", "{\"error\":\"upload commit failed\"}");
             return;
         }
-        std::error_code ignored;
-        fs::remove(voice_dir / "steps.txt", ignored);
     }
-    const std::shared_ptr<WebService> self = shared_from_this();
+    // Retire request-owned upload staging before handing the reservation to a
+    // worker that can complete before the acceptance response is written.
+    staged.reset();
+    if (cancellation_requested(ticket.generation)) {
+        owner.outcome = TrainingOutcome::kCancelled; accepted(); return;
+    }
+    set_stage(ticket.generation, "queued");
     try {
-        std::thread worker([self, name, mode, steps, seg, epochs, separate, dereverb,
+        const std::shared_ptr<WebService> self = shared_from_this();
+        std::thread worker([self, generation = ticket.generation, name, mode, steps, seg, epochs, separate, dereverb,
                             deecho, denoise, deharmony, vad] {
+            TrainingOwner completion(*self); completion.generation = generation;
             try {
-                self->run_training(name, mode, steps, seg, epochs, separate, dereverb,
+                completion.outcome = self->run_training(generation, name, mode, steps, seg, epochs, separate, dereverb,
                                    deecho, denoise, deharmony, vad);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[vc_serve] training exception: %s\n", e.what());
-                self->finish("error", true);
             } catch (...) {
                 std::fprintf(stderr, "[vc_serve] training exception\n");
-                self->finish("error", true);
             }
         });
+        owner.release(); // The successfully constructed worker owns finalization now.
         worker.detach();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[vc_serve] cannot start training worker: %s\n", e.what());
-        finish("error", true);
         send_response(fd, 503, "Service Unavailable", "application/json", "{\"error\":\"cannot start worker\"}");
         return;
     }
-    send_json(fd, "{\"job\":\"" + json_escape(name) + "\",\"files\":" + std::to_string(nfiles) + "}");
+    accepted();
 }
 
 void WebService::handle_status(int fd, const Request& req) {
     std::string qn = query_get(req.query, "name");
-    std::string stage, jname; bool running, done, error;
-    { std::lock_guard<std::mutex> lk(job_.mu); stage = job_.stage; jname = job_.name; running = job_.running; done = job_.done; error = job_.error; }
+    std::string stage, jname, id, kind, state; bool running, done, error, requested, cancelled, cancellable;
+    {
+        std::lock_guard<std::mutex> lock(job_.mu);
+        stage = job_.stage; jname = job_.name; id = job_.public_id;
+        running = job_.running; done = job_.done; error = job_.error;
+        requested = job_.cancel_requested; cancelled = job_.cancelled;
+        kind = job_.kind == JobKind::kTraining ? "train" : job_.kind == JobKind::kStep ? "step" : "none";
+        cancellable = running && job_.kind == JobKind::kTraining && stage != "publishing";
+        state = !running ? (cancelled ? "cancelled" : error ? "error" : done ? "done" : "idle") :
+                requested ? "cancel_requested" : stage == "queued" ? "queued" :
+                stage == "publishing" ? "publishing" : "running";
+    }
     std::string which = qn.empty() ? jname : qn, logtail;
     if (safe_name(which)) logtail = log_tail(paths_.runs + "/" + which + "/train.log", 4000);
     send_json(fd, std::string("{\"name\":\"") + json_escape(jname) + "\",\"stage\":\"" + json_escape(stage) +
+        "\",\"job_id\":\"" + id + "\",\"kind\":\"" + kind + "\",\"state\":\"" + state +
         "\",\"running\":" + (running ? "true" : "false") + ",\"done\":" + (done ? "true" : "false") +
-        ",\"error\":" + (error ? "true" : "false") + ",\"log\":\"" + json_escape(logtail) + "\"}");
+        ",\"error\":" + (error ? "true" : "false") + ",\"cancel_requested\":" + (requested ? "true" : "false") +
+        ",\"cancelled\":" + (cancelled ? "true" : "false") + ",\"cancellable\":" + (cancellable ? "true" : "false") +
+        ",\"cancel_boundary\":\"stage_or_iteration\",\"log\":\"" + json_escape(logtail) + "\"}");
+}
+
+void WebService::handle_cancel_train(int fd, const Request& req) {
+    std::vector<Part> parts;
+    if (!request_parts(fd, req, parts)) return;
+    if (parts.size() != 1 || parts[0].name != "job_id" || !parts[0].filename.empty() ||
+        !safe_name(parts[0].data)) {
+        send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"exactly one valid job_id is required\"}"); return;
+    }
+    const std::string id = parts[0].data;
+    int code = 202; const char* failure = nullptr; bool stopped = false;
+    std::shared_ptr<training_control::TrainingCancelSource> channel;
+    {
+        std::lock_guard<std::mutex> lock(job_.mu);
+        if (job_.public_id.empty()) { code = 404; failure = "no job"; }
+        else if (id != job_.public_id) { code = 409; failure = "job id does not match current job"; }
+        else if (job_.kind != JobKind::kTraining) { code = 409; failure = "only training jobs can be cancelled"; }
+        else if (job_.cancelled && !job_.running) { code = 200; stopped = true; }
+        else if (!job_.running || job_.stage == "publishing") { code = 409; failure = "too late: publication started or job already ended"; }
+        else {
+            code = job_.cancel_requested ? 200 : 202; job_.cancel_requested = true;
+            channel = job_.cancel_source;
+        }
+    }
+    if (failure) {
+        send_response(fd, code, code == 404 ? "Not Found" : "Conflict", "application/json",
+                      std::string("{\"error\":\"") + failure + "\"}"); return;
+    }
+    job_.changed.notify_all();
+    if (channel && channel->request() == training_control::CancelDelivery::kError) {
+        send_response(fd, 500, "Internal Server Error", "application/json",
+                      "{\"error\":\"cancellation channel failed; waiting for current stage to finish\"}");
+        return;
+    }
+    send_response(fd, code, code == 202 ? "Accepted" : "OK", "application/json",
+                  "{\"job_id\":\"" + id + "\",\"cancel_requested\":true,\"cancelled\":" +
+                  (stopped ? "true" : "false") + ",\"state\":\"" +
+                  (stopped ? "cancelled" : "cancel_requested") + "\"}");
 }
 
 // Apply selected SOTA input preprocessing (vocal/deharmony/dereverb/denoise) to
@@ -742,7 +934,7 @@ const char* WebService::allowed_api_method(const std::string& path) {
         path == "/api/train/status" || path == "/api/preview") {
         return "GET";
     }
-    if (path == "/api/train" || path == "/api/material" || path == "/api/step" ||
+    if (path == "/api/train" || path == "/api/train/cancel" || path == "/api/material" || path == "/api/step" ||
         path == "/api/preprocess" || path == "/api/convert") {
         return "POST";
     }
@@ -756,6 +948,8 @@ void WebService::handle_request(int fd, const Request& request) {
         send_json(fd, separation_models_json());
     } else if (request.method == "GET" && request.path == "/api/train/status") {
         handle_status(fd, request);
+    } else if (request.method == "POST" && request.path == "/api/train/cancel") {
+        handle_cancel_train(fd, request);
     } else if (request.method == "POST" && request.path == "/api/train") {
         handle_train(fd, request);
     } else if (request.method == "POST" && request.path == "/api/material") {

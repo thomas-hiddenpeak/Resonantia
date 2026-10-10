@@ -168,6 +168,21 @@ API，并以子进程调用 CLI。内部进程适配器用 argv 直接启动程�
 只有有效 WAV clips 与非空 model/index 齐全时才成组发布并报告 `done`，失败保留旧产物。
 material 上传后的 raw/work 副本不代表已经完成 step；只有非空 `steps.txt` marker 与有效 work
 WAV 同时存在时训练才复用 work，否则从 raw 开始并执行请求的 separation/cleanup flags。
+material/train 上传把 raw/work 替换与旧 `steps.txt` 退役纳入同一个 backup/rollback 事务；
+非常规 marker（包括 symlink）在移动原素材前拒绝。material、step、training 的备份均在
+移动 live 产物前启用无分配、noexcept retention guard；只有成功提交或完整回滚才允许
+TempDir 清理。错误文本在回滚之后构造；中途异常保留备份路径及字节供恢复，不能只依赖
+HTTP 层 catch。异常保护保证可恢复副本，不保证原路径已经恢复或持续可用；不自动恢复。
+运维从服务 stderr 中的 `transaction incomplete; backup retained at ...` 定位备份，先暂停
+对应素材的写入并确认相关作业结束，逐项核对 live 与 backup 中的 raw/work/marker（或对应
+step/训练产物）；先将保留字节复制到独立恢复目录、确认属于同一旧代且内容完整，再由
+维护者安排恢复。不得盲目覆盖 live 或删除唯一备份。默认 `test_web_transaction_failure`
+隔离进程在失败 rename 后注入一次
+分配失败，验证三种事务的旧产物在 live 或 backup 中完整保留。一个实例内的 material mutex 同步
+material/train/step 发布与 preview 的文件选择、校验及最多 64 MiB 的完整读取。写路径先取得
+GPU mutex 再取得 material mutex，preview 只取后者；不在 CLI 执行或 socket 发送期间持有
+material mutex，异常由 RAII 解锁。锁内包含文件读取和提交/回滚及 backup 清理，因此没有
+硬性时间上限；它不保证外部进程修改或进程崩溃时多次 rename 的原子性。
 监听 socket 与连接 socket 均为 close-on-exec，CLI 不继承 HTTP 文件描述符。监听地址由
 `--host` 配置，默认 `0.0.0.0`；可选
 `--auth-token` 保护 API。服务限制请求头、请求体、上传大小和并发数；已知 API 的错误
@@ -176,16 +191,102 @@ WAV 同时存在时训练才复用 work，否则从 raw 开始并执行请求的
 和 marker。内部由 `tools/web/http_transport.*` 负责
 socket、HTTP、鉴权和资源 reservation，`workflow_support.*` 负责文件/进程适配器，
 `web_service.*` 负责路由与工作流；job/GPU 状态归单个 `WebService` 实例所有。公网部署
-仍需要反向代理 TLS 和网络访问控制。所有 Web boolean field 只接受 `0` 或 `1`；显式空值
+仍需要反向代理 TLS 和网络访问控制。step 的 promise/future 握手与 shared ownership
+准备放在启动异常处理范围内；train 的 job metadata 初始化独立捕获失败，并把
+shared ownership 准备纳入原 worker 启动处理。未交给 worker 的初始化异常释放预留并
+返回 503，已接手 worker 的响应生成保持在启动 catch 外，避免响应失败错误地清除活动
+作业。默认 `test_web_job_lifecycle` 使用隔离的请求线程单次分配故障与假 CLI 验证释放、
+重试、终态及 staging 清理；内部 friend 只供测试读取 running 来定位注入窗口，没有
+生产故障回调或新运行时依赖。
+train 上传发布的 try/catch 只包住锁与提交；是否失败在 catch 后统一判定，只调用一次
+finish，再构造错误响应。释放后响应异常直接交给 HTTP 错误边界，不重新释放可能已归
+后续请求的共享 slot。没有引入新的 job token/调度架构，也不改变 GPU mutex 串行执行。
+
+Request 的 body reservation 与 ConnectionGuard 的 socket/连接计数仍由原 RAII 释放。
+新增真实 HTTP 门禁只用短 body 和较大的声明长度验证 128 MiB 上限与 256 MiB 总预留、
+EOF/RST 后恢复及 accepted socket 关闭；33 次串行截断 EOF 验证连接名额可复用。
+最多三个客户端、实际 body 不超过 215 bytes；不是吞吐/压力、完整大上传或 slow-client
+超时验收，不需改变现有 10/120 秒 deadline。
+另有真实10秒header deadline门禁：第0/3/6秒滴流不续期，400后关闭socket、job与CLI不变，
+后续请求可用；53 bytes慢header、最多2客户端、用例<15秒。独立D2随后验证120秒body绝对deadline：声明1024 bytes、实际216 bytes，
+0/20/40/60/80/100秒滴流仍在120708 ms后400/EOF；socket关闭、后续查询可用。
+其CTest上限130秒，通过默认OFF的VOXMUTATIO_ENABLE_SLOW_WEB_TESTS单独注册，
+不改变当时默认18项快速套件或生产逻辑。
+`test_web_process_contract` 覆盖原runner的空argv、缺失程序、日志打开失败及自有子进程
+自行SIGTERM，检查结果分类、输出、FD/直接子进程回收及下一次成功调用。
+该host门禁串行、最多1个helper、CTest上限10秒，不改变生产runner、等待/取消或进程组行为。
+
+新增host门禁`test_web_result_contract`只使用既有ProcessRunner依赖测试替身，通过socketpair
+观察实际HTTP响应writer；模拟signal、wait失败、exit0+io_error三类结果，覆盖7路径的失败/正常重试。
+即使替身产物格式有效也须同步500或后台error，保留旧产物、不执行下游，等待worker结束后清理。
+不新增生产seam、不启动真实子进程；默认快速套件现19项，该门禁CTest上限5秒。
+所有 Web boolean field 只接受 `0` 或 `1`；显式空值
 或其他字符串返回 400。preview/preprocess/convert 的音频响应当前在发送前
 完整缓冲，硬上限为 64 MiB；超过时明确返回 413，不会以 200 返回空 body。
 `/api/convert` 只有在 `index_rate > 0` 且选定声线存在非空 Index 时才向 `vc_convert`
 传递 `--index/--index-rate`；正数 rate 缺 Index 会在启动 CLI 前返回 400，`index_rate=0`
 则显式不传这两个 flags，即使该声线目录中已有 Index 也保持 no-index 模式。
 
+multipart transport 按参数/quoted-string 语法提取唯一 boundary，拒绝重复 boundary、未闭合
+引号/转义及尾部垃圾，不从其他参数的值中查找 boundary。完整 delimiter line 才终止 part，
+二进制 WAV 内相似前缀保持原字节。边界解析失败先返回 400、字段或 part 数超限返回
+413，material handler 不进入 staging/commit；真实 HTTP contract 验证旧 raw/work 与
+step marker 保留，并覆盖 16 KiB field / 128 parts 的准确上限。
+
+part header 逐行验证并展开 MIME 续行，仅从唯一 Content-Disposition 的 form-data 参数中
+取得 name/filename；无关头、参数后缀、quoted text 或注释不能提供属性。合法 token/quoted
+值、转义、折行和注释得到语法处理；重复 disposition/name/filename 按歧义拒绝策略返回
+400，畸形头/参数及 filename* 同样拒绝。跨 part 重复字段名保持允许。扫描受原有 64 KiB
+part header 上限约束，注释深度迭代计数、不递归；没有增加运行时依赖。
+
 历史公共头 `voxmutatio/webui/server.h` 的嵌入式 `WebServer` 从未实现监听器，也不是上述
 服务的库形式。按 ADR-0003，它只在一个迁移窗口内保留 deprecated 源码/静态链接表面；
 `start()` 明确 fail-fast 并引导调用方迁移到 `vc_serve`，不再忙循环或返回伪造 API 成功。
+
+### 训练取消与迁移（WEB-FR-011）
+
+训练取消增量（WEB-FR-011）已按2026-10-10 12:41:53 UTC用户授权实现，基线固定为审查源码v8、证据v9。
+`POST /api/train/cancel`只接受单个`job_id`；首个有效请求202、重复请求200，过期id/step/已完成或
+进入最终发布的作业409，无作业404，非法输入400；继承现有Bearer鉴权。接受与状态响应含作业id，
+状态区分`cancel_requested`和`cancelled`。排队worker经条件变量唤醒；活动CLI自然返回后才在阶段
+检查点停止，绝不把flag当作已停止。请求/worker按代号持有训练预留，临时目录及GPU锁收尾后才发布终态。
+已开始的raw/work提交完成并保留；最终clips/model/index发布开始后拒绝过晚取消并完成提交/回滚。
+真实CLI失败即使同时请求取消仍为error。前端按钮跟随确切作业，取消终态不显示“已生成声线”。
+
+验证：旧实现红测因缺job_id失败；新增取消门禁覆盖排队中GPU仍被他人持有、三个CLI阶段、重复与
+过期请求、未收尾保持busy、重试、已提交上传保留、8次完成/取消竞争、取消期间失败和step排除。
+同一门禁检查旧产物、临时目录与FD；仅用现有ProcessRunner替身，没有真实模型或子进程。
+真实HTTP门禁增加method/Allow、Bearer与非法取消参数；Node.js 18.19.1手动运行
+`node tests/test_web_train_cancel_ui.cjs`，通过完整app.js语法及mock DOM/fetch的状态竞态检查，
+不代表浏览器视觉验收。首次UI替身遗漏cancel_requested字段，补齐契约字段后通过，保留失败日志。
+固定v9默认无模型回归 **20/20、0失败、0 CTest skip，22.00秒**，全部串行/nice 10；
+取消专用门禁0.05秒，原启动17点及结果消费21失败/21重试回归通过。长body门禁保持OFF，未重跑既有D2。
+
+限制：CLI没有训练循环内协作停止接口，等待当前CLI自然结束的时延不设上限；无timeout、信号、
+强杀、step/同步任务取消或resume。精确旧A/B/C探针、预留前filesystem异常terminate观察、真实OS
+wait/I/O及真实模型/音质缺口仍保留。不把Spec003整体标为Complete。正式ADR审查状态仍为Proposed，实施授权及回滚见
+[ADR-0006](adr/0006-training-cancellation-ownership.md)。
+
+后续独立审查回传（2026-10-10，固定源码v9、27项哈希一致）：未发现已确认的训练取消缺陷；
+host取消、mock UI及额外重复提交/无ID取消/重复取消/新作业恢复检查通过。该结论不覆盖以下新测试接缝。
+原8次最终发布竞态只接受两种合法结果，不保证命中“发布已开始”窗口；丢失初次提交响应或刷新页面
+后无法恢复跟踪仍是既有限制，本次未修复或扩展会话恢复。
+
+素材提交中取消的独立补充：`test_web_train_cancel_commit`在专属测试目标重编译Web支持源码，
+只对该目标定义`RESONANTIA_TEST_MATERIAL_COMMIT_GATE`，于raw安装完成、work安装之前通过条件
+变量暂停。现有事务测试依赖rename拦截，本补充不使用它、不拦截系统调用、不生成OS故障。
+普通Web对象和`vc_serve`重建后SHA256与v9逐字节一致，生产库无暂停符号；没有运行时/API改变。
+测试先在无调用的v9上因未进入gate失败（这是观测接缝红测，不是产品缺陷），随后控制组与取消组
+**1/1通过，0.01秒**：中途取消202/重复200、仍running且新train/step/material均409；释放gate后完整
+提交raw/work、退役旧marker，再发布cancelled；旧模型保留、后续CLI调用为零；终态重复取消200，
+旧id无法取消下一作业，下一worker在自然返回前不释放预留，正常重试成功。仅tiny临时素材及既有
+ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误复制不可复制Request，修正字段构造后运行红测。
+本补充串行回归执行**20/20通过、0失败、21.67秒**；当前注册21项，主动排除内部拦截rename的
+`test_web_transaction_failure`一项（未运行，不算通过或CTest skip），遵守本轮禁止系统调用拦截的约束。
+原取消及新提交用例focused 2/2通过（0.06秒），不重复运行无变化的UI/长body门禁。
+这一补充没有发现需修复的产品缺陷；新接缝尚无独立审查，不扩展到最终发布窗口的确定性暂停、
+崩溃/回滚异常或真实训练。固定Library源码v9/证据v10/计划v4保持不变，另存本轮增量和日志。
+
 
 ## 4. 权重与数据
 
@@ -198,13 +299,13 @@ socket、HTTP、鉴权和资源 reservation，`workflow_support.*` 负责文件/
 2. 可选 `integration`：配置 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON`；只有所需资产存在的用例才进入 CTest。
 
 测试内部“找不到文件就 return”不是可信的通过证据，因此 CMake 在注册前检查资产。当前
-资产齐全配置注册 39 个 distinct tests：16 contract-labelled、24 integration-labelled；
+slow选项OFF的资产齐全配置现注册 45 个 distinct tests：22 contract-labelled、24 integration-labelled；
 `test_bounded_file_wavlm_preflight` 同时属于两类。2026-08-12 的 fresh Release/SM87
 build `/tmp/resonantia-nonrt-final.a8O1Ay` 已实际执行并通过 39/39（0 失败，
 `Total Test time (real) = 1297.94 sec`）。加固前 Release/SM87 30/30（11 contract +
 19 integration，356.41 秒）只保留为历史基线。新增门禁包括 bounded
 I/O/DSP/resource/F0/caller、immutable Index/build-index、VITS snapshot 和代表性 CUDA
-failure injection；注册或 focused pass 本身不是全量证据，本次当前工作树 39/39
+failure injection；注册或 focused pass 本身不是全量证据，该历史工作树 39/39
 是对它们的独立收口。
 
 CUDA fault seam 只编入私有测试 target，覆盖 RMVPE/VITS 代表性 allocation、H2D/D2H copy、
@@ -238,3 +339,60 @@ targets；公共 `voxmutatio` 仍聚合为一个兼容 static archive。CLI 不�
 - 端到端输出相关性 `> 0.99`
 
 只有在对应模型、输入、参考文件均存在且测试实际执行时，才能报告这些结果。默认 CI 通过仅说明可复现契约测试通过，不等价于全模型数值对齐已经在该次提交复验。
+
+
+### 完整迭代协作取消（2026-10-10 后续授权，TR-FR-015 / WEB-FR-011）
+
+本增量以固定源码v9和已复验的素材提交测试增量为基线。用户明确授权CLI编排/Web集成，
+不扩展到训练数值、CUDA kernels、自动超时、强杀或checkpoint/resume。此前“CLI无循环内接口”
+是v9历史边界；当前增加可选`vc_train --cancel-file <path>`，不带参数时不打开/轮询任何文件。
+参数不可为空或重复。Web在每个唯一staging目录独占创建0600的一字节常规文件，初始`0`、请求后`1`；
+CLI以CLOEXEC/NOFOLLOW/NONBLOCK只读打开一次，拒绝符号链接、非常规文件、长度/内容异常，
+不重新打开替换路径。该文件不是认证凭据，也不持久保存任务。
+
+CLI退出语义：正常完成0，错误1，协作取消2。首次检查在CUDA初始化之前；后续检查在已完成的
+初始化阶段/clip边界、每个完整迭代之前和最终导出之前。GAN的D/G整对更新和原LR处理完整执行，
+decoder的forward/backward/optimizer整步完整执行；共用私有`run_training_iterations`只包住编排，
+不拆分数值步骤。当前步骤报告的错误先于并发取消。最后一步完成后也检查，取消不开始新导出。
+导出已开始则完成：直接CLI此时可能正常返回0并替换自己的`--out`；Web的`--out`始终是staging，
+后续checkpoint会丢弃该结果并保留已发布模型。最终三产物发布已开始仍409且完整收尾。
+
+Web只有在对应job确实请求取消、vc_train正常退出2且没有system/log/signal异常时确认cancelled；
+不更改`ProcessResult::success()`或其他CLI的非零退出语义。专属source/lease的request与close互斥，
+close等已开始写操作结束，关闭后旧shared_ptr不能写或重建路径。lease在runner自然排空日志/reap之后
+关闭并解绑，再清理staging，最后原owner释放GPU锁/作业预留。注册令牌时重查本代取消，覆盖注册前竞争。
+取消写失败返回500且保持预留；source记录首个写/close错误，最终error优先。新作业从新id、新token开始。
+`cancel_boundary`更新为`stage_or_iteration`；收到请求仍不等于已经停止。
+
+验证分层：`test_training_cancel`覆盖默认/参数/异常token、完整fake step、最后一步取消、错误优先、
+关闭/旧路径隔离，以及真实CLI的预取消入口（隐藏GPU、输入不存在）。同一测试的微型host helper使用
+共享loop helper，由真实PosixProcessRunner自然排空/reap；这不是GPU训练。`test_web_train_cancel`
+沿用ProcessRunner替身检查token送达、重复请求、runner返回前busy、旧id/新token隔离、退出2未请求即错误、
+并发system/log/普通错误优先、清理及重试。`test_web_train_cancel_commit`保留素材中途提交控制/取消门禁。
+
+证据限制：host编排与编译成功不证明真实GPU循环的取消延迟、资源峰值或数值等价；没有启动真实训练。
+单次初始化/clip/step/export或底层驱动卡住时仍无停止时限。token写/close的OS故障分支未做系统调用拦截验证；
+既有GPU析构的cudaFree错误仅日志记录、TempDir清理失败及进程异常guard的旧行为不在本增量修复范围。
+取消丢弃进度，没有resume；未改变页面刷新/提交响应丢失后的跟踪限制，也未确定性命中最终发布窗口。
+正式ADR仍Proposed，Spec003仍部分验收。原A/B/C和其他既有未验证项保持未完成。
+
+本轮验证结果：首个真实CLI预取消红测失败（旧参数不支持）；实现后3个focused门禁通过，0.25秒。
+补充自然host helper后，明确选择8项串行回归8/8通过、0失败/skip，3.38秒；当前注册22项，
+未运行10项GPU、`test_web_contract`/`test_web_process_contract`（使用信号）、
+`test_web_transaction_failure`（rename拦截）及无关`test_realtime_benchmark_report`，不称全量通过。
+SDD32项、git diff --check、Node mock UI门禁通过；vc_train/vc_serve已编译，未部署。
+
+### CLI普通异常退出边界：独立审查修复（2026-10-10）
+
+独立审查发现原`tools/vc_train.cpp`没有catch边界：GAN finite-loss、optimizer/CUDA的普通C++异常
+可外逸到terminate；此前“所有错误退出1/普通栈展开”的描述过宽。Web把异常进程归error本身正确。
+现由main的try覆盖options/parse/run，catch标准及未知异常，普通栈展开完成后返回1；正常返回0、
+协作取消2保持。错误诊断用noexcept小函数并捕获诊断自身异常，诊断失败仍返回1，绝不转为成功或取消。
+未改变run_training_iterations、训练器、核函数或Web流程。
+
+`test_vc_train_entry`把相同生产main链接到host应用替身，替身抛标准/未知/解析/body异常；
+测试专属terminate handler使用_Exit(86)观察旧缺陷，避免SIGABRT/崩溃转储，没有生产测试hook。
+红测旧入口返回86而非1；修复后8个case验证标准/未知/parse/body、诊断失败、正常0/取消2，
+marker断言普通栈对象恰好展开一次。取消后body抛异常仍1。加既有CLI及取消门禁3/3通过、3.18秒。
+这不是在真实CUDA上制造异常；不覆盖noexcept析构异常、信号/崩溃、硬件/驱动致命故障、
+静态析构失败或所有GPU错误后的释放保证。原209文件审查包保持固定，本修复另存增量。

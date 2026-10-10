@@ -176,6 +176,79 @@ resonantia_register_test(test_web_contract test_web_contract
     ARGS "$<TARGET_FILE:vc_serve>"
     LABELS "contract;web" TIMEOUT 60 NO_GPU_LOCK)
 
+# Keep real two-minute wall-clock validation out of the default fast suite.
+if(VOXMUTATIO_ENABLE_SLOW_WEB_TESTS)
+    resonantia_register_test(test_web_body_deadline test_web_contract
+        ARGS "$<TARGET_FILE:vc_serve>" "--body-deadline-only"
+        LABELS "contract;web;host;slow" TIMEOUT 130 NO_GPU_LOCK)
+endif()
+
+resonantia_add_process_test_executable(test_web_transaction_failure
+    "${PROJECT_SOURCE_DIR}/tests/test_web_transaction_failure.cpp")
+target_link_libraries(test_web_transaction_failure PRIVATE resonantia_web_support)
+resonantia_register_test(test_web_transaction_failure test_web_transaction_failure
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
+resonantia_add_process_test_executable(test_web_job_lifecycle
+    "${PROJECT_SOURCE_DIR}/tests/test_web_job_lifecycle.cpp")
+target_link_libraries(test_web_job_lifecycle PRIVATE resonantia_web_support)
+resonantia_register_test(test_web_job_lifecycle test_web_job_lifecycle
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
+resonantia_add_process_test_executable(test_web_process_contract
+    "${PROJECT_SOURCE_DIR}/tests/test_web_process_contract.cpp")
+target_link_libraries(test_web_process_contract PRIVATE resonantia_web_support)
+resonantia_register_test(test_web_process_contract test_web_process_contract
+    LABELS "contract;web;host" TIMEOUT 10 NO_GPU_LOCK)
+
+resonantia_add_process_test_executable(test_web_result_contract
+    "${PROJECT_SOURCE_DIR}/tests/test_web_result_contract.cpp")
+target_link_libraries(test_web_result_contract PRIVATE resonantia_web_support)
+resonantia_register_test(test_web_result_contract test_web_result_contract
+    LABELS "contract;web;host" TIMEOUT 5 NO_GPU_LOCK)
+
+resonantia_add_process_test_executable(test_web_train_cancel
+    "${PROJECT_SOURCE_DIR}/tests/test_web_train_cancel.cpp")
+target_link_libraries(test_web_train_cancel PRIVATE resonantia_web_support)
+resonantia_register_test(test_web_train_cancel test_web_train_cancel
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
+# A private source recompilation supplies the deterministic material-commit
+# pause. Production resonantia_web_support/vc_serve never receive this macro.
+resonantia_add_process_test_executable(test_web_train_cancel_commit
+    "${PROJECT_SOURCE_DIR}/tests/test_web_train_cancel.cpp")
+target_sources(test_web_train_cancel_commit PRIVATE
+    "${PROJECT_SOURCE_DIR}/tools/web/http_transport.cpp"
+    "${PROJECT_SOURCE_DIR}/tools/web/workflow_support.cpp"
+    "${PROJECT_SOURCE_DIR}/tools/web/web_service.cpp")
+target_include_directories(test_web_train_cancel_commit PRIVATE "${PROJECT_SOURCE_DIR}")
+target_compile_definitions(test_web_train_cancel_commit PRIVATE
+    RESONANTIA_TEST_MATERIAL_COMMIT_GATE=1)
+target_link_libraries(test_web_train_cancel_commit PRIVATE voxmutatio resonantia_training_control)
+resonantia_register_test(test_web_train_cancel_commit test_web_train_cancel_commit
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
+resonantia_add_process_test_executable(test_training_cancel
+    "${PROJECT_SOURCE_DIR}/tests/test_training_cancel.cpp")
+target_link_libraries(test_training_cancel PRIVATE resonantia_web_support resonantia_vc_train_app_support)
+add_dependencies(test_training_cancel vc_train)
+resonantia_register_test(test_training_cancel test_training_cancel
+    ARGS "$<TARGET_FILE:vc_train>" LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
+# The production main is linked unchanged to host throwing app stubs. The
+# fixture does not link the CUDA facade or add hooks to the production CLI.
+add_executable(vc_train_entry_exception_fixture
+    "${PROJECT_SOURCE_DIR}/tools/vc_train.cpp"
+    "${PROJECT_SOURCE_DIR}/tests/vc_train_entry_exception_fixture.cpp")
+target_link_libraries(vc_train_entry_exception_fixture PRIVATE resonantia_training_control)
+resonantia_add_process_test_executable(test_vc_train_entry
+    "${PROJECT_SOURCE_DIR}/tests/test_vc_train_entry.cpp")
+target_link_libraries(test_vc_train_entry PRIVATE resonantia_web_support)
+add_dependencies(test_vc_train_entry vc_train_entry_exception_fixture)
+resonantia_register_test(test_vc_train_entry test_vc_train_entry
+    ARGS "$<TARGET_FILE:vc_train_entry_exception_fixture>"
+    LABELS "contract;cli;host" TIMEOUT 10 NO_GPU_LOCK)
+
 resonantia_add_test_executable(test_legacy_webserver_contract
     "${PROJECT_SOURCE_DIR}/tests/test_legacy_webserver_contract.cpp")
 resonantia_register_test(test_legacy_webserver_contract test_legacy_webserver_contract

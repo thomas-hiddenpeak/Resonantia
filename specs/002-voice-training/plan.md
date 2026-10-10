@@ -101,3 +101,13 @@ A5 的占位完成证据。
 
 下一里程碑优先完成 A5 的可验证 resume，再建立 A6 的质量协议；在这两项完成前，
 规格状态保持“实验性 / 部分完成”。
+
+## Authorized orchestration increment: complete-iteration cancellation
+
+- [x] Optional job channel and distinct completed/error/cancelled CLI statuses.
+- [x] Poll between initialization/clips and complete decoder iterations or GAN D/G pairs; gate final export.
+- [x] Web owns token lifetime, natural reap and staging cleanup before releasing the job.
+- [x] Host contracts for parameters, protocol, fake complete steps, actual pre-CUDA cancellation and Web result consumption.
+- [ ] Independent review and real GPU cancellation/resource/latency acceptance; no real training run in this increment.
+
+Unchanged A5/A6 milestones and unsupported resume still apply. See [DESIGN](../../docs/DESIGN.md).

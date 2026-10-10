@@ -16,6 +16,7 @@ struct VcTrainOptions {
     std::string pretrained_path;
     std::string target_path;
     std::string output_path;
+    std::string cancel_file; // Optional, one-byte job channel; empty preserves old behavior.
     std::string discriminator_path;
     int speaker = 0;
     int steps = 300;

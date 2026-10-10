@@ -26,9 +26,36 @@ namespace resonantia::web {
 
 namespace fs = std::filesystem;
 
+#ifdef RESONANTIA_TEST_MATERIAL_COMMIT_GATE
+// Defined only by the private commit test executable, never a service target.
+void test_material_raw_installed(const fs::path& directory);
+#endif
+
 namespace {
 
 constexpr std::size_t kMaximumProcessLogLine = 64 * 1024;
+
+// After live artifacts move, cleanup is unsafe until commit or full rollback.
+// This guard must remain allocation-free even when diagnostic formatting throws.
+class BackupRetentionGuard {
+public:
+    BackupRetentionGuard(TempDir& backup, const char* operation) noexcept
+        : backup_(backup), operation_(operation) {}
+    BackupRetentionGuard(const BackupRetentionGuard&) = delete;
+    BackupRetentionGuard& operator=(const BackupRetentionGuard&) = delete;
+    ~BackupRetentionGuard() noexcept {
+        if (cleanup_allowed_) return;
+        std::fprintf(stderr, "[vc_serve] %s transaction incomplete; backup retained at %s\n",
+                     operation_, backup_.path().c_str());
+        backup_.release();
+    }
+    void allow_cleanup() noexcept { cleanup_allowed_ = true; }
+
+private:
+    TempDir& backup_;
+    const char* operation_;
+    bool cleanup_allowed_ = false;
+};
 
 class UniqueFd {
 public:
@@ -523,16 +550,31 @@ bool write_uploads(const std::vector<Upload>& uploads, const fs::path& raw,
 
 bool replace_material_dirs(const fs::path& directory, const fs::path& staged_raw,
                            const fs::path& staged_work, std::string& error) {
+    const fs::path steps = directory / "steps.txt";
+    std::error_code filesystem_error;
+    const fs::file_status marker_status = fs::symlink_status(steps, filesystem_error);
+    if (filesystem_error && filesystem_error != std::errc::no_such_file_or_directory) {
+        error = filesystem_error.message();
+        return false;
+    }
+    if (fs::exists(marker_status) && !fs::is_regular_file(marker_status)) {
+        error = "existing step marker must be a regular file";
+        return false;
+    }
+    filesystem_error.clear();
+
     TempDir backup(directory, ".material_backup_");
     const fs::path raw = directory / "raw";
     const fs::path work = directory / "work";
     const fs::path old_raw = fs::path(backup.path()) / "raw";
     const fs::path old_work = fs::path(backup.path()) / "work";
+    const fs::path old_steps = fs::path(backup.path()) / "steps.txt";
     bool moved_raw = false;
     bool moved_work = false;
+    bool moved_steps = false;
     bool installed_raw = false;
     bool installed_work = false;
-    std::error_code filesystem_error;
+    BackupRetentionGuard retention(backup, "material");
     const auto move_old = [&](const fs::path& source, const fs::path& destination,
                               bool& moved) {
         const bool exists = fs::exists(source, filesystem_error);
@@ -542,17 +584,23 @@ bool replace_material_dirs(const fs::path& directory, const fs::path& staged_raw
         if (!filesystem_error) moved = true;
         return !filesystem_error;
     };
-    if (!move_old(raw, old_raw, moved_raw) || !move_old(work, old_work, moved_work)) {
-        error = filesystem_error.message();
-    } else {
+    // Retire the previous generation's marker as part of the same transaction.
+    // A later publish failure restores it together with the old raw/work pair.
+    if (move_old(raw, old_raw, moved_raw) && move_old(work, old_work, moved_work) &&
+        move_old(steps, old_steps, moved_steps)) {
         fs::rename(staged_raw, raw, filesystem_error);
         if (!filesystem_error) {
             installed_raw = true;
+#ifdef RESONANTIA_TEST_MATERIAL_COMMIT_GATE
+            test_material_raw_installed(directory);
+#endif
             fs::rename(staged_work, work, filesystem_error);
             if (!filesystem_error) installed_work = true;
         }
-        if (!filesystem_error) return true;
-        error = filesystem_error.message();
+        if (!filesystem_error) {
+            retention.allow_cleanup();
+            return true;
+        }
     }
 
     bool rollback_ok = true;
@@ -573,12 +621,9 @@ bool replace_material_dirs(const fs::path& directory, const fs::path& staged_raw
     remove_installed(work, installed_work);
     restore_old(old_raw, raw, moved_raw);
     restore_old(old_work, work, moved_work);
-    if (!rollback_ok) {
-        std::fprintf(stderr,
-                     "[vc_serve] material rollback incomplete; backup retained at %s\n",
-                     backup.path().c_str());
-        backup.release();
-    }
+    restore_old(old_steps, steps, moved_steps);
+    if (rollback_ok) retention.allow_cleanup();
+    error = filesystem_error.message();
     return false;
 }
 
@@ -598,6 +643,7 @@ bool replace_step_artifacts(const fs::path& directory, const fs::path& staged_wo
          fs::path(backup.path()) / "steps.txt"},
     }};
     std::error_code filesystem_error;
+    BackupRetentionGuard retention(backup, "step");
 
     for (Artifact& artifact : artifacts) {
         const bool exists = fs::exists(artifact.live, filesystem_error);
@@ -614,8 +660,10 @@ bool replace_step_artifacts(const fs::path& directory, const fs::path& staged_wo
             artifact.installed = true;
         }
     }
-    if (!filesystem_error) return true;
-    error = filesystem_error.message();
+    if (!filesystem_error) {
+        retention.allow_cleanup();
+        return true;
+    }
 
     bool rollback_ok = true;
     for (auto artifact = artifacts.rbegin(); artifact != artifacts.rend(); ++artifact) {
@@ -630,12 +678,8 @@ bool replace_step_artifacts(const fs::path& directory, const fs::path& staged_wo
         fs::rename(artifact->old, artifact->live, rollback_error);
         if (rollback_error) rollback_ok = false;
     }
-    if (!rollback_ok) {
-        std::fprintf(stderr,
-                     "[vc_serve] step rollback incomplete; backup retained at %s\n",
-                     backup.path().c_str());
-        backup.release();
-    }
+    if (rollback_ok) retention.allow_cleanup();
+    error = filesystem_error.message();
     return false;
 }
 
@@ -661,6 +705,7 @@ bool replace_training_artifacts(const fs::path& directory,
     }};
 
     std::error_code filesystem_error;
+    BackupRetentionGuard retention(backup, "training");
     for (Artifact& artifact : artifacts) {
         const bool exists = fs::exists(artifact.live, filesystem_error);
         if (filesystem_error) break;
@@ -676,8 +721,10 @@ bool replace_training_artifacts(const fs::path& directory,
             artifact.installed = true;
         }
     }
-    if (!filesystem_error) return true;
-    error = filesystem_error.message();
+    if (!filesystem_error) {
+        retention.allow_cleanup();
+        return true;
+    }
 
     bool rollback_ok = true;
     for (auto artifact = artifacts.rbegin(); artifact != artifacts.rend(); ++artifact) {
@@ -692,12 +739,8 @@ bool replace_training_artifacts(const fs::path& directory,
         fs::rename(artifact->old, artifact->live, rollback_error);
         if (rollback_error) rollback_ok = false;
     }
-    if (!rollback_ok) {
-        std::fprintf(stderr,
-                     "[vc_serve] training rollback incomplete; backup retained at %s\n",
-                     backup.path().c_str());
-        backup.release();
-    }
+    if (rollback_ok) retention.allow_cleanup();
+    error = filesystem_error.message();
     return false;
 }
 

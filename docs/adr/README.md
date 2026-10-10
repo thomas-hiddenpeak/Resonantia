@@ -33,6 +33,9 @@ ADR 记录会长期影响模块边界、依赖、持久格式、运行时、部�
   （`Accepted`，2026-08-12；active exact-scan mmap 改为私有、已 unlink 的 filesystem-backed
   snapshot，优先 `FICLONE`、否则 bounded copy；`build_index` 确定排序并原子发布）。
 
+- [`ADR-0006`](0006-training-cancellation-ownership.md)：训练作业代号、单一所有者和阶段边界取消
+  （`Proposed`，2026-10-10；用户已明确授权本增量实施，正式ADR审查状态保留；无强杀/自动超时）。
+
 ## 最小模板
 
 ```markdown

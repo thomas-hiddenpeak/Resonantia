@@ -105,6 +105,10 @@ struct Upload {
                                  const std::filesystem::path& raw,
                                  const std::optional<std::filesystem::path>& work,
                                  std::string& error);
+// Publishes raw/work and retires the previous regular steps.txt marker together.
+// Recoverable failures restore the old generation; non-regular markers fail
+// before live artifacts are moved. Unexpected exceptions retain backup bytes
+// until commit or complete rollback. Callers must serialize material mutations.
 [[nodiscard]] bool replace_material_dirs(const std::filesystem::path& directory,
                                          const std::filesystem::path& staged_raw,
                                          const std::filesystem::path& staged_work,

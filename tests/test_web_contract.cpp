@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -17,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -128,9 +130,18 @@ struct HttpResponse {
 
 HttpResponse request(int port, const std::string& method, const std::string& path,
                      const std::string& body = {}, const std::string& content_type = {},
-                     const std::string& extra_headers = {}) {
+                     const std::string& extra_headers = {}, int io_timeout_seconds = 0,
+                     std::size_t* input_bytes = nullptr) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) throw std::runtime_error("request socket failed");
+    if (io_timeout_seconds > 0) {
+        const timeval timeout{io_timeout_seconds, 0};
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ||
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout))) {
+            close(fd);
+            throw std::runtime_error("request socket timeout setup failed");
+        }
+    }
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -148,10 +159,15 @@ HttpResponse request(int port, const std::string& method, const std::string& pat
     if (!content_type.empty()) wire += "Content-Type: " + content_type + "\r\n";
     wire += extra_headers;
     wire += "Connection: close\r\n\r\n" + body;
+    if (input_bytes && *input_bytes + wire.size() > 4096) {
+        close(fd);
+        throw std::runtime_error("body deadline total input exceeded 4KiB");
+    }
     if (!send_all(fd, wire)) {
         close(fd);
         throw std::runtime_error("request send failed");
     }
+    if (input_bytes) *input_bytes += wire.size();
     shutdown(fd, SHUT_WR);
 
     std::string raw;
@@ -212,8 +228,8 @@ public:
     ServerProcess(const fs::path& executable, const fs::path& root,
                   const fs::path& hold_trigger, const fs::path& hold_started,
                   const fs::path& hold_release, const fs::path& fail_trigger,
-                  const std::string& token = {})
-        : port_(reserve_loopback_port()) {
+                  const std::string& token = {}, std::size_t* input_bytes = nullptr)
+        : port_(reserve_loopback_port()), input_bytes_(input_bytes) {
         pid_ = fork();
         if (pid_ < 0) throw std::runtime_error("fork failed");
         if (pid_ == 0) {
@@ -261,6 +277,7 @@ public:
     ~ServerProcess() { stop(); }
 
     int port() const { return port_; }
+    pid_t pid() const { return pid_; }
 
     void stop() {
         if (pid_ <= 0) return;
@@ -289,7 +306,8 @@ private:
                 throw std::runtime_error("vc_serve exited before accepting requests");
             }
             try {
-                if (request(port_, "GET", "/").status == 200) return;
+                if (request(port_, "GET", "/", {}, {}, {}, input_bytes_ ? 1 : 0,
+                            input_bytes_).status == 200) return;
             } catch (const std::exception&) {
             }
             std::this_thread::sleep_for(20ms);
@@ -299,6 +317,7 @@ private:
 
     pid_t pid_ = -1;
     int port_ = 0;
+    std::size_t* input_bytes_ = nullptr;
 };
 
 bool wait_for(const std::function<bool()>& predicate,
@@ -394,6 +413,82 @@ void check_training_artifact_transaction(Checks& checks, const fs::path& root) {
                       !fs::exists(rollback / "clips/new.wav") &&
                       !has_hidden_training_directory(rollback),
                   "partial training artifact publish must roll back the complete old triplet");
+}
+
+bool has_material_staging(const fs::path& directory) {
+    for (const auto& entry : fs::directory_iterator(directory)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(".material_backup_", 0) == 0 ||
+            name.rfind(".material_upload_", 0) == 0 ||
+            name.rfind(".train_upload_", 0) == 0) return true;
+    }
+    return false;
+}
+
+void check_material_transaction(Checks& checks, const fs::path& root) {
+    using resonantia::web::replace_material_dirs;
+    const std::string old_raw = minimal_wav("old-raw");
+    const std::string old_work = minimal_wav("old-work");
+    for (bool have_old : {false, true}) {
+        for (bool fail_work : {false, true}) {
+            const fs::path directory = root / (std::string("material-transaction-") +
+                (have_old ? "old-" : "new-") + (fail_work ? "rollback" : "success"));
+            if (have_old) {
+                write_file(directory / "raw/old.wav", old_raw);
+                write_file(directory / "work/old.wav", old_work);
+                write_file(directory / "steps.txt", "denoise\n");
+            }
+            const fs::path staged = directory / "staged";
+            write_file(staged / "raw/new.wav", minimal_wav("new-material"));
+            if (!fail_work)
+                write_file(staged / "work/new.wav", minimal_wav("new-material"));
+            std::string error;
+            const bool committed = replace_material_dirs(
+                directory, staged / "raw", staged / "work", error);
+            if (fail_work) {
+                checks.expect(!committed && !error.empty() &&
+                                  !fs::exists(directory / "raw/new.wav") &&
+                                  !fs::exists(directory / "work/new.wav") &&
+                                  (have_old
+                                      ? read_file(directory / "raw/old.wav") == old_raw &&
+                                        read_file(directory / "work/old.wav") == old_work &&
+                                        read_file(directory / "steps.txt") == "denoise\n"
+                                      : !fs::exists(directory / "raw") &&
+                                        !fs::exists(directory / "work") &&
+                                        !fs::exists(directory / "steps.txt")),
+                              "second material rename failure must restore the previous generation");
+            } else {
+                checks.expect(committed && error.empty() &&
+                                  read_file(directory / "raw/new.wav") == minimal_wav("new-material") &&
+                                  read_file(directory / "work/new.wav") == minimal_wav("new-material") &&
+                                  !fs::exists(directory / "steps.txt"),
+                              "material transaction must publish raw/work and invalidate the old marker together");
+            }
+            checks.expect(!has_material_staging(directory),
+                          "material success or complete rollback must remove its backup");
+        }
+    }
+    for (bool dangling : {false, true}) {
+        const fs::path directory = root / (dangling ? "material-dangling-marker"
+                                                   : "material-symlink-marker");
+        write_file(directory / "raw/old.wav", old_raw);
+        write_file(directory / "work/old.wav", old_work);
+        write_file(directory / "staged/raw/new.wav", minimal_wav("new"));
+        write_file(directory / "staged/work/new.wav", minimal_wav("new"));
+        if (!dangling) write_file(directory / "marker-target", "preserve\n");
+        fs::create_symlink("marker-target", directory / "steps.txt");
+        std::string error;
+        checks.expect(!replace_material_dirs(directory, directory / "staged/raw",
+                                              directory / "staged/work", error) &&
+                          !error.empty() &&
+                          fs::is_symlink(directory / "steps.txt") &&
+                          read_file(directory / "raw/old.wav") == old_raw &&
+                          read_file(directory / "work/old.wav") == old_work &&
+                          (dangling ? !fs::exists(directory / "marker-target")
+                                    : read_file(directory / "marker-target") == "preserve\n") &&
+                          !has_material_staging(directory),
+                      "symlink marker rejection must preserve material, link and target");
+    }
 }
 
 void check_step_artifact_transaction(Checks& checks, const fs::path& root) {
@@ -728,6 +823,709 @@ void check_training_preprocess_source(Checks& checks, int port,
             : "unprocessed material must use raw input and honor requested stages");
 }
 
+void check_training_upload(Checks& checks, int port, const fs::path& root) {
+    const std::string name = "training-replaces-material";
+    const fs::path directory = root / "runs" / name;
+    const std::string fresh = minimal_wav("fresh-training-upload");
+    write_file(directory / "raw/old.wav", minimal_wav("old-raw"));
+    write_file(directory / "work/old.wav", minimal_wav("old-work"));
+    write_file(directory / "steps.txt", "denoise\n");
+    fs::remove(root / "preprocess-invocations");
+    const HttpResponse start = request(
+        port, "POST", "/api/train",
+        multipart_body({{"name", name}, {"steps", "1"}, {"denoise", "1"}},
+                       {{"fresh.wav", fresh}}), kMultipartType);
+    if (start.status != 200) {
+        checks.expect(false, "training with fresh material should be accepted");
+        return;
+    }
+    const HttpResponse status = wait_for_job_completion(port, name);
+    const std::string invocation = read_file(root / "preprocess-invocations");
+    checks.expect(status.body.find("\"stage\":\"done\"") != std::string::npos &&
+                      read_file(directory / "raw/fresh.wav") == fresh &&
+                      read_file(directory / "work/fresh.wav") == fresh &&
+                      !fs::exists(directory / "raw/old.wav") &&
+                      !fs::exists(directory / "work/old.wav") &&
+                      !fs::exists(directory / "steps.txt") &&
+                      !has_material_staging(directory) &&
+                      invocation.find("--input " + (directory / "raw").string()) != std::string::npos &&
+                      invocation.find("--denoise") != std::string::npos,
+                  "training upload must retire the old marker and apply requested cleanup to fresh raw");
+}
+
+void check_multipart_boundaries(Checks& checks, int port, const fs::path& root) {
+    const std::string boundary = "resonantia-contract-boundary";
+    const std::string name = "multipart-boundary";
+    const fs::path material = root / "runs" / name;
+    const std::string old_audio = minimal_wav("existing-material");
+    const std::string audio = minimal_wav("new-material");
+    const std::string body = multipart_body({{"name", name}}, {{"new.wav", audio}});
+    const auto rejected = [&](const std::string& candidate, const std::string& type,
+                              int status, const std::string& description) {
+        fs::remove(material / "raw/new.wav");
+        fs::remove(material / "work/new.wav");
+        write_file(material / "raw/old.wav", old_audio);
+        write_file(material / "work/old.wav", old_audio);
+        write_file(material / "steps.txt", "denoise\n");
+        const HttpResponse response = request(port, "POST", "/api/material", candidate, type);
+        checks.expect(response.status == status, description);
+        checks.expect(read_file(material / "raw/old.wav") == old_audio &&
+                          read_file(material / "work/old.wav") == old_audio &&
+                          read_file(material / "steps.txt") == "denoise\n" &&
+                          !fs::exists(material / "raw/new.wav") &&
+                          !fs::exists(material / "work/new.wav"),
+                      description + " must preserve existing material and marker");
+    };
+    rejected(body, std::string(kMultipartType) + "; boundary=" + boundary, 400,
+             "duplicate identical boundary parameters must fail");
+    rejected(body, std::string(kMultipartType) + "; BOUNDARY=other", 400,
+             "duplicate conflicting boundary parameters must fail case-insensitively");
+    rejected(body, "multipart/form-data; note=\"ignored; boundary=" + boundary +
+                       "; ignored\"", 400,
+             "boundary text inside a quoted parameter must not select a delimiter");
+    rejected(body, "multipart/form-data; xboundary=" + boundary, 400,
+             "a boundary parameter name suffix must not select a delimiter");
+    rejected(body, "multipart/form-data", 400, "missing boundary must fail");
+    rejected(body, "multipart/form-data; boundary=\"\"", 400, "empty boundary must fail");
+    rejected(body, "multipart/form-data; boundary=\"" + boundary, 400,
+             "unterminated quoted boundary must fail");
+    rejected(body, std::string(kMultipartType) + "; note=\"unterminated", 400,
+             "unterminated trailing parameter must fail");
+    rejected(body, std::string(kMultipartType) + "; note=value junk", 400,
+             "trailing parameter junk must fail");
+    rejected(body, std::string(kMultipartType) + "; note=\"trailing\\", 400,
+             "unterminated quoted escape must fail");
+    rejected(body, std::string(kMultipartType) + ";", 400,
+             "an empty trailing parameter must fail");
+    rejected(body, "multipart/form-data; boundary=other", 400,
+             "mismatched body boundary must fail");
+    rejected(body.substr(0, body.size() - (boundary.size() + 6)), kMultipartType, 400,
+             "missing closing delimiter must fail");
+    rejected(body + "junk", kMultipartType, 400,
+             "bytes after the closing delimiter must fail");
+    rejected(multipart_body({{"name", name}, {"note", std::string(16385, 'x')}},
+                            {{"new.wav", audio}}), kMultipartType, 413,
+             "multipart fields above 16 KiB must fail");
+    std::vector<std::pair<std::string, std::string>> fields{{"name", name}};
+    for (int i = 0; i < 127; ++i) fields.emplace_back("note", "x");
+    rejected(multipart_body(fields, {{"new.wav", audio}}), kMultipartType, 413,
+             "multipart bodies above 128 parts must fail");
+
+    // A delimiter prefix in binary WAV data is payload, not a delimiter line.
+    const std::string binary_audio = minimal_wav(
+        std::string("\0\xff", 2) + "\r\n--" + boundary + "-suffix\r\n--" +
+        boundary + "X\r\n--" + boundary + "\rX\r\n--" + boundary +
+        "--suffix\r\n--" + boundary + "--\rX\r\nend");
+    fields.pop_back();
+    fields.back().second.assign(16384, 'x');
+    const std::vector<std::string> accepted_types{
+        kMultipartType,
+        "multipart/form-data; boundary=\"" + boundary + "\"",
+        "multipart/form-data; note=\"ignored; boundary=decoy\"; BOUNDARY=\"" +
+            boundary + "\"; charset=utf-8",
+        "multipart/form-data; note=\"escaped\\\"; boundary=decoy\"; boundary=" + boundary,
+    };
+    for (const std::string& type : accepted_types) {
+        const HttpResponse accepted = request(
+            port, "POST", "/api/material",
+            multipart_body(fields, {{"new.wav", binary_audio}}), type);
+        checks.expect(accepted.status == 200 &&
+                          read_file(material / "raw/new.wav") == binary_audio &&
+                          read_file(material / "work/new.wav") == binary_audio &&
+                          !fs::exists(material / "steps.txt"),
+                      "128 parts, 16 KiB field and binary delimiter prefixes must preserve "
+                      "exact uploaded bytes with " + type);
+    }
+    checks.expect(!fs::exists(root / "preprocess-invocations") &&
+                      !fs::exists(root / "convert-invoked"),
+                  "multipart validation and material upload must not start model CLI jobs");
+}
+
+void check_multipart_part_headers(Checks& checks, int port, const fs::path& root) {
+    const std::string boundary = "resonantia-contract-boundary";
+    const std::string name_header = "Content-Disposition: form-data; name=\"name\"";
+    const std::string file_header =
+        "Content-Disposition: form-data; name=\"audio\"; filename=\"new.wav\"";
+    const std::string fresh = minimal_wav("part-header-upload");
+    const auto body = [&](const std::string& name, const std::string& field_headers,
+                          const std::string& file_headers) {
+        return "--" + boundary + "\r\n" + field_headers + "\r\n\r\n" + name +
+               "\r\n--" + boundary + "\r\n" + file_headers + "\r\n\r\n" + fresh +
+               "\r\n--" + boundary + "--\r\n";
+    };
+    struct RejectedHeader {
+        const char* label;
+        bool file_part;
+        std::string headers;
+    };
+    const std::vector<RejectedHeader> rejected{
+        {"missing disposition cannot borrow name from another header", false,
+         "X-Metadata: name=\"name\""},
+        {"wrong disposition type", false, "Content-Disposition: attachment; name=\"name\""},
+        {"name suffix is not a name parameter", false,
+         "Content-Disposition: form-data; xname=\"name\""},
+        {"comment text is not a name parameter", false,
+         "Content-Disposition: form-data (name=\"name\")"},
+        {"duplicate disposition header is ambiguous", false, name_header + "\r\n" + name_header},
+        {"duplicate identical name is ambiguous", false, name_header + "; name=\"name\""},
+        {"duplicate conflicting name is ambiguous", false, name_header + "; NAME=\"other\""},
+        {"duplicate filename is ambiguous", true, file_header + "; FILENAME=\"other.wav\""},
+        {"filename cannot stand in for missing name", true,
+         "Content-Disposition: form-data; filename=\"new.wav\""},
+        {"unrelated header cannot supply a filename", true,
+         "X-Metadata: filename=\"new.wav\"\r\nContent-Disposition: form-data; name=\"audio\""},
+        {"header missing colon", false, "Content-Disposition form-data; name=\"name\""},
+        {"whitespace inside header name", false, "Content-Disposition : form-data; name=\"name\""},
+        {"orphan continuation line", false, " " + name_header},
+        {"bare LF in header block", false, name_header + "\nX-Metadata: value"},
+        {"bare CR in header block", false, name_header + "\rX-Metadata: value"},
+        {"NUL in header block", false, name_header + "\r\nX-Metadata: " + std::string(1, '\0')},
+        {"DEL in header block", false, name_header + "\r\nX-Metadata: " + std::string(1, '\x7f')},
+        {"unterminated quoted parameter", false, name_header + "; note=\"unfinished"},
+        {"unterminated quoted escape", false, name_header + "; note=\"unfinished\\"},
+        {"trailing parameter junk", false, name_header + " junk"},
+        {"empty trailing parameter", false, name_header + ";"},
+        {"unterminated comment", false, name_header + " (unfinished"},
+        {"filename star is prohibited for form-data", true,
+         file_header + "; filename*=UTF-8''other.wav"},
+    };
+    const std::string cli_before = read_file(root / "preprocess-invocations");
+    for (std::size_t i = 0; i < rejected.size(); ++i) {
+        const auto& test = rejected[i];
+        const std::string name = "part-header-reject-" + std::to_string(i);
+        const fs::path directory = root / "runs" / name;
+        const std::string old_raw = minimal_wav("old-raw"), old_work = minimal_wav("old-work");
+        write_file(directory / "raw/old.wav", old_raw);
+        write_file(directory / "work/old.wav", old_work);
+        write_file(directory / "steps.txt", "denoise\n");
+        const HttpResponse response = request(
+            port, "POST", "/api/material",
+            body(name, test.file_part ? name_header : test.headers,
+                 test.file_part ? test.headers : file_header), kMultipartType);
+        checks.expect(response.status == 400 &&
+                          read_file(directory / "raw/old.wav") == old_raw &&
+                          read_file(directory / "work/old.wav") == old_work &&
+                          read_file(directory / "steps.txt") == "denoise\n" &&
+                          !fs::exists(directory / "raw/new.wav") &&
+                          !fs::exists(directory / "work/new.wav") &&
+                          !has_material_staging(directory),
+                      std::string(test.label) + " must return 400 and preserve raw/work/marker");
+    }
+    const std::vector<std::pair<std::string, std::string>> accepted{
+        {name_header, file_header},
+        {"cOnTeNt-DiSpOsItIoN: FORM-DATA; NAME = name",
+         "Content-Disposition: form-data; name=audio; filename=new.wav"},
+        {"Content-Disposition: form-data; name=\"na\\me\"",
+         "Content-Disposition: form-data; filename=\"ne\\w.wav\"; name=\"audio\""},
+        {"Content-Disposition: form-data;\r\n\tname = \"name\"", file_header},
+        {"Content-Disposition: form-data (name=\"decoy\" (nested)); name=(ignored)\"name\"",
+         file_header + " (escaped\\) comment)"},
+        {"X-Metadata: name=\"decoy\"\r\n" + name_header,
+         "X-Metadata: filename=\"decoy.wav\"\r\n" + file_header},
+        {"Content-Disposition: form-data; xname=\"decoy\"; name=\"name\"",
+         file_header + "; note=\"filename=\\\"decoy.wav\\\"\""},
+        {name_header + "\r\nX-Trace: ordinary extension", file_header + "\r\nContent-Type: audio/wav"},
+    };
+    for (std::size_t i = 0; i < accepted.size(); ++i) {
+        const std::string name = "part-header-accept-" + std::to_string(i);
+        const HttpResponse response = request(
+            port, "POST", "/api/material", body(name, accepted[i].first, accepted[i].second),
+            kMultipartType);
+        checks.expect(response.status == 200 &&
+                          read_file(root / "runs" / name / "raw/new.wav") == fresh &&
+                          read_file(root / "runs" / name / "work/new.wav") == fresh,
+                      "valid disposition syntax and ignored metadata must preserve values and bytes, case " +
+                          std::to_string(i));
+    }
+    const std::string repeated_name = "part-header-repeated-fields";
+    const HttpResponse repeated = request(
+        port, "POST", "/api/material",
+        multipart_body({{"name", repeated_name}, {"", "empty field name"}, {"note", "one"}, {"note", "two"}},
+                       {{"one.wav", fresh}, {"two.wav", fresh}}), kMultipartType);
+    checks.expect(repeated.status == 200 &&
+                      read_file(root / "runs" / repeated_name / "raw/one.wav") == fresh &&
+                      read_file(root / "runs" / repeated_name / "raw/two.wav") == fresh,
+                  "repeated names across parts and an explicit empty field name must remain valid");
+    checks.expect(read_file(root / "preprocess-invocations") == cli_before,
+                  "part header parsing must not start a model CLI");
+}
+
+void check_material_marker_failure(Checks& checks, int port, const fs::path& root) {
+    for (const std::string route : {"material", "train"}) {
+        const std::string name = "material-marker-" + route;
+        const fs::path directory = root / "runs" / name;
+        const std::string old_raw = minimal_wav("raw-before-failed-upload");
+        const std::string old_work = minimal_wav("work-before-failed-upload");
+        write_file(directory / "raw/old.wav", old_raw);
+        write_file(directory / "work/old.wav", old_work);
+        // An invalid marker must not be silently ignored, or recursively deleted.
+        write_file(directory / "steps.txt/preserve.txt", "preserve-invalid-marker");
+        const std::string invocations = read_file(root / "preprocess-invocations");
+        const HttpResponse response = request(
+            port, "POST", "/api/" + route,
+            multipart_body({{"name", name}, {"steps", "1"}},
+                           {{"new.wav", minimal_wav("new-upload")}}), kMultipartType);
+        // Keep a failing pre-fix run from leaving its fake worker in flight.
+        if (route == "train" && response.status == 200) wait_for_job_completion(port, name);
+        checks.expect(response.status == 500,
+                      route + " upload must fail when its existing step marker is not a regular file");
+        checks.expect(read_file(directory / "raw/old.wav") == old_raw &&
+                          read_file(directory / "work/old.wav") == old_work &&
+                          read_file(directory / "steps.txt/preserve.txt") == "preserve-invalid-marker" &&
+                          !fs::exists(directory / "raw/new.wav") &&
+                          !fs::exists(directory / "work/new.wav") &&
+                          !has_material_staging(directory),
+                      route + " marker failure must preserve old material and clean only request staging");
+        checks.expect(read_file(root / "preprocess-invocations") == invocations,
+                      route + " marker failure must not launch the preprocessing CLI");
+        if (route == "train") {
+            const HttpResponse status = request(port, "GET", "/api/train/status?name=" + name);
+            checks.expect(status.body.find("\"running\":false") != std::string::npos &&
+                              status.body.find("\"error\":true") != std::string::npos,
+                          "failed training upload must release its job reservation and report error");
+        }
+    }
+}
+
+void check_material_preview_race(Checks& checks, int port) {
+    const std::string name = "material-preview-race";
+    const std::string first = minimal_wav(std::string(64 * 1024, 'a'));
+    const std::string second = minimal_wav(std::string(64 * 1024, 'b'));
+    const auto upload = [&](int generation) {
+        return request(port, "POST", "/api/material",
+                       multipart_body({{"name", name}},
+                           {{generation % 2 == 0 ? "first.wav" : "second.wav",
+                             generation % 2 == 0 ? first : second}}), kMultipartType);
+    };
+    if (upload(0).status != 200) {
+        checks.expect(false, "preview race fixture must publish its initial generation");
+        return;
+    }
+    // Two clients only: bounded traffic, no model execution and no timing sleeps.
+    auto publisher = std::async(std::launch::async, [&] {
+        int failures = 0;
+        for (int generation = 1; generation <= 256; ++generation)
+            if (upload(generation).status != 200) ++failures;
+        return failures;
+    });
+    int preview_failures = 0;
+    for (int i = 0; i < 1024; ++i) {
+        const HttpResponse preview = request(port, "GET", "/api/preview?name=" + name);
+        if (preview.status != 200 || (preview.body != first && preview.body != second))
+            ++preview_failures;
+    }
+    const int publish_failures = publisher.get();
+    std::cout << "Material/preview concurrent check: publish failures=" << publish_failures
+              << ", preview failures=" << preview_failures << '\n';
+    checks.expect(publish_failures == 0 && preview_failures == 0,
+                  "concurrent preview must return one complete generation while material is replaced");
+}
+
+void check_slow_preview_publication(Checks& checks, int port, const fs::path& root) {
+    const std::string name = "slow-preview-publication";
+    const fs::path work = root / "runs" / name / "work/large.wav";
+    write_file(work, minimal_wav("slow-preview"));
+    fs::resize_file(work, 8U * 1024U * 1024U);
+    struct SocketGuard {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        ~SocketGuard() { if (fd >= 0) close(fd); }
+    } client;
+    if (client.fd < 0) throw std::runtime_error("slow preview socket failed");
+    const int small_buffer = 4096;
+    const timeval timeout{3, 0};
+    if (setsockopt(client.fd, SOL_SOCKET, SO_RCVBUF, &small_buffer, sizeof(small_buffer)) != 0 ||
+        setsockopt(client.fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0)
+        throw std::runtime_error("slow preview socket options failed");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    if (connect(client.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+        !send_all(client.fd, "GET /api/preview?name=" + name +
+                     " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"))
+        throw std::runtime_error("slow preview request failed");
+    std::string headers;
+    while (headers.size() < 4096 && headers.find("\r\n\r\n") == std::string::npos) {
+        char byte;
+        if (recv(client.fd, &byte, 1, 0) != 1)
+            throw std::runtime_error("slow preview response header failed");
+        headers.push_back(byte);
+    }
+    checks.expect(headers.find("HTTP/1.1 200 ") == 0,
+                  "slow preview fixture must begin a successful response");
+    // Stop reading an 8 MiB body with a small receive window. Publication must
+    // finish before this socket is closed, proving socket writes hold no material lock.
+    auto publication = std::async(std::launch::async, [&] {
+        return request(port, "POST", "/api/material",
+                       multipart_body({{"name", name}}, {{"fresh.wav", minimal_wav("fresh")}}),
+                       kMultipartType);
+    });
+    const bool ready = publication.wait_for(2s) == std::future_status::ready;
+    shutdown(client.fd, SHUT_RDWR);
+    close(client.fd);
+    client.fd = -1;
+    const HttpResponse published = publication.get();
+    checks.expect(ready && published.status == 200,
+                  "slow preview response must not retain the material publication lock");
+}
+
+// Bounded raw HTTP client for incomplete uploads. The Content-Length reservation
+// can be large while the actual transmitted body remains only a few bytes.
+class IncompleteUploadClient {
+public:
+    explicit IncompleteUploadClient(int port) {
+        fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) throw std::runtime_error("resource test socket failed");
+        const timeval timeout{2, 0};
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(port);
+        if (setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ||
+            setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) ||
+            connect(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address))) {
+            close(fd_);
+            throw std::runtime_error("resource test socket setup failed");
+        }
+    }
+    IncompleteUploadClient(const IncompleteUploadClient&) = delete;
+    IncompleteUploadClient& operator=(const IncompleteUploadClient&) = delete;
+    ~IncompleteUploadClient() { if (fd_ >= 0) close(fd_); }
+
+    void start(std::size_t declared_length, const std::string& body = {}) {
+        const std::string wire =
+            "POST /api/train HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: " +
+            std::to_string(declared_length) + "\r\nContent-Type: " + kMultipartType +
+            "\r\nConnection: close\r\n\r\n" + body;
+        if (!send_all(fd_, wire)) throw std::runtime_error("resource test send failed");
+    }
+    void finish_write() {
+        if (shutdown(fd_, SHUT_WR)) throw std::runtime_error("resource test EOF failed");
+    }
+    void reset() {
+        const linger option{1, 0};
+        if (setsockopt(fd_, SOL_SOCKET, SO_LINGER, &option, sizeof(option)))
+            throw std::runtime_error("resource test reset setup failed");
+        close(fd_);
+        fd_ = -1;
+    }
+    int response_status() {
+        std::string response;
+        char buffer[4096];
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        for (;;) {
+            if (std::chrono::steady_clock::now() >= deadline)
+                throw std::runtime_error("resource response deadline exceeded");
+            const ssize_t size = recv(fd_, buffer, sizeof(buffer), 0);
+            if (size < 0 && errno == EINTR) continue;
+            if (size < 0) throw std::runtime_error("resource response read failed");
+            if (size == 0) break;
+            response.append(buffer, static_cast<std::size_t>(size));
+            if (response.size() > 16 * 1024)
+                throw std::runtime_error("resource test response exceeded bound");
+        }
+        if (response.rfind("HTTP/1.1 ", 0) || response.find("\r\n\r\n") == std::string::npos)
+            throw std::runtime_error("resource test malformed response");
+        return std::stoi(response.substr(9, 3));
+    }
+private:
+    int fd_ = -1;
+};
+
+int server_socket_count(pid_t pid) {
+    std::error_code error;
+    int count = 0;
+    const fs::path directory = fs::path("/proc") / std::to_string(pid) / "fd";
+    for (fs::directory_iterator entry(directory, error), end; !error && entry != end;
+         entry.increment(error)) {
+        std::error_code link_error;
+        const fs::path target = fs::read_symlink(entry->path(), link_error);
+        if (link_error == std::errc::no_such_file_or_directory) continue;
+        if (link_error) return -1;
+        if (target.string().rfind("socket:[", 0) == 0) ++count;
+    }
+    return error ? -1 : count;
+}
+
+void check_header_deadline(Checks& checks, const ServerProcess& server,
+                           const fs::path& root) {
+    const auto case_start = std::chrono::steady_clock::now();
+    const std::string initial_job = request(server.port(), "GET", "/api/train/status", {}, {}, {}, 1).body;
+    const std::string cli_before = read_file(root / "preprocess-invocations");
+    struct Socket {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        ~Socket() { if (fd >= 0) close(fd); }
+    } client;
+    if (client.fd < 0) throw std::runtime_error("header deadline socket failed");
+    const timeval send_timeout{1, 0};
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(server.port());
+    if (setsockopt(client.fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout)) ||
+        connect(client.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)))
+        throw std::runtime_error("header deadline connection failed");
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto response_limit = start + 13s;
+    const auto wait_readable_until = [&](std::chrono::steady_clock::time_point deadline) {
+        for (;;) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            if (remaining <= 0ms) return false;
+            pollfd event{client.fd, POLLIN, 0};
+            const int ready = poll(&event, 1, static_cast<int>(remaining.count()) + 1);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) throw std::runtime_error("header deadline poll failed");
+            if (ready > 0) return true;
+        }
+    };
+    const std::string prefix = "POST /api/train HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Drip: ";
+    if (!send_all(client.fd, prefix)) throw std::runtime_error("header prefix send failed");
+    std::size_t sent = prefix.size();
+    bool early_response = false;
+    for (const auto offset : {3s, 6s}) {
+        if (wait_readable_until(start + offset)) {
+            early_response = true;
+            break;
+        }
+        if (!send_all(client.fd, "x")) throw std::runtime_error("header drip send failed");
+        ++sent;
+    }
+    // Never finish the headers, half-close, or reset: only the server's real
+    // 10-second deadline may finish this request. Late bytes must not extend it.
+    std::string wire;
+    bool peer_closed = false;
+    char buffer[1024];
+    while (wait_readable_until(response_limit)) {
+        const ssize_t count = recv(client.fd, buffer, sizeof(buffer), MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (count < 0) throw std::runtime_error("header deadline receive failed");
+        if (count == 0) { peer_closed = true; break; }
+        wire.append(buffer, static_cast<std::size_t>(count));
+        if (wire.size() > 4096) throw std::runtime_error("header response exceeded test bound");
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    checks.expect(!early_response && elapsed >= 9s && elapsed < 13s && peer_closed &&
+                      wire.rfind("HTTP/1.1 400 ", 0) == 0 &&
+                      wire.find("\r\n\r\n") != std::string::npos,
+                  "header deadline must return 400 and close at 10s despite 3s/6s drips");
+    if (!peer_closed) throw std::runtime_error("header deadline gate did not close by 13s");
+    checks.expect(sent <= 4096 && wait_for([&] {
+                      return server_socket_count(server.pid()) == 1;
+                  }, 1s), "header timeout must close its accepted socket");
+    checks.expect(request(server.port(), "GET", "/api/train/status", {}, {}, {}, 1).body == initial_job &&
+                      read_file(root / "preprocess-invocations") == cli_before,
+                  "header timeout must leave service usable, job unchanged and CLI unstarted");
+    checks.expect(std::chrono::steady_clock::now() - case_start < 15s,
+                  "header deadline case must finish within 15s");
+    std::cout << "Header deadline: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+              << " ms, sent=" << sent << " bytes, peer_closed=" << peer_closed
+              << ", max clients=2; unchanged 10s production deadline\n";
+}
+
+void check_incomplete_upload_resources(Checks& checks, const ServerProcess& server,
+                                        const fs::path& root) {
+    using namespace resonantia::web;
+    const auto require = [&](bool condition, const std::string& message) {
+        checks.expect(condition, message);
+        if (!condition) throw std::runtime_error("incomplete upload resource gate failed");
+    };
+    const auto probe = [&] {
+        IncompleteUploadClient client(server.port());
+        client.start(1, "x"); // Complete but invalid multipart: 400 if admitted.
+        client.finish_write();
+        return client.response_status();
+    };
+    const auto idle_sockets = [&] {
+        return wait_for([&] { return server_socket_count(server.pid()) == 1; }, 2s);
+    };
+    const fs::path directory = root / "runs/incomplete-upload";
+    write_file(directory / "raw/old.wav", minimal_wav("raw-before-truncation"));
+    write_file(directory / "work/old.wav", minimal_wav("work-before-truncation"));
+    write_file(directory / "steps.txt", "denoise\n");
+    // The MIME body itself is valid; only the declared HTTP length is incomplete.
+    // Ignoring truncation would therefore start a real job against this fixture.
+    const std::string partial_body = multipart_body({{"name", "incomplete-upload"}, {"steps", "1"}});
+    const std::string cli_before = read_file(root / "preprocess-invocations");
+    const std::string initial_job = request(server.port(), "GET", "/api/train/status").body;
+    require(idle_sockets(), "only the listener should remain before resource checks");
+
+    // Boundary rejection must happen from headers alone, without waiting for or
+    // allocating a 128 MiB payload. Exact-limit admission is exercised below.
+    {
+        IncompleteUploadClient over_limit(server.port());
+        over_limit.start(kMaxBodyBytes + 1);
+        require(over_limit.response_status() == 413,
+                "declared body above 128 MiB must fail before its body is sent");
+    }
+    for (const bool reset : {false, true}) {
+        IncompleteUploadClient first(server.port()), second(server.port());
+        first.start(kMaxBodyBytes, partial_body);
+        second.start(kMaxBodyBytes, partial_body);
+        require(wait_for([&] { return probe() == 503; }, 2s),
+                "two 128 MiB declarations must exhaust the 256 MiB reservation budget");
+        require(request(server.port(), "GET", "/api/train/status").body == initial_job,
+                "incomplete uploads must not create or modify a job");
+        if (reset) {
+            first.reset();
+        } else {
+            first.finish_write();
+            require(first.response_status() == 400, "truncated body EOF must return 400");
+        }
+        require(wait_for([&] { return probe() == 400; }, 2s),
+                reset ? "RST must release the request body reservation"
+                      : "EOF must release the request body reservation");
+        {
+            IncompleteUploadClient replacement(server.port());
+            replacement.start(kMaxBodyBytes, partial_body);
+            require(wait_for([&] { return probe() == 503; }, 2s),
+                    "released capacity must admit another full 128 MiB reservation");
+            replacement.finish_write();
+            require(replacement.response_status() == 400,
+                    "replacement must have been admitted, then fail only on truncation");
+        }
+        second.finish_write();
+        require(second.response_status() == 400,
+                "remaining exact-limit incomplete upload must return 400");
+        require(idle_sockets(), "EOF/RST must close all accepted sockets");
+    }
+
+    // More than the connection cap, serially: a leaked connection counter would
+    // eventually turn these 400s into 503s, without opening 32 sockets at once.
+    for (int i = 0; i <= kMaxConnections; ++i) {
+        IncompleteUploadClient client(server.port());
+        client.start(1);
+        client.finish_write();
+        require(client.response_status() == 400,
+                "serial truncated uploads must return their connection slots");
+    }
+    require(idle_sockets(), "serial truncation must leave only the listener socket");
+    require(request(server.port(), "GET", "/api/train/status").body == initial_job,
+            "all rejected/truncated uploads must leave job state unchanged");
+    require(read_file(directory / "raw/old.wav") == minimal_wav("raw-before-truncation") &&
+            read_file(directory / "work/old.wav") == minimal_wav("work-before-truncation") &&
+            read_file(directory / "steps.txt") == "denoise\n" &&
+            !has_hidden_training_directory(directory) && !has_material_staging(directory),
+            "incomplete uploads must preserve old material and create no training staging");
+    require(read_file(root / "preprocess-invocations") == cli_before,
+            "incomplete upload resource checks must not start the training CLI chain");
+    std::cout << "Incomplete upload resources: 128 MiB declaration +1 rejected; "
+              << "256 MiB reservation full/recovered after EOF and RST; "
+              << "33 serial truncated connections recovered; no job/material changes; "
+              << "max actual body=" << partial_body.size() << " bytes, max clients=3\n";
+}
+
+void run_body_deadline_contract(Checks& checks, const fs::path& server,
+                                const fs::path& root) {
+    const auto case_start = std::chrono::steady_clock::now();
+    const auto require = [&](bool ok, const std::string& message) {
+        checks.expect(ok, message);
+        if (!ok) throw std::runtime_error("body deadline gate: " + message);
+    };
+    std::size_t all_request_bytes = 0;
+    ServerProcess process(server, root, root / "hold.trigger", root / "hold.started",
+                          root / "hold.release", root / "fail.trigger", {},
+                          &all_request_bytes);
+    const fs::path material = root / "runs/body-deadline";
+    write_file(material / "raw/old.wav", minimal_wav("raw-before-timeout"));
+    write_file(material / "work/old.wav", minimal_wav("work-before-timeout"));
+    write_file(material / "steps.txt", "denoise\n");
+    const auto initial = request(process.port(), "GET", "/api/train/status",
+                                 {}, {}, {}, 1, &all_request_bytes);
+    require(initial.status == 200, "initial status must be available");
+    const std::string cli_before = read_file(root / "preprocess-invocations");
+    struct Socket {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        ~Socket() { if (fd >= 0) close(fd); }
+    } client;
+    require(client.fd >= 0, "socket creation failed");
+    const timeval send_timeout{1, 0};
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(process.port());
+    require(setsockopt(client.fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout)) == 0 &&
+                connect(client.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
+            "connection failed");
+    constexpr std::size_t declared_body_bytes = 1024;
+    // Complete MIME content makes accidental early dispatch observable. The
+    // HTTP body remains incomplete throughout; no real material or CLI is used.
+    const std::string body = multipart_body({{"name", "body-deadline"}, {"steps", "1"}});
+    const std::string headers = "POST /api/train HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        "Content-Type: " + std::string(kMultipartType) + "\r\nContent-Length: " +
+        std::to_string(declared_body_bytes) + "\r\nConnection: close\r\n\r\n";
+    const auto send_bounded = [&](const std::string& bytes) {
+        require(all_request_bytes + bytes.size() <= 4096, "total input exceeded 4KiB");
+        require(send_all(client.fd, bytes), "body drip send failed");
+        all_request_bytes += bytes.size();
+    };
+    require(body.size() + 5 < declared_body_bytes, "fixture would complete the body");
+    const auto started = std::chrono::steady_clock::now();
+    send_bounded(headers + body);
+    std::size_t actual_body_bytes = body.size();
+    const auto wait_readable_until = [&](std::chrono::steady_clock::time_point deadline) {
+        for (;;) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            if (left <= 0ms) return false;
+            pollfd event{client.fd, POLLIN, 0};
+            const int ready = poll(&event, 1, static_cast<int>(left.count()) + 1);
+            if (ready < 0 && errno == EINTR) continue;
+            require(ready >= 0, "response poll failed");
+            if (ready > 0) return true;
+        }
+    };
+    int drips = 0;
+    for (const auto offset : {20s, 40s, 60s, 80s, 100s}) {
+        require(!wait_readable_until(started + offset), "response arrived before the body deadline");
+        send_bounded(" ");
+        ++actual_body_bytes;
+        ++drips;
+        std::cout << "Body drip at " << offset.count() << "s; declared=" << declared_body_bytes
+                  << ", actual body=" << actual_body_bytes << " bytes\n" << std::flush;
+    }
+    // Do not complete the body, half-close, or reset. Only the real server
+    // deadline may produce the response and EOF. Stop observing by 124s.
+    std::string wire;
+    bool peer_closed = false;
+    char buffer[1024];
+    while (wait_readable_until(started + 124s)) {
+        const ssize_t count = recv(client.fd, buffer, sizeof(buffer), MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        require(count >= 0, "response read failed");
+        if (count == 0) { peer_closed = true; break; }
+        wire.append(buffer, static_cast<std::size_t>(count));
+        require(wire.size() <= 4096, "response exceeded 4KiB");
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    require(peer_closed && elapsed >= 118s && elapsed < 124s && drips == 5 &&
+                wire.rfind("HTTP/1.1 400 ", 0) == 0 && wire.find("\r\n\r\n") != std::string::npos,
+            "120s absolute deadline must return 400/EOF despite periodic body bytes");
+    require(wait_for([&] { return server_socket_count(process.pid()) == 1; }, 1s),
+            "accepted socket must be released after timeout");
+    const auto after = request(process.port(), "GET", "/api/train/status",
+                               {}, {}, {}, 1, &all_request_bytes);
+    require(after.status == 200 && after.body == initial.body &&
+                read_file(root / "preprocess-invocations") == cli_before &&
+                read_file(material / "raw/old.wav") == minimal_wav("raw-before-timeout") &&
+                read_file(material / "work/old.wav") == minimal_wav("work-before-timeout") &&
+                read_file(material / "steps.txt") == "denoise\n" &&
+                !has_hidden_training_directory(material) && !has_material_staging(material),
+            "service must remain usable; no job, material, CLI or staging changes");
+    process.stop();  // Reap only our own temporary listener before reporting success.
+    require(std::chrono::steady_clock::now() - case_start < 130s,
+            "body deadline case exceeded 130s");
+    std::cout << "Body deadline: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+              << " ms; declared body=" << declared_body_bytes
+              << " bytes; actual body=" << actual_body_bytes
+              << " bytes; all HTTP request bytes including readiness/status=" << all_request_bytes
+              << "; 5 drips, 400/EOF, accepted socket closed, next status=200, no job/material changes; "
+              << "max clients=2, own listener reaped\n";
+}
+
 void run_open_server_contracts(Checks& checks, const fs::path& server,
                                const fs::path& root) {
     const fs::path hold_trigger = root / "hold.trigger";
@@ -742,6 +1540,37 @@ void run_open_server_contracts(Checks& checks, const fs::path& server,
                   "static root should be publicly readable");
     checks.expect(request(process.port(), "GET", "/api/voices").status == 200,
                   "default API mode should remain open");
+
+    const auto cancel_method = request(process.port(), "GET", "/api/train/cancel");
+    checks.expect(cancel_method.status == 405 && cancel_method.has_header("Allow: POST\r\n"),
+                  "cancel endpoint must reject GET with Allow POST");
+    const auto initial_job = request(process.port(), "GET", "/api/train/status").body;
+    checks.expect(request(process.port(), "POST", "/api/train/cancel",
+                          multipart_body({{"job_id", "unknown"}}), kMultipartType).status == 404,
+                  "cancel without an admitted job must return 404");
+    for (const auto& fields : std::vector<std::vector<std::pair<std::string, std::string>>>{
+             {}, {{"job_id", ""}}, {{"job_id", "bad/id"}},
+             {{"job_id", "one"}, {"job_id", "two"}}, {{"name", "voice"}},
+             {{"job_id", "one"}, {"extra", "value"}}}) {
+        checks.expect(request(process.port(), "POST", "/api/train/cancel",
+                              multipart_body(fields), kMultipartType).status == 400,
+                      "cancel must accept exactly one valid job_id field");
+    }
+    checks.expect(request(process.port(), "POST", "/api/train/cancel",
+                          multipart_body({}, {{"job.wav", minimal_wav("cancel-file")}}),
+                          kMultipartType).status == 400,
+                  "cancel endpoint must reject files");
+    checks.expect(request(process.port(), "GET", "/api/train/status").body == initial_job,
+                  "invalid cancellation must not alter job state");
+
+    check_header_deadline(checks, process, root);
+    check_incomplete_upload_resources(checks, process, root);
+
+    check_multipart_boundaries(checks, process.port(), root);
+    check_multipart_part_headers(checks, process.port(), root);
+    check_material_marker_failure(checks, process.port(), root);
+    check_material_preview_race(checks, process.port());
+    check_slow_preview_publication(checks, process.port(), root);
 
     HttpResponse wrong_get = request(process.port(), "POST", "/api/voices");
     checks.expect(wrong_get.status == 405,
@@ -1102,6 +1931,7 @@ void run_open_server_contracts(Checks& checks, const fs::path& server,
                                      "train-flags-from-raw", false);
     check_training_preprocess_source(checks, process.port(), root,
                                      "train-flags-from-work", true);
+    check_training_upload(checks, process.port(), root);
     check_training_success(checks, process.port(), root, "train-success");
 }
 
@@ -1120,6 +1950,16 @@ void run_auth_contracts(Checks& checks, const fs::path& server,
     checks.expect(request(process.port(), "GET", "/api/voices", {}, {},
                           "Authorization: Bearer contract-token\r\n").status == 200,
                   "token-enabled API should accept the configured bearer token");
+    const auto cancel_body = multipart_body({{"job_id", "unknown"}});
+    checks.expect(request(process.port(), "POST", "/api/train/cancel", cancel_body,
+                          kMultipartType).status == 401,
+                  "cancellation requires the configured bearer token");
+    checks.expect(request(process.port(), "POST", "/api/train/cancel", cancel_body,
+                          kMultipartType, "Authorization: Bearer wrong\r\n").status == 401,
+                  "wrong token must not cancel a job");
+    checks.expect(request(process.port(), "POST", "/api/train/cancel", cancel_body,
+                          kMultipartType, "Authorization: Bearer contract-token\r\n").status == 404,
+                  "authorized cancellation must reach the job validation contract");
     checks.expect(request(process.port(), "GET", "/").status == 200,
                   "static assets should remain public when API auth is enabled");
 }
@@ -1127,8 +1967,9 @@ void run_auth_contracts(Checks& checks, const fs::path& server,
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::cerr << "Usage: test_web_contract /absolute/path/to/vc_serve\n";
+    const bool body_only = argc == 3 && std::string(argv[2]) == "--body-deadline-only";
+    if (argc != 2 && !body_only) {
+        std::cerr << "Usage: test_web_contract /absolute/path/to/vc_serve [--body-deadline-only]\n";
         return 2;
     }
     try {
@@ -1140,7 +1981,12 @@ int main(int argc, char** argv) {
         create_fake_convert(tree.path());
 
         Checks checks;
+        if (body_only) {
+            run_body_deadline_contract(checks, server, tree.path());
+            return checks.failures() == 0 ? 0 : 1;
+        }
         check_training_artifact_transaction(checks, tree.path());
+        check_material_transaction(checks, tree.path());
         check_step_artifact_transaction(checks, tree.path());
         run_open_server_contracts(checks, server, tree.path());
         run_auth_contracts(checks, server, tree.path());

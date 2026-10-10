@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "tools/app_support/cli_parse.h"
+#include "tools/app_support/training_cancel.h"
 #include "voxmutatio/autograd/tensor.h"
 #include "voxmutatio/content/hubert_encoder.h"
 #include "voxmutatio/core/device.h"
@@ -85,7 +86,9 @@ void print_usage(std::ostream& output) {
         "  --lr-decay <f>   Per-epoch exponential LR decay (default: 0.999875)\n"
         "  --seg <frames>   Training segment length in frames (default: 40)\n"
         "  --seed <n>       RNG seed (default: 0)\n"
-        "  --help           Show this help\n";
+        "  --cancel-file <path> Optional job channel (0=run, 1=cancel at safe point)\n"
+        "  --help           Show this help\n"
+        "Exit status: 0=completed, 1=error, 2=cooperatively cancelled (no export)\n";
 }
 
 }  // namespace
@@ -122,6 +125,13 @@ ParseStatus parse_vc_train_options(int argc, char* const argv[],
         } else if (argument == "--out") {
             const char* value = next(argument); if (!value) return ParseStatus::kExitFailure;
             options.output_path = value;
+        } else if (argument == "--cancel-file") {
+            const char* value = next(argument); if (!value) return ParseStatus::kExitFailure;
+            if (!options.cancel_file.empty() || !*value) {
+                error << "error: --cancel-file requires one nonempty path and cannot be repeated\n";
+                return ParseStatus::kExitFailure;
+            }
+            options.cancel_file = value;
         } else if (argument == "--speaker") {
             if (!cli::parse_integer_option(argc, argv, i, argument, 0, 108,
                                            options.speaker, error)) {
@@ -186,12 +196,25 @@ ParseStatus parse_vc_train_options(int argc, char* const argv[],
 }
 
 int run_vc_train(VcTrainOptions options) {
+    using namespace resonantia::training_control;
+    TrainingCancelReader cancellation(options.cancel_file);
+    const auto report = [&](TrainingResult result) {
+        if (result == TrainingResult::kCancelled)
+            std::cout << "Training cancelled at safe point; no model exported\n";
+        else if (result == TrainingResult::kError && cancellation.error_code())
+            std::cerr << "error: training cancellation channel: "
+                      << std::strerror(cancellation.error_code()) << "\n";
+        return static_cast<int>(result);
+    };
+    const auto checkpoint = [&] { return report(cancellation.poll()); };
+    if (const int stop = checkpoint()) return stop;
     Device device;
     if (auto error = device.init("cuda", 0)) {
         std::cerr << "CUDA init: " << *error << "\n";
         return 1;
     }
     std::cout << "Device: " << device.name() << "\n";
+    if (const int stop = checkpoint()) return stop;
 
     content::HubertConfig hubert_config;
     hubert_config.model_path = options.hubert_path;
@@ -204,6 +227,8 @@ int run_vc_train(VcTrainOptions options) {
         return 1;
     }
 
+    if (const int stop = checkpoint()) return stop;
+
     f0::RmvpeConfig rmvpe_config;
     rmvpe_config.model_path = options.rmvpe_path;
     f0::RmvpeExtractor rmvpe;
@@ -211,6 +236,8 @@ int run_vc_train(VcTrainOptions options) {
         std::cerr << "RMVPE init failed\n";
         return 1;
     }
+
+    if (const int stop = checkpoint()) return stop;
 
     synthesizer::SynthesizerConfig synthesizer_config;
     synthesizer_config.model_path = options.pretrained_path;
@@ -223,11 +250,15 @@ int run_vc_train(VcTrainOptions options) {
         return 1;
     }
 
+    if (const int stop = checkpoint()) return stop;
+
     training::GeneratorTrainer trainer;
     if (!trainer.init(options.pretrained_path, options.speaker)) {
         std::cerr << "Trainer init failed\n";
         return 1;
     }
+
+    if (const int stop = checkpoint()) return stop;
 
     std::vector<std::string> files;
     if (fs::is_directory(options.target_path)) {
@@ -252,6 +283,7 @@ int run_vc_train(VcTrainOptions options) {
 
     std::vector<Clip> clips;
     for (const auto& file : files) {
+        if (const int stop = checkpoint()) return stop;
         auto audio_16k = io::read_audio(file, 16'000);
         if (!audio_16k) {
             std::cerr << "skip (read failed): " << file << "\n";
@@ -330,6 +362,8 @@ int run_vc_train(VcTrainOptions options) {
         return 1;
     }
 
+    if (const int stop = checkpoint()) return stop;
+
     long long total_frames = 0;
     for (const auto& clip : clips) total_frames += clip.frames;
     const int per_epoch = std::max<int>(
@@ -370,7 +404,8 @@ int run_vc_train(VcTrainOptions options) {
                   << " lr=" << options.learning_rate << "\n";
         float first = -1.0f;
         float last = 0.0f;
-        for (int iteration = 0; iteration < options.steps; ++iteration) {
+        // One body is a complete D/G pair, including existing LR bookkeeping.
+        const auto result = run_training_iterations(options.steps, cancellation, [&](int iteration) {
             const Clip& clip = clips[random() % clips.size()];
             const int maximum_start = clip.frames - options.segment_frames;
             const int start = maximum_start > 0
@@ -417,9 +452,12 @@ int run_vc_train(VcTrainOptions options) {
                 (iteration + 1) % per_epoch == 0) {
                 gan.decay_lr(options.learning_rate_decay);
             }
-        }
+            return true;
+        });
+        if (result != TrainingResult::kCompleted) return report(result);
         std::printf("GAN fine-tune done: mel %.4f -> %.4f (final lr=%.2e)\n",
                     first, last, gan.g_lr());
+        if (const int stop = checkpoint()) return stop;
         if (!gan.export_model(options.pretrained_path, options.output_path)) {
             std::cerr << "error: export failed\n";
             return 1;
@@ -436,7 +474,8 @@ int run_vc_train(VcTrainOptions options) {
     int running_count = 0;
     float first = -1.0f;
     float last = 0.0f;
-    for (int iteration = 0; iteration < options.steps; ++iteration) {
+    // Keep each complete decoder forward/backward/update indivisible.
+    const auto result = run_training_iterations(options.steps, cancellation, [&](int iteration) {
         const Clip& clip = clips[random() % clips.size()];
         const int maximum_start = clip.frames - options.segment_frames;
         const int start = maximum_start > 0
@@ -475,7 +514,7 @@ int run_vc_train(VcTrainOptions options) {
         const float loss_value = loss.to_host()[0];
         if (!std::isfinite(loss_value)) {
             std::cerr << "error: non-finite decoder loss; update skipped\n";
-            return 1;
+            return false;
         }
         if (first < 0.0f) first = loss_value;
         last = loss_value;
@@ -493,9 +532,12 @@ int run_vc_train(VcTrainOptions options) {
             running = 0.0f;
             running_count = 0;
         }
-    }
+        return true;
+    });
+    if (result != TrainingResult::kCompleted) return report(result);
     std::printf("Fine-tune done: mel-L1 %.4f -> %.4f\n", first, last);
 
+    if (const int stop = checkpoint()) return stop;
     if (!trainer.export_model(options.pretrained_path, options.output_path)) {
         std::cerr << "error: export failed\n";
         return 1;

@@ -17,6 +17,7 @@
 #include <exception>
 #include <limits>
 #include <sstream>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -235,6 +236,127 @@ ReadResult read_request(int fd, Request& request, const std::string& auth_token,
     return ReadResult::kOk;
 }
 
+bool mime_parameter_token(unsigned char c) {
+    return c > 32 && c < 127 &&
+           std::string_view("()<>@,;:\\\"/[]?=").find(c) == std::string_view::npos;
+}
+
+bool parse_disposition(std::string_view value, Part& part) {
+    std::size_t position = 0;
+    // MIME comments are whitespace between tokens, not parameter sources.
+    // Scan nesting iteratively; the complete part header already has a size cap.
+    const auto skip_space = [&] {
+        while (position < value.size()) {
+            if (value[position] == ' ' || value[position] == '\t') {
+                ++position;
+            } else if (value[position] == '(') {
+                std::size_t depth = 1;
+                ++position;
+                while (position < value.size() && depth != 0) {
+                    const char c = value[position++];
+                    if (c == '\\') {
+                        if (position == value.size()) return false;
+                        ++position;
+                    } else if (c == '(') {
+                        ++depth;
+                    } else if (c == ')') {
+                        --depth;
+                    }
+                }
+                if (depth != 0) return false;
+            } else {
+                break;
+            }
+        }
+        return true;
+    };
+    const auto token = [&] {
+        const std::size_t start = position;
+        while (position < value.size() && mime_parameter_token(value[position])) ++position;
+        return value.substr(start, position - start);
+    };
+    if (!skip_space() || lower(std::string(token())) != "form-data" || !skip_space()) return false;
+    bool have_name = false, have_filename = false;
+    while (position < value.size()) {
+        if (value[position++] != ';' || !skip_space()) return false;
+        const std::string name = lower(std::string(token()));
+        if (name.empty() || !skip_space() || position == value.size() ||
+            value[position++] != '=' || !skip_space()) return false;
+        std::string parameter;
+        if (position < value.size() && value[position] == '"') {
+            ++position;
+            bool closed = false;
+            while (position < value.size()) {
+                char c = value[position++];
+                if (c == '"') {
+                    closed = true;
+                    break;
+                }
+                if (c == '\\') {
+                    if (position == value.size()) return false;
+                    c = value[position++];
+                }
+                parameter.push_back(c);
+            }
+            if (!closed) return false;
+        } else {
+            parameter = std::string(token());
+            if (parameter.empty()) return false;
+        }
+        if (!skip_space() || (position < value.size() && value[position] != ';')) return false;
+        if (name == "name") {
+            if (have_name) return false;
+            part.name = std::move(parameter);
+            have_name = true;
+        } else if (name == "filename") {
+            if (have_filename) return false;
+            part.filename = std::move(parameter);
+            have_filename = true;
+        } else if (name == "filename*") {
+            // RFC 7578 explicitly excludes this encoding in multipart/form-data.
+            return false;
+        }
+    }
+    return have_name;
+}
+
+bool parse_part_headers(std::string_view headers, Part& part) {
+    std::string key, value;
+    bool have_disposition = false;
+    const auto finish_header = [&] {
+        if (key != "content-disposition") return true;
+        if (have_disposition) return false;
+        have_disposition = true;
+        return parse_disposition(value, part);
+    };
+    std::size_t position = 0;
+    while (position < headers.size()) {
+        const std::size_t end = headers.find("\r\n", position);
+        const std::string_view line = headers.substr(
+            position, end == std::string_view::npos ? headers.size() - position : end - position);
+        if (line.empty()) return false;
+        for (unsigned char c : line) {
+            if ((c < 32 && c != '\t') || c == 127) return false;
+        }
+        if (line.front() == ' ' || line.front() == '\t') {
+            if (key.empty()) return false;
+            // Unfold CRLF only. Keep whitespace so tokens cannot be concatenated.
+            value.append(line.data(), line.size());
+        } else {
+            if (!finish_header()) return false;
+            const std::size_t colon = line.find(':');
+            if (colon == 0 || colon == std::string_view::npos) return false;
+            for (unsigned char c : line.substr(0, colon)) {
+                if (c < 33 || c > 126) return false;
+            }
+            key = lower(std::string(line.substr(0, colon)));
+            value = std::string(line.substr(colon + 1));
+        }
+        position = end == std::string_view::npos ? headers.size() : end + 2;
+    }
+    return finish_header() && have_disposition;
+}
+
 MultipartResult parse_multipart(const std::string& body, const std::string& boundary,
                                 std::vector<Part>& parts) {
     if (boundary.empty() || boundary.size() > 200 ||
@@ -267,7 +389,17 @@ MultipartResult parse_multipart(const std::string& body, const std::string& boun
         }
         const std::string headers = body.substr(position, header_end - position);
         const std::size_t content_start = header_end + 4;
-        const std::size_t next_marker = body.find("\r\n" + delimiter, content_start);
+        const std::string marker = "\r\n" + delimiter;
+        std::size_t next_marker = body.find(marker, content_start);
+        while (next_marker != std::string::npos) {
+            const std::size_t suffix = next_marker + marker.size();
+            const bool closing = body.compare(suffix, 2, "--") == 0 &&
+                (suffix + 2 == body.size() || body.compare(suffix + 2, 2, "\r\n") == 0);
+            if (body.compare(suffix, 2, "\r\n") == 0 || closing) break;
+            // Binary content can contain a delimiter prefix. Only a complete
+            // delimiter line ends the part; leave every other byte untouched.
+            next_marker = body.find(marker, suffix);
+        }
         const std::size_t next = next_marker == std::string::npos
                                      ? std::string::npos
                                      : next_marker + 2;
@@ -275,16 +407,7 @@ MultipartResult parse_multipart(const std::string& body, const std::string& boun
         if (parts.size() >= kMaxMultipartParts) return MultipartResult::kTooManyParts;
 
         Part part;
-        const std::string normalized_headers = lower(headers);
-        const auto attribute = [&](const std::string& key) -> std::string {
-            std::size_t key_position = normalized_headers.find(key + "=\"");
-            if (key_position == std::string::npos) return "";
-            key_position += key.size() + 2;
-            const std::size_t end = headers.find('"', key_position);
-            return end == std::string::npos ? "" : headers.substr(key_position, end - key_position);
-        };
-        part.name = attribute("name");
-        part.filename = attribute("filename");
+        if (!parse_part_headers(headers, part)) return MultipartResult::kMalformed;
         const std::size_t part_size = next_marker - content_start;
         const std::size_t limit = part.filename.empty() ? kMaxFieldBytes : kMaxFileBytes;
         if (part_size > limit) return MultipartResult::kTooLarge;
@@ -293,6 +416,12 @@ MultipartResult parse_multipart(const std::string& body, const std::string& boun
         position = next;
     }
     return MultipartResult::kMalformed;
+}
+
+bool parameter_token(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           std::string_view("!#$%&'*+-.^_`|~").find(c) != std::string_view::npos;
 }
 
 bool extract_boundary(const std::string& content_type, std::string& boundary) {
@@ -305,26 +434,68 @@ bool extract_boundary(const std::string& content_type, std::string& boundary) {
     while (!media.empty() && (media.back() == ' ' || media.back() == '\t')) {
         media.pop_back();
     }
-    if (media != "multipart/form-data") return false;
-    const std::size_t boundary_start = normalized.find("boundary=", media_end);
-    if (boundary_start == std::string::npos) return false;
-    if (boundary_start > 0 && normalized[boundary_start - 1] != ';' &&
-        normalized[boundary_start - 1] != ' ' && normalized[boundary_start - 1] != '\t') {
-        return false;
+    if (media != "multipart/form-data" || media_end == std::string::npos) return false;
+
+    // Parse parameter boundaries and quoted strings rather than searching for a
+    // substring that could belong to another parameter's name or value.
+    bool have_boundary = false;
+    std::size_t position = media_end;
+    const auto skip_space = [&] {
+        while (position < content_type.size() &&
+               (content_type[position] == ' ' || content_type[position] == '\t')) {
+            ++position;
+        }
+    };
+    while (position < content_type.size()) {
+        if (content_type[position++] != ';') return false;
+        skip_space();
+        const std::size_t name_start = position;
+        while (position < content_type.size() && parameter_token(content_type[position])) {
+            ++position;
+        }
+        const std::string name = normalized.substr(name_start, position - name_start);
+        skip_space();
+        if (name.empty() || position == content_type.size() ||
+            content_type[position++] != '=') return false;
+        skip_space();
+        std::string value;
+        if (position < content_type.size() && content_type[position] == '"') {
+            ++position;
+            bool closed = false;
+            while (position < content_type.size()) {
+                unsigned char c = content_type[position++];
+                if (c == '"') {
+                    closed = true;
+                    break;
+                }
+                if (c == '\\') {
+                    if (position == content_type.size()) return false;
+                    c = content_type[position++];
+                }
+                if ((c < 32 && c != '\t') || c == 127) return false;
+                value.push_back(static_cast<char>(c));
+            }
+            if (!closed) return false;
+        } else {
+            const std::size_t value_start = position;
+            while (position < content_type.size() && parameter_token(content_type[position])) {
+                ++position;
+            }
+            if (position == value_start) return false;
+            value = content_type.substr(value_start, position - value_start);
+        }
+        skip_space();
+        if (position < content_type.size() && content_type[position] != ';') return false;
+        if (name == "boundary") {
+            if (have_boundary || value.empty() || value.size() > 200) return false;
+            for (unsigned char c : value) {
+                if (c < 32 || c >= 127) return false;
+            }
+            boundary = std::move(value);
+            have_boundary = true;
+        }
     }
-    boundary = content_type.substr(boundary_start + 9);
-    const std::size_t semicolon = boundary.find(';');
-    if (semicolon != std::string::npos) boundary.resize(semicolon);
-    while (!boundary.empty() && (boundary.front() == ' ' || boundary.front() == '\t')) {
-        boundary.erase(boundary.begin());
-    }
-    while (!boundary.empty() && (boundary.back() == ' ' || boundary.back() == '\t')) {
-        boundary.pop_back();
-    }
-    if (boundary.size() >= 2 && boundary.front() == '"' && boundary.back() == '"') {
-        boundary = boundary.substr(1, boundary.size() - 2);
-    }
-    return !boundary.empty() && boundary.size() <= 200;
+    return have_boundary;
 }
 
 bool send_all(int fd, const char* data, std::size_t size) {

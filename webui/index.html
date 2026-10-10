@@ -86,6 +86,8 @@
                 <section class="step">
                     <div class="step-head"><span class="step-no">4</span><h2>开始训练</h2></div>
                     <button class="btn-convert" id="btnTrain" disabled>开始训练</button>
+                    <button class="btn-secondary" id="btnCancelTrain" disabled>取消训练</button>
+                    <p class="hint">取消会等待当前处理阶段结束；已提交素材会保留，保存训练结果后无法取消。</p>
                     <div class="progress-section" id="trainProgress" style="display:none;">
                         <h3>训练进度 — <span id="trainStage">…</span></h3>
                         <div class="progress-bar"><div class="progress-fill" id="trainFill"></div></div>

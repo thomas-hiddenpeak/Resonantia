@@ -249,9 +249,10 @@ function renderTrainFiles() {
     updateDataHint();
     updateTrainBtn();
 }
+let activeTrain = null;
 function updateTrainBtn() {
     const name = $('voiceName').value.trim();
-    $('btnTrain').disabled = !(trainCascade.state.ready && /^[A-Za-z0-9_-]+$/.test(name));
+    $('btnTrain').disabled = !!activeTrain || !(trainCascade.state.ready && /^[A-Za-z0-9_-]+$/.test(name));
 }
 $('voiceName').addEventListener('input', () => { updateTrainBtn(); ensureTrainMaterial(); });
 
@@ -276,8 +277,12 @@ async function ensureTrainMaterial() {
 }
 $('trainResetPre').onclick = () => { trainMatSig = ''; ensureTrainMaterial(); };
 
+// ---------- Training job controls ----------
 $('btnTrain').addEventListener('click', async () => {
+    if (activeTrain) return;
     const name = $('voiceName').value.trim();
+    const job = { name, id: null, cancelSent: false, cancelInFlight: false };
+    activeTrain = job;
     // Files were uploaded as the work-set in step 2; the cascade cleaned it.
     const fd = new FormData();
     fd.append('name', name);
@@ -286,37 +291,86 @@ $('btnTrain').addEventListener('click', async () => {
     fd.append('seg', $('trainSeg').value);
     fd.append('epochs', $('trainEpochs').value);
     fd.append('vad', $('recVad').checked ? '1' : '0');
-    $('btnTrain').disabled = true;
+    updateTrainBtn();
+    $('btnCancelTrain').disabled = true;
     $('trainProgress').style.display = 'block';
     $('trainStage').textContent = '提交中…';
     $('trainFill').style.width = '5%';
     try {
         const r = await apiFetch(`${API}/train`, { method: 'POST', body: fd });
         if (!r.ok) throw new Error(await errText(r));
-        pollTrain(name);
+        const accepted = await r.json();
+        if (!accepted.job_id) throw new Error('服务器未返回作业标识，请核实服务状态');
+        job.id = accepted.job_id;
+        pollTrain(job);
     } catch (err) {
-        $('trainStage').textContent = '失败: ' + err.message;
-        $('btnTrain').disabled = false;
+        if (activeTrain !== job) return;
+        $('trainStage').textContent = '提交结果未确认: ' + err.message;
+        activeTrain = null; updateTrainBtn();
     }
 });
 
-const STAGES_PCT = { queued: 10, preprocessing: 25, separating: 30, training: 55, indexing: 90, done: 100, error: 100 };
-async function pollTrain(name) {
+$('btnCancelTrain').addEventListener('click', async () => {
+    const job = activeTrain;
+    if (!job || !job.id || job.cancelSent || job.cancelInFlight) return;
+    job.cancelInFlight = true;
+    $('btnCancelTrain').disabled = true;
+    $('trainStage').textContent = '正在请求取消…';
+    const fd = new FormData(); fd.append('job_id', job.id);
     try {
-        const r = await apiFetch(`${API}/train/status?name=${encodeURIComponent(name)}`);
+        const r = await apiFetch(`${API}/train/cancel`, { method: 'POST', body: fd });
+        if (!r.ok) throw new Error(await errText(r));
+        const result = await r.json();
+        if (activeTrain !== job) return;
+        if (result.job_id !== job.id) throw new Error('取消响应的作业标识不匹配');
+        job.cancelSent = true;
+        $('trainStage').textContent = result.cancelled ? '已取消；已提交素材保留' : '已请求取消，等待当前阶段结束…';
+        // Only the status poll retires the UI job. An acknowledgement does not
+        // release the server's resources or permit this UI to start another job.
+    } catch (err) {
+        if (activeTrain !== job) return;
+        $('trainStage').textContent = '取消未确认: ' + err.message;
+    } finally {
+        job.cancelInFlight = false;
+    }
+});
+
+const STAGES_PCT = { queued: 10, preparing: 15, preprocessing: 25, separating: 30, training: 55, indexing: 90, publishing: 95, done: 100, error: 100, cancelled: 100 };
+async function pollTrain(job) {
+    if (activeTrain !== job) return;
+    try {
+        const r = await apiFetch(`${API}/train/status?name=${encodeURIComponent(job.name)}`);
+        if (!r.ok) throw new Error(await errText(r));
         const s = await r.json();
-        $('trainStage').textContent = s.stage;
+        if (activeTrain !== job) return;
+        if (s.job_id !== job.id || s.kind !== 'train') {
+            $('trainStage').textContent = '当前作业已变化，无法确认本次训练结果，请核实服务状态';
+            $('btnCancelTrain').disabled = true;
+            activeTrain = null; updateTrainBtn(); return;
+        }
         $('trainFill').style.width = (STAGES_PCT[s.stage] || 50) + '%';
         $('trainLog').textContent = s.log || '';
         $('trainLog').scrollTop = $('trainLog').scrollHeight;
-        if (s.running || (!s.done && s.stage !== 'idle')) {
-            setTimeout(() => pollTrain(name), 1500);
+        $('btnCancelTrain').disabled = !s.cancellable || job.cancelSent || job.cancelInFlight || s.cancel_requested;
+        if (s.running) {
+            $('trainStage').textContent = s.cancel_requested || job.cancelSent ? '已请求取消，等待当前阶段结束…' :
+                job.cancelInFlight ? '正在请求取消…' : s.stage === 'publishing' ? '正在保存训练结果，已无法取消…' : s.stage;
+            setTimeout(() => pollTrain(job), 1500);
+        } else if (s.done) {
+            $('btnCancelTrain').disabled = true;
+            activeTrain = null; updateTrainBtn();
+            if (s.cancelled) $('trainStage').textContent = '已取消；已提交素材保留';
+            else if (s.error) $('trainStage').textContent = '训练失败，请查看日志';
+            else { $('trainStage').textContent = '完成 ✓ 已生成声线「' + job.name + '」'; loadVoices(); }
         } else {
-            $('btnTrain').disabled = false;
-            if (!s.error) { $('trainStage').textContent = '完成 ✓ 已生成声线「' + name + '」'; loadVoices(); }
+            $('trainStage').textContent = '等待作业状态…';
+            setTimeout(() => pollTrain(job), 1500);
         }
     } catch (e) {
-        setTimeout(() => pollTrain(name), 2500);
+        if (activeTrain !== job) return;
+        $('btnCancelTrain').disabled = true;
+        $('trainStage').textContent = '暂时无法确认作业状态，正在重试…';
+        setTimeout(() => pollTrain(job), 2500);
     }
 }
 
