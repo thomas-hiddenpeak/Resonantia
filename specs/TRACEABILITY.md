@@ -143,13 +143,14 @@ fail-closed 和 standalone exact-retrieval 诊断 probe；这些 scaffold 不等
 
 | ID / 约束 | 当前实现位置 | 验证 | 状态与缺口 |
 |---|---|---|---|
-| BUILD-001：CMake 3.24、C++20/CUDA20、显式 CUDA 架构 | 根 `CMakeLists.txt`，默认 SM87 cache | configure/build 命令；可信 ARM64 CI | **已实现**；非 SM87 产品支持未知 |
+| BUILD-001：CMake 3.24、C++20/CUDA20、显式 CUDA 架构 | 根 `CMakeLists.txt`，默认 SM87 cache | configure/build命令；专属OrinNX手动CI路径（本增量未运行） | **已实现**；非SM87产品支持未知 |
 | BUILD-002：核心库与 CLI 目标 | 显式 source list + 12 个内部 OBJECT 组件；`voxmutatio` static compatibility facade；四个按命令隔离的 `resonantia_vc_*_app_support` 与 `resonantia_web_support`；既有 CLI targets | fresh build、CMake graph、静态库符号集合与 CLI/HTTP contract | **已实现**；内部 target 不构成新公共 ABI |
 | BUILD-003：可复现默认 contract suite | `cmake/ResonantiaTests.cmake`；优先系统 Catch2 3.4，缺失时使用固定 3.4.0 archive + SHA-256 | asset-free 21 tests；full config 45 distinct / 22 contract-labelled / 24 integration-labelled / 1 overlap | **已实现·默认门禁**；固定v9默认20/20通过（0失败/skip，22.00秒）；提交补充选择回归20/20通过（21.67秒）；已注册21项，按本轮限制排除rename拦截测试1项未运行；2026-08-12 历史工作树 full 39/39 通过（0 失败，1297.94 秒）；跨机器系统包补丁版本可能不同 |
 | BUILD-004：模型/fixture 测试不得假通过 | `VOXMUTATIO_ENABLE_MODEL_TESTS`、每测试 `ASSETS` 注册检查 | configure 输出缺失资产原因 | **已实现** |
 | BUILD-005：GPU 测试串行与 timeout | CTest `RESOURCE_LOCK voxmutatio_gpu`、每测试 timeout | CTest properties | **已实现** |
-| BUILD-006：PR 与自托管 runner 安全边界 | `.github/workflows/ci.yml` | PR 只跑 repository-policy；`main` push/manual 才跑 GPU | **已实现**；普通 PR 没有编译门禁，这是显式覆盖缺口 |
+| BUILD-006：自动检查与自托管runner安全边界 | `.github/workflows/ci.yml` | push/PR只用托管Ubuntu；设备需manual/main/opt-in/ready且固定专属标签；24种事件组合静态验证 | **已实现**；标签为配置约定，runner身份/唯一归属未核实，设备测试未运行；无通用ARM64兜底 |
 | BUILD-007：SDD/Codex bridge | 根 `AGENTS.md`、`scripts/check_sdd.sh`、SDD 索引与 ADR 模板 | repository-policy + 本地 32-required-file/link contract | **已实现**；ADR-0004/0005 追踪本轮离线迁移；ADR-0002/Spec006 实现状态未改变 |
+| BUILD-008：无CUDA的托管host子集 | `cmake/host-tests/CMakeLists.txt`，复用6项现有Web/CLI测试 | 独立C++20构建与串行CTest；实际运行结果见对应SHA的host-contract-tests日志 | **限定子集**；不加载模型/执行GPU；其余测试保持根CMake设备路径，受限rename探针仍不执行 |
 
 ## 更新规则
 

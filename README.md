@@ -94,7 +94,28 @@ CLI 参数、默认值和错误行为见 [`docs/CLI.md`](docs/CLI.md) 与各命�
 
 ## 测试
 
-contract 不依赖被忽略的模型和数值 fixture。当前本地检查与 CI 使用以下受限选择：
+每次 `main` push、PR 和手动 workflow 都在 GitHub 托管的 `ubuntu-24.04` 上运行仓库检查
+和以下独立 Linux host 子集；不需要 CUDA、模型、第三方测试框架或设备 runner：
+
+```bash
+cmake -S cmake/host-tests -B build-host-ci -DCMAKE_BUILD_TYPE=Release
+cmake --build build-host-ci --parallel 2
+ctest --test-dir build-host-ci --output-on-failure --parallel 1 --no-tests=error
+```
+
+该入口复用现有 6 项：作业初始化、A/B/C所有权、结果消费、训练取消、素材提交中取消、
+CLI异常入口。它使用现有替身和临时文件，没有真实模型或训练，也不代表完整设备套件通过。
+根 CMake 的其余测试源码与注册保持不变。
+
+设备作业仅在 `main` 上手动勾选 `run_orinnx`，并且仓库变量 `ORINNX_RUNNER_READY`
+为字符串 `true` 时才可调度。它固定要求全部标签
+`[self-hosted, linux, ARM64, resonantia-orinnx-dedicated]`，没有用户提供标签或通用兜底。
+专属标签是待配置约定，并不表示 runner 已注册或身份已核实。维护者必须先另行核实唯一匹配
+runner 的 OrinNX 身份并授权，才能设置就绪标记；本次修改没有设置变量、注册 runner 或手动触发。
+没有已授权的匹配 runner 就不执行设备测试，状态记为**未运行**。设备开始后另查 hostname 和
+device-tree 型号作为第二层检查，不能代替调度前的身份/标签核实。
+
+设备上获授权的无模型 contract 入口仍保留以下精确排除：
 
 ```bash
 ctest --test-dir build --output-on-failure --label-regex contract \
@@ -102,9 +123,9 @@ ctest --test-dir build --output-on-failure --label-regex contract \
 ```
 
 `test_web_transaction_failure` 的源码仍保留，但其 `rename` 符号拦截不在当前执行授权内，
-因此不执行，也不计为通过或 CTest skip。CI 的 push、PR 和手动入口均保留这一边界：
-PR 只运行仓库检查；进入设备测试作业的事件使用上述排除项。其事务故障注入覆盖仍未验证。
-其他 contract 检查继续保留；其中底层 CUDA 单元检查不等于真实模型、训练或 GPU 取消验收。
+因此不执行，也不计为通过或 CTest skip；其事务故障注入覆盖仍未验证。host 子集不包含它，
+手动设备入口也使用上述排除项。其他 contract 的设备可执行路径继续保留；底层 CUDA 单元检查
+不等于真实模型、训练或 GPU 取消验收。CI 不启用模型资产测试或 GPU 训练。
 
 模型、对齐、训练和端到端测试只有在声明资产存在时才注册：
 

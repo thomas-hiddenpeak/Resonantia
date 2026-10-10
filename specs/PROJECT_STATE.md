@@ -9,6 +9,15 @@
 
 ## 验证基线
 
+- 2026-10-10，后续授权将安全发布边界落实为CI：push/PR自动作业只使用GitHub托管
+  `ubuntu-24.04`运行仓库检查与6项现有Web/CLI host子集。新增独立`cmake/host-tests`入口，
+  不启用CUDA，也不修改根CMake或原测试源码。设备作业需要manual/main/显式勾选/就绪变量
+  四重条件，固定`resonantia-orinnx-dedicated`专属标签，无任意标签输入或通用ARM64兜底。
+  发布前工作流静态检查与24种事件组合通过，host CMake配置/编译图与6项CTest注册核验通过；
+  Mac没有执行Linux测试，实际托管host结果应以对应提交的CI日志为准。设备测试未运行，
+  未配置runner/变量/凭据，未访问设备。该改动替代下条“仅本地提交”的历史发布边界，
+  不新增GPU、模型、训练或受限探针证据。设备检查路径和原精确排除项继续保留。
+
 - 2026-10-10，基于本地/远端一致的`main@0955500`，新增`test_web_job_ownership`普通host门禁：
   上传自然校验拒绝/worker先于响应退休各配合正常响应/普通异常，**4/4确定性交错通过**。
   B活动时旧A的training/step finish各重复两次，B状态/id不变、C仍409；B结束后C可重试，
@@ -314,8 +323,8 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
    v5重复finish窄修复现有[§8普通host等价所有权门禁](003-webui/acceptance-plan.md#8-abc所有权与重复finish后续普通host验证)；
    原受限A/B/C探针未重跑，预留前filesystem分配terminate仍待调查。更广OS/压力未验证项不自动扩展为追加实验。
    用户已批准并完成训练阶段及完整迭代协作取消编排（FR-011/TR-FR-015），有host证据；真实GPU取消未验收，timeout与强制终止未实施。
-   本次所有权增量保持本地提交；下一步先审定专属OrinNX CI路由和runner归属，再决定安全推送。
-   不自动扩展到真实训练、部署或已中止探针，也不配置/注册runner。
+   所有权增量的后续安全发布已授权：push只触发托管host检查，设备保持手动/就绪/专属标签门禁。
+   后续设备执行仍需先核实runner唯一归属并单独授权；不扩展到真实训练、部署或已中止探针。
 4. **实时能力暂缓**——Spec 006/ADR-0002 保持 Approved / R0 evidence 部分完成 / 产品未实现；
    本轮不接 persistent runtime、session 或 ALSA。恢复时仍需有授权 corpus、匹配 target
    model+Index 及 Index-enabled 质量/SLO 证据。

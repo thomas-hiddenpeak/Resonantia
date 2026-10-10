@@ -420,3 +420,17 @@ CTest上限15秒，没有rename/pthread拦截、进程注入或信号操作。
 3.43秒；当前注册24项，其余14项未运行。该证据闭合所列等价所有权语义，但不是原受限
 OS故障探针的复跑或新的独立审查；真实OS异常生成、全局/worker OOM、预留前filesystem
 terminate、真实GPU取消和最终三产物发布窗口仍未验证。复现范围与命令见验收计划§8。
+
+### CI自动host检查与手动设备边界（2026-10-10）
+
+`cmake/host-tests`是独立Linux C++20测试入口，复用现有Web/CLI实现和6项门禁源码，不启用
+CUDA、不链接`voxmutatio`、不获取新测试依赖、不改变生产构建。host支持库分别复用HTTP/
+registry/token、workflow和Web service源码；ownership及material-commit的宏仍只在私有
+测试目标生效。既有完整测试注册保留在根CMake，host子集不声明模型/GPU或完整套件通过。
+
+push、PR的全部自动作业只使用GitHub托管Ubuntu。设备job只有在workflow_dispatch、main、
+`run_orinnx=true`、`ORINNX_RUNNER_READY='true'`同时成立且host检查成功时才可调度，
+runs-on固定要求`self-hosted/linux/ARM64/resonantia-orinnx-dedicated`；没有动态标签或兜底。
+就绪变量只可在专属runner身份、唯一标签匹配和执行授权另行核实后设置，本增量未设置/注册。
+hostname/device-tree检查是调度后的辅助保护。自动与手动并发组分离，自动push不会取消手动设备作业。
+当前增量不dispatch设备job，不运行GPU训练；受限rename测试在手动设备路径仍精确排除且明确记未运行。

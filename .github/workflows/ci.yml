@@ -5,13 +5,19 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_orinnx:
+        description: Run device contracts only after the dedicated OrinNX runner is verified and authorized
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: resonantia-ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: resonantia-ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   repository-policy:
@@ -34,13 +40,42 @@ jobs:
           else
             git show --check --oneline --no-renames HEAD
           fi
+      - name: Report the device verification boundary
+        shell: bash
+        run: |
+          echo 'Automatic CI runs repository and host checks only. Device tests are not run automatically and are not counted as passing.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Device execution requires manual opt-in on main, ORINNX_RUNNER_READY=true, and a separately verified/authorized runner with the fixed resonantia-orinnx-dedicated label. The label is a configuration contract, not proof of registration.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Not run in this workflow: test_web_transaction_failure (restricted rename interposition), model acceptance, and GPU training.' >> "$GITHUB_STEP_SUMMARY"
+
+  host-contract-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Configure existing host contracts without CUDA
+        shell: bash
+        run: cmake -S cmake/host-tests -B build-host-ci -DCMAKE_BUILD_TYPE=Release
+      - name: Build host contracts
+        shell: bash
+        run: cmake --build build-host-ci --parallel 2
+      - name: Run host contracts serially
+        shell: bash
+        run: ctest --test-dir build-host-ci --output-on-failure --parallel 1 --no-tests=error
 
   cuda-build-and-contract-tests:
-    # Resonantia targets Jetson Orin-class devices (aarch64, SM87). Running untrusted fork
-    # pull requests on a self-hosted GPU would be unsafe, so this workflow is
-    # intentionally limited to trusted pushes and manual dispatches.
-    if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, linux, ARM64]
+    # Never scheduled by a push or PR. Readiness stays unset until a maintainer
+    # verifies and authorizes a uniquely matching runner; this change sets no
+    # repository variable or runner label and does not dispatch the job.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.run_orinnx == true && vars.ORINNX_RUNNER_READY == 'true'
+    needs: [repository-policy, host-contract-tests]
+    runs-on: [self-hosted, linux, ARM64, resonantia-orinnx-dedicated]
     timeout-minutes: 60
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
@@ -60,6 +95,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$(hostname)" = "OrinNX"
+          tr -d '\0' < /proc/device-tree/model | grep -Fq 'Jetson Orin NX'
           command -v cmake
           command -v nvcc
           test "$(uname -m)" = "aarch64"
