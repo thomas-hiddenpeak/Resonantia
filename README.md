@@ -94,11 +94,17 @@ CLI 参数、默认值和错误行为见 [`docs/CLI.md`](docs/CLI.md) 与各命�
 
 ## 测试
 
-默认 contract 不依赖被忽略的模型和数值 fixture：
+contract 不依赖被忽略的模型和数值 fixture。当前本地检查与 CI 使用以下受限选择：
 
 ```bash
-ctest --test-dir build --output-on-failure --label-regex contract
+ctest --test-dir build --output-on-failure --label-regex contract \
+  --exclude-regex '^test_web_transaction_failure$' --parallel 1 --no-tests=error
 ```
+
+`test_web_transaction_failure` 的源码仍保留，但其 `rename` 符号拦截不在当前执行授权内，
+因此不执行，也不计为通过或 CTest skip。CI 的 push、PR 和手动入口均保留这一边界：
+PR 只运行仓库检查；进入设备测试作业的事件使用上述排除项。其事务故障注入覆盖仍未验证。
+其他 contract 检查继续保留；其中底层 CUDA 单元检查不等于真实模型、训练或 GPU 取消验收。
 
 模型、对齐、训练和端到端测试只有在声明资产存在时才注册：
 

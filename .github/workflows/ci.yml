@@ -82,6 +82,13 @@ jobs:
         shell: bash
         run: cmake --build build-ci --parallel 2
 
-      - name: Run contract tests
+      - name: Run permitted contract tests
         shell: bash
-        run: ctest --test-dir build-ci --output-on-failure --label-regex contract
+        # Applies to every event that reaches this job, including manual runs.
+        # Keep the rename-interposition regression source, but do not execute it
+        # under the current restricted-probe boundary or count it as passing.
+        run: |
+          set -euo pipefail
+          echo 'Not run: test_web_transaction_failure (restricted rename interposition; coverage unverified).' >> "$GITHUB_STEP_SUMMARY"
+          ctest --test-dir build-ci --output-on-failure --label-regex contract \
+            --exclude-regex '^test_web_transaction_failure$' --parallel 1 --no-tests=error
