@@ -9,7 +9,40 @@
 
 ## 验证基线
 
-### 2026-10-24 八项审计修复
+### 2026-10-24 推送前合并远端 CI 更新
+
+推送 `d20dbe0` 时发现远端新增 `5f7fe83`、`c65eec7`，采用 merge 保留双方历史。
+合并 README/状态记录时保留八项修复和远端托管 CI/取消测试；更新当前测试数量与 CI 边界。
+工作流和独立 host 构建入口与 `c65eec7` 一致，自动 CI 仍只运行仓库检查及 10 项 host 子集；
+未手动派发设备作业或配置 runner。以下为合并工作树的本地验证，不代替推送后的 GitHub CI。
+
+- 根构建重新 configure、全部目标构建成功；默认 asset-free contract **29/29 通过，
+  0 失败/跳过，23.19 秒**，包含远端新增的协议与最终发布门禁以及本次修复回归。
+- 独立无 CUDA host 构建成功，**10/10 通过，0 失败/跳过，0.29 秒**。
+- Node 可用、slow=OFF 时根构建默认29项、资产齐全53 distinct（30 contract / 24 integration /
+  1 overlap）；slow=ON 共54项。缺 Node 减2项。注册清单已核对，本次合并未重跑24项
+  integration及1项slow；下节52/52全量证据属于 `d20dbe0`，不报告合并树54/54通过。
+- SDD 32项、shell语法和差异格式检查通过。本机日志目录为
+  `/tmp/resonantia-push-merge-20261024.0j9cec3p`。
+
+```bash
+cmake -S cmake/host-tests -B /tmp/resonantia-push-merge-20261024.0j9cec3p/host \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFETCHCONTENT_SOURCE_DIR_CATCH2=/home/rm01/Resonantia/build/_deps/catch2-src \
+  -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+nice -n 10 cmake --build /tmp/resonantia-push-merge-20261024.0j9cec3p/host --parallel 1
+nice -n 10 ctest --test-dir /tmp/resonantia-push-merge-20261024.0j9cec3p/host \
+  --parallel 1 --output-on-failure --no-tests=error
+# 根构建沿用下节相同 configure 参数，重新配置和构建后执行：
+nice -n 10 cmake --build /tmp/resonantia-fixes-20261024.wmLxjK --parallel 1
+nice -n 10 ctest --test-dir /tmp/resonantia-fixes-20261024.wmLxjK \
+  -L contract -LE 'integration|slow' --parallel 1 --output-on-failure --no-tests=error
+bash scripts/check_sdd.sh
+bash -n scripts/*.sh
+git diff --check
+```
+
+### 2026-10-24 八项审计修复（d20dbe0）
 
 基于干净的 `main@7082b96`，修复完整 GAN 导出漏写 Flow、批处理同名覆盖、host 频谱奇数
 padding 越界、sqrt/log 裁剪梯度、MelLoss 配置与形状校验、AdamW 非有限 beta、Web token
@@ -78,7 +111,7 @@ focused/contract/full CTest、sanitizer、WavLM before/after 日志及测试注�
 WavLM 负对照的工作目录为该目录下 `wavlm-controls/{truncated,error}/run`；分别执行
 `wavlm-before` 与本轮 `test_wavlm_alignment`，原始模型/fixture 只读引用。
 
-当前 Node 可用且 slow=OFF 时默认 asset-free 为 **27 项**，完整资产为 **51 distinct**
+该修复提交在 Node 可用且 slow=OFF 时默认 asset-free 为 **27 项**，完整资产为 **51 distinct**
 （28 contract-labelled、24 integration-labelled、1 overlap）；slow=ON 再加 1 项真实
 120 秒 body deadline，总计 **52**。缺 Node 时两个 UI 测试明确不注册，不算通过；
 因此默认/full 数量分别减 2。以下日期化记录保留各自历史数量及当时授权边界。
@@ -87,6 +120,24 @@ WavLM 负对照的工作目录为该目录下 `wavlm-controls/{truncated,error}/
 保证、非 SM87 平台及实时产品仍未验收；Spec 006 目标声线 model/Index 资格资产仍缺失。
 
 ### 历史验证记录
+
+- 2026-10-10，发布后对`5f7fe83`进行host完整性核验：此前10/6差异中两个Catch2用例
+  可直接运行于host，取消测试的纯协议部分也不需要CUDA。现复用这两个用例，并将已有协议/
+  完整fake迭代/自然helper断言原样拆出；真实参数解析及CLI预取消仍保留完整CUDA构建路径。
+  另为原先未确定性命中的最终三产物发布窗口增加私有显式屏障，复用已有取消测试fixture，
+  检查发布中409、reservation保留、完整收尾和重试。host注册10项；与原10项不是同一集合。
+  对应[验收计划§9](003-webui/acceptance-plan.md#9-托管host覆盖完整性与最终发布窗口)列明逐项差异。
+  工作流及设备手动/专属/就绪门禁保持不变；没有设备访问、GPU训练、受限探针或runner设置。
+  当前增量的实际host结果以对应SHA的GitHub CI日志为准，设备验证仍未运行。
+
+- 2026-10-10，后续授权将安全发布边界落实为CI：push/PR自动作业只使用GitHub托管
+  `ubuntu-24.04`运行仓库检查与6项现有Web/CLI host子集。新增独立`cmake/host-tests`入口，
+  不启用CUDA，也不修改根CMake或原测试源码。设备作业需要manual/main/显式勾选/就绪变量
+  四重条件，固定`resonantia-orinnx-dedicated`专属标签，无任意标签输入或通用ARM64兜底。
+  发布前工作流静态检查与24种事件组合通过，host CMake配置/编译图与6项CTest注册核验通过；
+  Mac没有执行Linux测试，实际托管host结果应以对应提交的CI日志为准。设备测试未运行，
+  未配置runner/变量/凭据，未访问设备。该改动替代下条“仅本地提交”的历史发布边界，
+  不新增GPU、模型、训练或受限探针证据。设备检查路径和原精确排除项继续保留。
 
 - 2026-10-10，基于本地/远端一致的`main@0955500`，新增`test_web_job_ownership`普通host门禁：
   上传自然校验拒绝/worker先于响应退休各配合正常响应/普通异常，**4/4确定性交错通过**。
@@ -393,8 +444,8 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
    v5重复finish窄修复现有[§8普通host等价所有权门禁](003-webui/acceptance-plan.md#8-abc所有权与重复finish后续普通host验证)；
    原受限A/B/C探针未重跑，预留前filesystem分配terminate仍待调查。更广OS/压力未验证项不自动扩展为追加实验。
    用户已批准并完成训练阶段及完整迭代协作取消编排（FR-011/TR-FR-015），有host证据；真实GPU取消未验收，timeout与强制终止未实施。
-   本次所有权增量保持本地提交；下一步先审定专属OrinNX CI路由和runner归属，再决定安全推送。
-   不自动扩展到真实训练、部署或已中止探针，也不配置/注册runner。
+   所有权增量的后续安全发布已授权：push只触发托管host检查，设备保持手动/就绪/专属标签门禁。
+   后续设备执行仍需先核实runner唯一归属并单独授权；不扩展到真实训练、部署或已中止探针。
 4. **实时能力暂缓**——Spec 006/ADR-0002 保持 Approved / R0 evidence 部分完成 / 产品未实现；
    本轮不接 persistent runtime、session 或 ALSA。恢复时仍需有授权 corpus、匹配 target
    model+Index 及 Index-enabled 质量/SLO 证据。

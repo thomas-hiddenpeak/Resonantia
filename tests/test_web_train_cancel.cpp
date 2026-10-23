@@ -400,7 +400,7 @@ void race_case(const fs::path& root,int n) {
     f.require_clean();
 }
 
-#ifdef RESONANTIA_TEST_MATERIAL_COMMIT_GATE
+#if defined(RESONANTIA_TEST_MATERIAL_COMMIT_GATE) || defined(RESONANTIA_TEST_TRAINING_PUBLISH_GATE)
 class CommitGate {
 public:
     explicit CommitGate(fs::path voice) : voice_(std::move(voice)) {}
@@ -425,6 +425,7 @@ private:
     std::condition_variable changed_;
     bool entered_ = false, released_ = false;
 };
+#ifdef RESONANTIA_TEST_MATERIAL_COMMIT_GATE
 // Set only in this test's submitting thread; no shared mutable hook pointer.
 thread_local CommitGate* current_commit_gate = nullptr;
 
@@ -504,6 +505,80 @@ void material_commit_case(const fs::path& root, bool request_cancel) {
     std::cout << "commit cancel: mid-transaction 202/duplicate 200; busy until complete; materials/old model retained; no CLI; stale id/new worker/retry passed\n";
 }
 #endif
+#ifdef RESONANTIA_TEST_TRAINING_PUBLISH_GATE
+// The lease installs this pointer before the worker starts and waits for every
+// worker reference to retire before removing it or destroying its gate.
+std::atomic<CommitGate*> current_publish_gate{nullptr};
+struct PublishGateLease {
+    Fixture& fixture;
+    CommitGate& gate;
+    PublishGateLease(Fixture& f, CommitGate& g) : fixture(f), gate(g) {
+        current_publish_gate.store(&gate);
+    }
+    ~PublishGateLease() {
+        gate.release();
+        if (!fixture.settled()) std::_Exit(2);
+        current_publish_gate.store(nullptr);
+    }
+};
+void training_publish_case(const fs::path& root, bool request_cancel) {
+    Fixture f(root / (request_cancel ? "publish-cancel" : "publish-control"));
+    CommitGate gate(f.voice);
+    PublishGateLease lease(f, gate);
+    Request train; make_request(train, "train-model");
+    const auto accepted = request(f, train);
+    require(accepted.status == 200 && gate.entered(), "final publication gate was not reached");
+    const auto id = job_id(accepted);
+    // The old generation was backed up and exactly the new clips have moved.
+    require(read(f.voice / "clips/result.wav") == kWav &&
+                !fs::exists(f.voice / "model.safetensors") && !fs::exists(f.voice / "model.index"),
+            "gate was not inside the three-artifact publication window");
+    fs::path backup;
+    for (const auto& item : fs::directory_iterator(f.voice))
+        if (item.path().filename().string().rfind(".train_backup_", 0) == 0) {
+            require(backup.empty(), "multiple publication backups"); backup = item.path();
+        }
+    require(!backup.empty() && read(backup / "clips/old.wav") == f.old.at("clips/old.wav") &&
+                read(backup / "model.safetensors") == "old-model" && read(backup / "model.index") == "old-index",
+            "old publication was not retained during the window");
+    const auto during = status(f);
+    require(job_id(during) == id, "publication lost job identity");
+    for (const char* field : {"\"stage\":\"publishing\"", "\"running\":true", "\"done\":false",
+                             "\"cancellable\":false", "\"cancel_requested\":false", "\"cancelled\":false"})
+        require(during.body.find(field) != std::string::npos, "wrong active publication state");
+    if (request_cancel) {
+        require(cancel(f, id).status == 409 && cancel(f, id).status == 409,
+                "cancellation accepted after final publication started");
+        require(status(f).body == during.body, "rejected cancellation changed publication state");
+    }
+    Request step; make_request(step, "step");
+    require(request(f, train).status == 409 && request(f, step).status == 409,
+            "publication released reservation before completion");
+    gate.release(); require_terminal(f, false, "done");
+    require(status(f).body.find("\"cancel_requested\":false") != std::string::npos &&
+                status(f).body.find("\"cancelled\":false") != std::string::npos,
+            "completed publication was reported cancelled");
+    require(read(f.voice / "clips/result.wav") == kWav &&
+                !fs::exists(f.voice / "clips/old.wav") &&
+                read(f.voice / "model.safetensors") == "new-model" && read(f.voice / "model.index") == "new-index",
+            "final publication did not finish all three artifacts");
+    for (const char* path : {"raw/old.wav", "work/old.wav", "steps.txt"})
+        require(read(f.voice / path) == f.old.at(path), "publication changed source materials");
+    require(f.runner->calls() == std::vector<std::string>{"vc_preprocess", "vc_train", "build_index"},
+            "unexpected worker stages during publication");
+    f.require_clean();
+    require(cancel(f, id).status == 409, "completed publication accepted cancellation");
+    f.runner->reset("");
+    const auto next = request(f, train);
+    require(next.status == 200 && job_id(next) != id, "slot not reusable after publication");
+    require_terminal(f, false, "done");
+    require(cancel(f, id).status == 409, "old publication id matched retry");
+    f.require_clean();
+    std::cout << "final publication " << (request_cancel ? "cancel" : "control")
+              << ": mid-transaction state, late cancel boundary, busy reservation, complete artifacts and retry passed\n";
+}
+#endif
+#endif
 
 void error_during_cancel(const fs::path& root) {
     Fixture f(root / "error-during-cancel");
@@ -576,6 +651,14 @@ void test_material_raw_installed(const std::filesystem::path& directory) {
 }
 }
 #endif
+#ifdef RESONANTIA_TEST_TRAINING_PUBLISH_GATE
+namespace resonantia::web {
+void test_training_clips_installed(const std::filesystem::path& directory) {
+    if (auto* gate = current_publish_gate.load()) gate->pause(directory);
+}
+}
+#endif
+
 int main() {
     try {
         const auto started=std::chrono::steady_clock::now();const auto fds=fd_count();fs::path path;
@@ -584,6 +667,9 @@ int main() {
 #ifdef RESONANTIA_TEST_MATERIAL_COMMIT_GATE
             material_commit_case(path, false);
             material_commit_case(path, true);
+#elif defined(RESONANTIA_TEST_TRAINING_PUBLISH_GATE)
+            training_publish_case(path, false);
+            training_publish_case(path, true);
 #else
             queued_case(path);
             for(const std::string program:{"vc_preprocess","vc_train","build_index"})stage_case(path,program);
@@ -599,6 +685,8 @@ int main() {
         require(std::chrono::steady_clock::now()-started<30s,"cancel suite exceeded 30 seconds");
 #ifdef RESONANTIA_TEST_MATERIAL_COMMIT_GATE
         std::cout << "Mid-commit cancellation: control + cancellation passed; no real CLI/syscall interception; no leftover fixtures/FD delta\n";
+#elif defined(RESONANTIA_TEST_TRAINING_PUBLISH_GATE)
+        std::cout << "Final publication: control + late cancellation passed; fake workers only; no leftover fixtures/FD delta\n";
 #else
         std::cout<<"Training cancellation: queue + 3 stages + committed upload + 8 completion races + failure during cancel + step exclusion passed; no real CLI/signals, no leftover fixtures/FD delta\n";
 #endif

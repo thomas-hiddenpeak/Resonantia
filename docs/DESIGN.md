@@ -287,7 +287,8 @@ wait/I/O及真实模型/音质缺口仍保留。不把Spec003整体标为Complet
 
 后续独立审查回传（2026-10-10，固定源码v9、27项哈希一致）：未发现已确认的训练取消缺陷；
 host取消、mock UI及额外重复提交/无ID取消/重复取消/新作业恢复检查通过。该结论不覆盖以下新测试接缝。
-原8次最终发布竞态只接受两种合法结果，不保证命中“发布已开始”窗口；丢失初次提交响应或刷新页面
+原8次最终发布竞态只接受两种合法结果，不保证命中“发布已开始”窗口；后续私有发布门禁见本文末。
+丢失初次提交响应或刷新页面
 后无法恢复跟踪仍是既有限制，本次未修复或扩展会话恢复。
 
 素材提交中取消的独立补充：`test_web_train_cancel_commit`在专属测试目标重编译Web支持源码，
@@ -312,14 +313,14 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
 
 模型权重和数值参考 fixture 体积较大且被 `.gitignore` 排除。由此形成两层测试：
 
-1. 默认 `contract`：不依赖这些本地资产，CI 构建并执行；除低层契约外还包含真实 CLI
-   子进程与真实 HTTP socket 测试。
+1. 根构建的默认 `contract`：不依赖这些本地资产；除低层契约外还包含真实 CLI
+   子进程与真实 HTTP socket 测试。自动 CI 执行独立的 10 项 host 子集，完整设备入口需手动授权。
 2. 可选 `integration`：配置 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON`；只有所需资产存在的用例才进入 CTest。
 
 测试内部“找不到文件就 return”不是可信的通过证据，因此 CMake 在注册前检查资产；WavLM
 还在运行时检查完整参考 shape/payload、双方有限值及全元素 RMSE `<1e-4`。
-Node.js 18+ 可用、slow=OFF 时默认27项、资产齐全51 distinct（28 contract-labelled、24
-integration-labelled、1 overlap）；slow=ON 加1项真实 body deadline，共52项。缺 Node
+Node.js 18+ 可用、slow=OFF 时默认29项、资产齐全53 distinct（30 contract-labelled、24
+integration-labelled、1 overlap）；slow=ON 加1项真实 body deadline，共54项。缺 Node
 时 UI 认证/取消两项明确不注册，数量减2；Node 只用于测试，不是 WebUI 构建/运行依赖。
 当前执行结果见 `specs/PROJECT_STATE.md`。2026-08-12 的 fresh Release/SM87
 build `/tmp/resonantia-nonrt-final.a8O1Ay` 已实际执行并通过 39/39（0 失败，
@@ -338,7 +339,7 @@ pre-launch、observable synchronization，以及 Synthesizer public fail-closed 
 - CMake 3.24+，C++20/CUDA20。
 - `VOXMUTATIO_CUDA_ARCHITECTURES` 决定目标架构，默认 87；不再额外硬编码一份冲突的 `-gencode`。
 - Catch2 优先使用系统包，否则下载带 SHA-256 校验的固定源码归档。
-- CI 只在 `main` push/手动触发时使用自托管 ARM64 CUDA runner，避免在自托管机器执行 fork PR 的任意代码。
+- CI 的 push/PR 自动运行 GitHub 托管仓库检查与独立 10 项 host 子集。设备作业仅在 main 手动 opt-in、就绪变量为 true 且专属 OrinNX 标签匹配时执行。
 
 运行时源码使用显式清单，按 core、I/O、CUDA ops、content、F0、Index、synthesizer、
 separation、autograd、training、pipeline 和 deprecated legacy WebUI compatibility surface
@@ -385,16 +386,17 @@ close等已开始写操作结束，关闭后旧shared_ptr不能写或重建路�
 取消写失败返回500且保持预留；source记录首个写/close错误，最终error优先。新作业从新id、新token开始。
 `cancel_boundary`更新为`stage_or_iteration`；收到请求仍不等于已经停止。
 
-验证分层：`test_training_cancel`覆盖默认/参数/异常token、完整fake step、最后一步取消、错误优先、
-关闭/旧路径隔离，以及真实CLI的预取消入口（隐藏GPU、输入不存在）。同一测试的微型host helper使用
-共享loop helper，由真实PosixProcessRunner自然排空/reap；这不是GPU训练。`test_web_train_cancel`
+验证分层：纯协议断言现移至`test_training_cancel_protocol`，覆盖默认/异常token、完整fake step、
+最后一步取消、错误优先、关闭/旧路径隔离。`test_training_cancel`保留参数解析和真实CLI的预取消
+入口（隐藏GPU、输入不存在）。协议测试的微型host helper使用共享loop helper，由真实
+PosixProcessRunner自然排空/reap；这不是GPU训练。`test_web_train_cancel`
 沿用ProcessRunner替身检查token送达、重复请求、runner返回前busy、旧id/新token隔离、退出2未请求即错误、
 并发system/log/普通错误优先、清理及重试。`test_web_train_cancel_commit`保留素材中途提交控制/取消门禁。
 
 证据限制：host编排与编译成功不证明真实GPU循环的取消延迟、资源峰值或数值等价；没有启动真实训练。
 单次初始化/clip/step/export或底层驱动卡住时仍无停止时限。token写/close的OS故障分支未做系统调用拦截验证；
 既有GPU析构的cudaFree错误仅日志记录、TempDir清理失败及进程异常guard的旧行为不在本增量修复范围。
-取消丢弃进度，没有resume；未改变页面刷新/提交响应丢失后的跟踪限制，也未确定性命中最终发布窗口。
+取消丢弃进度，没有resume；未改变页面刷新/提交响应丢失后的跟踪限制。当时未确定性命中最终发布窗口，后续host门禁见本文末。
 正式ADR仍Proposed，Spec003仍部分验收。当时原A/B/C和其他既有未验证项保持未完成；
 后续普通host等价所有权验证见下文，原受限探针仍未重跑。
 
@@ -440,4 +442,25 @@ CTest上限15秒，没有rename/pthread拦截、进程注入或信号操作。
 旧finish修改B。负对照不修改仓库实现。本轮10项明确选择的host回归10/10通过、0失败/skip，
 3.43秒；当前注册24项，其余14项未运行。该证据闭合所列等价所有权语义，但不是原受限
 OS故障探针的复跑或新的独立审查；真实OS异常生成、全局/worker OOM、预留前filesystem
-terminate、真实GPU取消和最终三产物发布窗口仍未验证。复现范围与命令见验收计划§8。
+terminate、真实GPU取消仍未验证；当时未覆盖的最终三产物发布窗口后续门禁见本文末。复现范围与命令见验收计划§8。
+
+### CI自动host检查与手动设备边界（2026-10-10）
+
+`cmake/host-tests`是独立Linux C++20测试入口，复用Web/CLI/IO实现，现有10项host门禁，不启用
+CUDA、不链接`voxmutatio`，Catch2与根构建共享已有版本/归档哈希策略。host支持库分别复用HTTP/
+registry/token、workflow和Web service源码；ownership及material-commit的宏仍只在私有
+测试目标生效。既有完整测试注册保留在根CMake，host子集不声明模型/GPU或完整套件通过。
+
+push、PR的全部自动作业只使用GitHub托管Ubuntu。设备job只有在workflow_dispatch、main、
+`run_orinnx=true`、`ORINNX_RUNNER_READY='true'`同时成立且host检查成功时才可调度，
+runs-on固定要求`self-hosted/linux/ARM64/resonantia-orinnx-dedicated`；没有动态标签或兜底。
+就绪变量只可在专属runner身份、唯一标签匹配和执行授权另行核实后设置，本增量未设置/注册。
+hostname/device-tree检查是调度后的辅助保护。自动与手动并发组分离，自动push不会取消手动设备作业。
+当前增量不dispatch设备job，不运行GPU训练；受限rename测试在手动设备路径仍精确排除且明确记未运行。
+
+后续完整性核验把取消协议断言从真实CUDA CLI测试中原样拆出，并直接编译原bounded I/O和
+旧Web API兼容用例。真实CLI预取消/五个CLI参数契约仍需完整CUDA构建，未用host替身替代。
+`test_web_train_cancel_publish`以私有宏在最终三产物事务的首项安装后暂停，复用现有fixture
+验证control及late-cancel两种路径：发布中取消409/状态不变、槽位不提前释放，结束后完整产物/
+清理/重试。两秒gate及15秒CTest界限，不涉及rename拦截；生产宏关闭代码保持一致。
+这补齐确定性host发布截止点，原文所述真实GPU、OS故障和崩溃原子性边界仍保留。

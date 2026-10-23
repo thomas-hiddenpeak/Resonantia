@@ -1,0 +1,7 @@
+# Lint declarations only: these do not register a runner, assign a label,
+# verify device identity, or set the readiness variable in GitHub.
+self-hosted-runner:
+  labels:
+    - resonantia-orinnx-dedicated
+config-variables:
+  - ORINNX_RUNNER_READY

@@ -31,6 +31,11 @@ namespace fs = std::filesystem;
 void test_material_raw_installed(const fs::path& directory);
 #endif
 
+#ifdef RESONANTIA_TEST_TRAINING_PUBLISH_GATE
+// Private host test only: pause after the first of the three artifacts installs.
+void test_training_clips_installed(const fs::path& directory);
+#endif
+
 namespace {
 
 constexpr std::size_t kMaximumProcessLogLine = 64 * 1024;
@@ -719,6 +724,9 @@ bool replace_training_artifacts(const fs::path& directory,
             fs::rename(artifact.staged, artifact.live, filesystem_error);
             if (filesystem_error) break;
             artifact.installed = true;
+#ifdef RESONANTIA_TEST_TRAINING_PUBLISH_GATE
+            if (&artifact == &artifacts.front()) test_training_clips_installed(directory);
+#endif
         }
     }
     if (!filesystem_error) {

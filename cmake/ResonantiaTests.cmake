@@ -3,19 +3,7 @@ include_guard(GLOBAL)
 set(_resonantia_test_output_dir "${CMAKE_BINARY_DIR}/Testing/Artifacts")
 file(MAKE_DIRECTORY "${_resonantia_test_output_dir}")
 
-# Prefer a system package, but keep a reproducible fallback for developer and CI
-# machines. The archive is content-addressed; no branch or mutable Git tag is run.
-find_package(Catch2 3.4 CONFIG QUIET)
-if(NOT Catch2_FOUND)
-    include(FetchContent)
-    FetchContent_Declare(
-        Catch2
-        URL https://github.com/catchorg/Catch2/archive/refs/tags/v3.4.0.tar.gz
-        URL_HASH SHA256=122928b814b75717316c71af69bd2b43387643ba076a6ec16e7882bfb2dfacbb
-        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-    )
-    FetchContent_MakeAvailable(Catch2)
-endif()
+include("${PROJECT_SOURCE_DIR}/cmake/ResonantiaCatch2.cmake")
 
 function(resonantia_add_test_executable target source)
     add_executable(${target} ${source})
@@ -246,6 +234,28 @@ target_link_libraries(test_web_train_cancel_commit PRIVATE voxmutatio resonantia
 resonantia_register_test(test_web_train_cancel_commit test_web_train_cancel_commit
     LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
 
+# Pause inside final three-artifact publication without syscall interposition.
+resonantia_add_process_test_executable(test_web_train_cancel_publish
+    "${PROJECT_SOURCE_DIR}/tests/test_web_train_cancel.cpp")
+target_sources(test_web_train_cancel_publish PRIVATE
+    "${PROJECT_SOURCE_DIR}/tools/web/http_transport.cpp"
+    "${PROJECT_SOURCE_DIR}/tools/web/workflow_support.cpp"
+    "${PROJECT_SOURCE_DIR}/tools/web/web_service.cpp")
+target_include_directories(test_web_train_cancel_publish PRIVATE "${PROJECT_SOURCE_DIR}")
+target_compile_definitions(test_web_train_cancel_publish PRIVATE
+    RESONANTIA_TEST_TRAINING_PUBLISH_GATE=1)
+target_link_libraries(test_web_train_cancel_publish PRIVATE voxmutatio resonantia_training_control)
+resonantia_register_test(test_web_train_cancel_publish test_web_train_cancel_publish
+    LABELS "contract;web;host" TIMEOUT 15 NO_GPU_LOCK)
+
+resonantia_add_process_test_executable(test_training_cancel_protocol
+    "${PROJECT_SOURCE_DIR}/tests/test_training_cancel_protocol.cpp")
+target_link_libraries(test_training_cancel_protocol PRIVATE resonantia_web_support resonantia_training_control)
+resonantia_register_test(test_training_cancel_protocol test_training_cancel_protocol
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
+# The remaining test retains real option parsing and the actual CLI pre-cancel
+# entry. It still requires the production CUDA build, not GPU test execution.
 resonantia_add_process_test_executable(test_training_cancel
     "${PROJECT_SOURCE_DIR}/tests/test_training_cancel.cpp")
 target_link_libraries(test_training_cancel PRIVATE resonantia_web_support resonantia_vc_train_app_support)

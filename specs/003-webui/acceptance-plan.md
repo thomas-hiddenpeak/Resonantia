@@ -249,3 +249,32 @@ CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 nice -n 10 ctes
 未运行不计skip/通过，未扩大已有独立审查结论；原受限探针、真实GPU取消、最终发布窗口、
 预留前filesystem terminate及更广OS/OOM边界仍未闭合。本增量不修改CI或其他测试，
 保持本地提交，待专属OrinNX路由方案单独获批并核实后再考虑推送。
+
+## 9. 托管host覆盖完整性与最终发布窗口
+
+对`main@5f7fe83`的有界核验发现，此前OrinNX选择的10项和GitHub的6项并非全由平台决定。
+六项一致的是`test_web_job_lifecycle`、`test_web_job_ownership`、`test_web_result_contract`、
+`test_web_train_cancel`、`test_web_train_cancel_commit`和`test_vc_train_entry`。
+
+| 本地额外测试 | 原托管CI缺少原因 | 本次处理与保留边界 |
+|---|---|---|
+| `test_bounded_audio_io` | 子集未接入Catch2；实现本身无需CUDA | 复用原测试和实现，加入host入口；共享现有固定Catch2依赖策略 |
+| `test_legacy_webserver_contract` | 同上，原根构建粗粒度链接CUDA facade | 直接复用旧API实现与原测试，加入host入口，无socket服务启动 |
+| `test_training_cancel` | 同一文件混合纯协议、参数解析和真实CUDA链接CLI的预取消入口 | 纯令牌/完整迭代/错误优先/路径复用/自然helper回收断言原样移至`test_training_cancel_protocol`，两种构建均注册；原名保留参数解析与真实CLI预取消，不用替身冒充真实CLI |
+| `test_cli_contract` | 需要五个实际生产CLI；其应用实现链接CUDA | 保留完整构建入口。是构建/链接依赖，不代表这些参数检查必须执行GPU；不为此安装CUDA或替换真实CLI |
+
+因此当前host入口为10项：原6项、上述两个直接复用测试、拆出的协议门禁，以及新增的
+`test_web_train_cancel_publish`。数量与原10项恰好相同但集合不同；不得等同两套证据。
+完整根CTest增加协议和发布两个注册，保留原CLI测试及其他用例；本轮未运行完整设备套件。
+
+最终发布待项的依据：旧`race_case`允许取消先到或发布先到，两种结果都通过，不能保证
+命中`publishing`。新私有目标复用同一`test_web_train_cancel.cpp`、fake runner和有界gate，
+在三产物事务安装clips后、model/index安装前暂停。对照与取消两种case均确认新clips已安装、
+旧三产物仍在backup、running为true、cancellable为false且新作业409；取消case连续两次
+返回409且job状态不变。释放后必须完整发布三产物、done且非cancelled，源素材不变，
+staging/backup与FD清理，槽位可重试、旧id不能匹配新作业。
+
+回调只存在于`RESONANTIA_TEST_TRAINING_PUBLISH_GATE`私有编译，原生产宏关闭代码保持一致。
+每个gate最长2秒，CTest上限15秒；普通fixture文件移动与fake worker，无系统调用拦截、
+进程注入、模型或GPU。该门禁验证取消截止点和正常发布收尾，不新增崩溃原子性、OS故障、
+rollback组合或真实GPU证据。运行结果以对应SHA的托管CI日志为准，设备job继续明确未运行。
