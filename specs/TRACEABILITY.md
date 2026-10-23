@@ -1,18 +1,19 @@
 # Resonantia 需求追踪矩阵
 
-**核对日期：2026-10-10（Web 硬化与已授权训练取消增量）；其他模块基线为 2026-08-12。** 本表描述当前仓库中的实现与 CTest 证据。状态词定义见
+**核对日期：2026-10-24（八项审计修复）。** 本表描述当前仓库中的实现与 CTest 证据；当前运行记录见 [PROJECT_STATE](./PROJECT_STATE.md)。状态词定义见
 [specs/README.md](./README.md#状态词汇)。
 
 ## 证据口径
 
-- 默认门禁由 `VOXMUTATIO_BUILD_TESTS=ON` 注册，asset-free 配置当前有 21 项，包括 core、
+- 默认门禁由 `VOXMUTATIO_BUILD_TESTS=ON` 注册，Node.js 18+ 可用、slow=OFF 的 asset-free 配置当前有 27 项，包括 core、
   audio/bounded I/O、content kernels、F0、immutable Index、pipeline/bounded DSP、autograd、
-  两个私有 CUDA failure targets、真实 CLI/HTTP、Web 事务与作业启动单次分配故障、自然进程失败/回收、Web模拟结果消费、legacy Web API 和 realtime 报告 validator。
+  两个私有 CUDA failure targets、training 数值/配置、真实 CLI/HTTP、Web 事务与作业启动单次分配故障、自然进程失败/回收、Web模拟结果消费、UI 认证/取消、legacy Web API 和 realtime 报告 validator。
 - 资产门禁仅在 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON` 时构建；每个测试还要通过
-  `cmake/ResonantiaTests.cmake` 的资产存在检查。完整资产配置当前共注册 45 个 distinct
-  tests：22 contract-labelled、24 integration-labelled；`test_bounded_file_wavlm_preflight`
-  同时属于两类，所以不能把 22+24 写成总数。缺资产时“不注册”不是“通过”。slow选项默认OFF；ON额外注册130秒上限的
-  `test_web_body_deadline`（本轮独立1/1通过120.74秒），当前默认21项、默认full配置45项口径不包含slow。
+  `cmake/ResonantiaTests.cmake` 的资产存在检查。完整资产配置当前共注册 51 个 distinct
+  tests：28 contract-labelled、24 integration-labelled；`test_bounded_file_wavlm_preflight`
+  同时属于两类，所以不能把 28+24 写成总数。缺资产时“不注册”不是“通过”。slow 默认 OFF；
+  ON 额外注册130秒上限的 `test_web_body_deadline`，完整配置为52项。缺 Node 时两个 UI
+  测试明确不注册、默认/full 数量减2；不影响无 Node 的静态 UI 构建/运行。
 - GPU 测试共用 `RESOURCE_LOCK voxmutatio_gpu`；bounded I/O、CLI、HTTP、legacy Web API 与
   realtime 报告 validator 等 host contract 不占 GPU lock。当前 CI 在普通 PR 只做
   仓库策略检查；ARM64/SM87 CUDA build 与默认 contract CTest 只在 `main` push 或手动触发。
@@ -31,31 +32,31 @@
 | VC-FR-001 WAV I/O | `io/audio_io.*`、private `io/bounded_audio_io.*`、pipeline file APIs | `test_audio_io`、`test_bounded_audio_io`（默认）；`test_e2e_conversion`（资产门禁） | **已实现·默认门禁**；seekable bounded reader/atomic streaming writer 有独立门禁，FLAC/MP3 不支持 |
 | VC-FR-002 Resampling | `io::resample_linear`、`bounded_pipeline.cpp` 的全局相位 16 kHz spool 与 40 kHz 模型率输出 | `test_audio_io` + `test_bounded_pipeline_dsp`（默认）；e2e（资产门禁） | **已实现·默认门禁**；当前 synthesizer 仅兼容 40 kHz，不提供其他模型率或独立目标输出采样率 |
 | VC-FR-003 HuBERT default | `content/hubert_encoder.*`、pipeline 默认 encoder、v1/v2 feature dim | `test_hubert_inference`、`test_pipeline_contract`（资产门禁） | **已实现·可选门禁** |
-| VC-FR-004 Optional WavLM | `content/wavlm_encoder.*`、pipeline encoder 分发、caller file policy | `test_wavlm_alignment`、bounded preflight（资产门禁） | **部分**：encoder 实现与对齐门禁存在；没有匹配的 WavLM-trained VITS bounded 资格资产，故 CLI/batch 明确走 legacy 而非静默换 HuBERT |
+| VC-FR-004 Optional WavLM | `content/wavlm_encoder.*`、pipeline encoder 分发、caller file policy | `test_wavlm_alignment` 完整参考 shape/payload、有限值与全元素 RMSE <1e-4；bounded preflight（资产门禁） | **部分**：encoder 实现与对齐门禁存在；没有匹配的 WavLM-trained VITS bounded 资格资产，故 CLI/batch 明确走 legacy 而非静默换 HuBERT |
 | VC-FR-005 F0 | `f0/rmvpe*`、`f0/fcpe.*`、bounded F0 window/spool；完整 manifest、staged init、finite/size 边界；ops 使用 `CudaBuffer` | `test_f0`、`test_cuda_failure`（默认）；RMVPE/FCPE alignment + final window profiles（资产门禁） | **已实现·默认及可选门禁**；PM 不支持；bounded raw core 128000，RMVPE/FCPE 单侧 context 64000/32000，硬输入独立为 256000/192000；故障注入是代表性路径，不是每条 CUDA 调用 |
 | VC-FR-006 Index | `index/cuda_flat_index.*` private unlinked filesystem snapshot；pipeline required-rate/width/lookup fail-closed | `test_index` FIFO/source-mutation/exact（默认）；`test_index_retrieval`（资产门禁） | **已实现·默认及可选门禁**；优先 `FICLONE`、否则 1 MiB bounded copy/compare，需要 `O(Index)` 临时 filesystem 容量；fallback 分支未被强制注入，ENOSPC/权限失败显式拒绝，非零 rate 不旁路 |
 | VC-FR-007 Synthesizer | `synthesizer/synthesizer.*`：完整 manifest/weight-norm；256 MiB VITS-only read-only anonymous snapshot + absolute path identity；公开 infer/debug finite/size/exception fail-closed；VITS ops RAII | `test_audio_io` snapshot/FIFO/ABA/read-only（默认）；`test_pipeline_smoke` VITS truncate/path replacement/CWD/finite/size（默认）；`test_synth_cuda_failure`（默认）；VITS/pipeline model tests（资产门禁） | **已实现·默认及可选门禁**；source truncate 不再造成 active mapping SIGBUS，路径身份变化仍拒绝调用；成功 init 约增加 checkpoint-size host residency；其他模型仍 file-backed |
 | VC-FR-008 Pipeline | `pipeline/pipeline.*`、`bounded_pipeline.*`、shared caller policy | pipeline/bounded DSP（默认）；pipeline/e2e/long/F0/resource/CLI caller（资产门禁） | **已实现·默认及可选门禁**：HuBERT callers bounded；direct E2E matrix 为 RMVPE/v2 + FCPE/v1，另有两种 F0 profiles；effective core=`Ceff+2Qeff`、content=`Ceff+2Qeff+2Peff+160`；17.565/35.130 秒 RSS 1342624/1354844 KiB、device 892334080/851812352 B。只有两个时长点且无独立 click threshold；legacy buffer/file 与 WavLM 仍随时长增长 |
 | VC-FR-009 Numerical safety | 公共 checked boundaries、`CudaBuffer`、VITS public exception boundary、RMVPE/VITS private fault seams | `test_cuda_failure`、`test_synth_cuda_failure` 及模块默认边界；真实模型 rollback/alignment 为资产门禁 | **部分**：代表性 allocation、H2D/D2H、pre-launch、observable sync 和 host-allocation failure 已注入且 seam 不进入 production；并非每条 CUDA/cuBLAS/cuFFT 或真实系统 OOM 都被注入，Pipeline 持续 `bad_alloc` 可传播 |
 | VC-FR-010 Output | pipeline/40 kHz model-rate `AudioBuffer`、`io::write_audio`、`vc_convert` 输出 | `test_audio_io` 原子替换/失败保留（默认）；e2e 有限/非空输出（资产门禁） | **已实现·默认门禁**：只支持当前 40 kHz model-rate WAV；同目录 staging 经 fsync/close 后 rename，失败保留旧目标 |
-| VC-FR-011 CLI | `tools/app_support/cli_parse.h`、`file_conversion_policy.h`、各 app-support/薄 main | `test_cli_contract`（默认）；`test_cli_bounded_callers` 真实 HuBERT/RMVPE/v2/speech（资产门禁） | **部分**：严格解析、失败和 `vc_convert`/单文件 `vc_batch` bounded caller 已在当前 39/39 中通过；WavLM 明确 legacy，`vc_probe` 仍无行为验收 |
+| VC-FR-011 CLI | `tools/app_support/cli_parse.h`、`file_conversion_policy.h`、各 app-support/薄 main | `test_cli_contract`（默认）；`test_cli_bounded_callers` 真实 HuBERT/RMVPE/v2/speech（资产门禁） | **部分**：严格解析、批处理输出冲突在模型/写入前拒绝、失败和 `vc_convert`/单文件 `vc_batch` bounded caller 已有对应门禁，本轮结果见 PROJECT_STATE；WavLM 明确 legacy，`vc_probe` 仍无行为验收 |
 | VC 初始化失败不得保留旧模型 | `pipeline/pipeline.cpp::init` staging/commit | `test_pipeline_contract` failed reinitialization（资产门禁） | **已实现·可选门禁** |
-| VC-FR-012 Auxiliary CLIs | `vc_batch`、`vc_probe` CMake targets | `test_cli_contract` 覆盖 batch 数值失败；`test_cli_bounded_callers` 覆盖单文件成功；无 `vc_probe` 行为门禁 | **部分**：`vc_probe` 仍是骨架；不得计入 Spec 001 完成证据 |
-| VC-MIG-001..006 Bounded file migration | additive API + private bounded I/O/planner/F0/RMS + shared HuBERT caller policy；legacy API 保留 | bounded I/O/DSP、RMVPE/FCPE profiles、long/resource/WavLM preflight/CLI caller | **已实现·默认及可选门禁**：R1–R5 已实施并经当前工作树 39/39 收口；临时 disk `O(duration)`、WavLM legacy、只有两个资源时长点且无独立 click threshold 仍是明示证据边界 |
+| VC-FR-012 Auxiliary CLIs | `vc_batch`、`vc_probe` CMake targets | `test_cli_contract` 覆盖 batch 数值失败/递归同名冲突及旧输出保留；`test_cli_bounded_callers` 覆盖单文件成功；无 `vc_probe` 行为门禁 | **部分**：`vc_probe` 仍是骨架；不得计入 Spec 001 完成证据 |
+| VC-MIG-001..006 Bounded file migration | additive API + private bounded I/O/planner/F0/RMS + shared HuBERT caller policy；legacy API 保留 | bounded I/O/DSP、RMVPE/FCPE profiles、long/resource/WavLM preflight/CLI caller | **已实现·默认及可选门禁**：R1–R5 已实施并经 2026-08-12 历史工作树 39/39 收口；当前执行见 PROJECT_STATE；临时 disk `O(duration)`、WavLM legacy、只有两个资源时长点且无独立 click threshold 仍是明示证据边界 |
 
 ## 训练
 
 | ID / 约束 | 当前实现位置 | CTest / 其他证据 | 状态与缺口 |
 |---|---|---|---|
-| TR-FR-001 Autograd | `autograd/tensor.h`、`src/autograd/autograd.cu` | `test_autograd`（默认 gradcheck/边界） | **已实现·默认门禁**；覆盖度随公开算子维护 |
-| TR-FR-002 AdamW/裁剪/非有限防护 | `autograd::AdamW`、`training/gan_trainer.cpp` | optimizer 凸收敛（默认）；GAN 集成（资产门禁） | **已实现·默认门禁**；生产超参稳定性未知 |
-| TR-FR-003 Differentiable STFT/mel | `training/mel_loss.*`、`autograd` frame/math ops | `test_autograd` primitives（默认）；`test_mel_loss`（真实语音资产门禁） | **已实现·可选门禁** |
+| TR-FR-001 Autograd | `autograd/tensor.h`、`src/autograd/autograd.cu` | `test_autograd`（默认 gradcheck/边界，含 sqrt/log 裁剪分支与端点零梯度） | **已实现·默认门禁**；覆盖度随公开算子维护 |
+| TR-FR-002 AdamW/裁剪/非有限防护 | `autograd::AdamW`、`training/gan_trainer.cpp` | optimizer 凸收敛、非有限 beta 拒绝、无效学习率更新保留旧值（默认）；GAN 集成（资产门禁） | **已实现·默认门禁**；生产超参稳定性未知 |
+| TR-FR-003 Differentiable STFT/mel | `training/mel_loss.*`、`autograd` frame/math ops | `test_autograd` primitives 与 `test_training_contract` 配置/shape/尺寸/host-GPU 奇数 padding（默认）；`test_mel_loss`（真实语音资产门禁） | **已实现·默认及可选门禁** |
 | TR-FR-004 Trainable decoder | `training/generator_trainer.*` | `test_generator_trainer` alignment/fine-tune/export（资产门禁） | **已实现·可选门禁** |
 | TR-FR-005 Posterior/Flow/Discriminator | `training/posterior_encoder.*`、`discriminator.*` | `test_gan` enc_q/flow/discriminator/rollback（资产门禁） | **已实现·可选门禁** |
 | TR-FR-006 GAN losses/alternating step | `training/gan_trainer.*` | `test_gan` fine-tune/full（资产门禁） | **已实现·可选门禁**；长期稳定性未知 |
 | TR-FR-007 WAV/data baseline | `tools/app_support/vc_train_app.cpp` 的发现、前端与固定片段采样；`vc_preprocess_app.cpp` 可独立准备片段；对应 `tools/vc_*.cpp` 为薄 main | `test_cli_contract` 严格数值/退出码（默认）；无独立 filelist/cache/batching 产品 CTest | **部分**：训练路径与严格参数边界存在；完整数据产品仍缺 |
 | TR-FR-008 Progress | `vc_train_app.cpp` runner 的文本 step/loss 输出 | 无机器可读协议 CTest | **部分**：稳定结构化协议未定义 |
-| TR-FR-009 Inference G export | `GeneratorTrainer::export_model`、`vc_train` 临时文件 + rename | generator zero-step/训练后 round-trip（资产门禁） | **已实现·可选门禁** |
+| TR-FR-009 Inference G export | `GeneratorTrainer::export_model`、`GANTrainer::export_model` 的 decoder + Flow 合并临时文件 + rename | generator 与完整 GAN 零步/训练后 Flow 变化/inverse/decoder 往返及失败保留（资产门禁） | **已实现·可选门禁** |
 | TR-FR-010 Independent Index build | `tools/build_index.cpp`：确定路径排序、same-directory unique staging、fsync/close + rename | `test_build_index_contract` 真实 HuBERT/语音确定性/旧 inode/失败清理（资产门禁）；无训练事务集成 | **部分**：工具独立构建与发布已加固，仍未与 G 导出原子绑定 |
 | TR-FR-011 Checkpoint resume | 无 G/D/optimizer/epoch/RNG 持久化 | 无 | **不支持** |
 | TR-FR-012 Legacy `FineTuneTrainer` | `training/fine_tuning.cpp` | `test_core` 仅验证畸形 dataset | **不支持**：门面必须失败 |
@@ -85,7 +86,7 @@
 |---|---|---|---|
 | WEB-FR-001 Static UI | `webui/`、`tools/web/workflow_support.*::serve_static`、CMake `vc_serve` | `test_web_contract` 真实 server/static root（默认） | **已实现·默认门禁** |
 | WEB-FR-002 Configurable bind | 薄 `vc_serve` startup config + `HttpTransport`，默认 `0.0.0.0:8080` | `test_web_contract` loopback/动态端口；help/默认值代码（默认） | **已实现·默认门禁**；默认全接口由静态契约保留，测试不暴露外网 |
-| WEB-FR-003 Optional auth | `HttpTransport` 的 token config、constant-time Bearer compare 与 `/api/` precheck | `test_web_contract` anonymous/wrong/correct token + public static（默认） | **已实现·默认门禁** |
+| WEB-FR-003 Optional auth | `HttpTransport` 的 token config、constant-time Bearer compare 与 `/api/` precheck | `test_web_contract` anonymous/wrong/correct token + public static；`test_web_auth_ui` 重试/并发/轮换/storage 回退（Node 可用时默认） | **已实现·默认门禁** |
 | WEB-FR-004 WAV-only upload | filename 白名单、`.wav`、RIFF/WAVE signature、duplicate 检查；transport 唯一 boundary/完整 delimiter line | `test_web_contract` multipart boundary/quoted-string 拒绝与二进制前缀 WAV 原样上传 | **部分**：part header/Content-Disposition 的23类拒绝、8类合法语法及跨part重复字段已有HTTP门禁；更广文件名/重复文件矩阵仍缺 |
 | WEB-FR-005 CLI orchestration | `WebService` + argv-based `PosixProcessRunner` 调用 preprocess/train/index/convert；不经过 shell；HTTP sockets close-on-exec | `test_web_contract` 使用长寿命假 CLI 验证 FD 隔离，并以假 preprocess/train/index/convert 覆盖全部工作流（默认） | **已实现·默认门禁** |
 | WEB-FR-006 GPU serialization | `WebService::gpu_mutex_`；convert/preprocess/step 使用 `try_lock`，step reservation 后才返回接受 | `test_web_contract` preprocess持锁时step立即409；`test_web_job_lifecycle`初始化失败释放slot/重试/活动worker保留；`test_web_job_ownership`四种A/B/C交错、旧training/step finish重放和两个负对照 | **已实现·默认门禁**；GPU mutex串行不变；重复finish修复的等价所有权语义已有普通host动态证据，原受限OS探针未重跑、未新增独立审查 |
@@ -145,7 +146,7 @@ fail-closed 和 standalone exact-retrieval 诊断 probe；这些 scaffold 不等
 |---|---|---|---|
 | BUILD-001：CMake 3.24、C++20/CUDA20、显式 CUDA 架构 | 根 `CMakeLists.txt`，默认 SM87 cache | configure/build 命令；可信 ARM64 CI | **已实现**；非 SM87 产品支持未知 |
 | BUILD-002：核心库与 CLI 目标 | 显式 source list + 12 个内部 OBJECT 组件；`voxmutatio` static compatibility facade；四个按命令隔离的 `resonantia_vc_*_app_support` 与 `resonantia_web_support`；既有 CLI targets | fresh build、CMake graph、静态库符号集合与 CLI/HTTP contract | **已实现**；内部 target 不构成新公共 ABI |
-| BUILD-003：可复现默认 contract suite | `cmake/ResonantiaTests.cmake`；优先系统 Catch2 3.4，缺失时使用固定 3.4.0 archive + SHA-256 | asset-free 21 tests；full config 45 distinct / 22 contract-labelled / 24 integration-labelled / 1 overlap | **已实现·默认门禁**；固定v9默认20/20通过（0失败/skip，22.00秒）；提交补充选择回归20/20通过（21.67秒）；已注册21项，按本轮限制排除rename拦截测试1项未运行；2026-08-12 历史工作树 full 39/39 通过（0 失败，1297.94 秒）；跨机器系统包补丁版本可能不同 |
+| BUILD-003：可复现默认 contract suite | `cmake/ResonantiaTests.cmake`；固定 Catch2 3.4.0 fallback | Node 可用且 slow=OFF：asset-free 27；full 51 distinct / 28 contract / 24 integration / 1 overlap；slow 加1 | **已实现·默认门禁**；2026-10-24 当前树完整命令及结果见 [PROJECT_STATE](./PROJECT_STATE.md)；缺 Node 的2项 UI 门禁和缺资产未注册项不可计通过 |
 | BUILD-004：模型/fixture 测试不得假通过 | `VOXMUTATIO_ENABLE_MODEL_TESTS`、每测试 `ASSETS` 注册检查 | configure 输出缺失资产原因 | **已实现** |
 | BUILD-005：GPU 测试串行与 timeout | CTest `RESOURCE_LOCK voxmutatio_gpu`、每测试 timeout | CTest properties | **已实现** |
 | BUILD-006：PR 与自托管 runner 安全边界 | `.github/workflows/ci.yml` | PR 只跑 repository-policy；`main` push/manual 才跑 GPU | **已实现**；普通 PR 没有编译门禁，这是显式覆盖缺口 |

@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
+#include <sys/stat.h>
 #include <random>
 #include <vector>
 
@@ -18,6 +20,7 @@
 #include "voxmutatio/training/discriminator.h"
 #include "voxmutatio/training/gan_trainer.h"
 #include "voxmutatio/training/posterior_encoder.h"
+#include "test_artifacts.h"
 
 using voxmutatio::autograd::Tensor;
 namespace ag = voxmutatio::autograd;
@@ -349,6 +352,27 @@ TEST_CASE("Full GAN step (enc_q + flow + KL + disc) on real audio", "[gan][full]
   training::GANTrainer gan;
   REQUIRE(gan.init(g_path, d_path, 0, mcfg, 1e-4f, 1e-4f));
 
+  // The inference export must preserve the conditional Flow as well as decoder.
+  training::Flow original_flow;
+  REQUIRE(original_flow.init(g_path, 0));
+  const auto probe = Tensor::from_host(mp_seg, {192, Tseg}, false);
+  const auto original = original_flow.forward(probe, Tseg).to_host();
+  resonantia_test::ScopedArtifact exported(
+      resonantia_test::unique_artifact_path("gan-export", ".safetensors"));
+  REQUIRE(gan.export_model(g_path, exported.path().string()));
+  {
+    training::Flow zero_step;
+    REQUIRE(zero_step.init(exported.path().string(), 0));
+    const auto actual = zero_step.forward(probe, Tseg).to_host();
+    REQUIRE(actual.size() == original.size());
+    double error = 0, energy = 0;
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+      error += std::pow(actual[i] - original[i], 2);
+      energy += std::pow(original[i], 2);
+    }
+    CHECK(std::sqrt(error / energy) < 1e-4);
+  }
+
   float first_mel = 0.0f, last_mel = 0.0f;
   const int steps = 3;
   for (int it = 0; it < steps; ++it) {
@@ -367,4 +391,52 @@ TEST_CASE("Full GAN step (enc_q + flow + KL + disc) on real audio", "[gan][full]
   // Full posterior-path GAN must stay finite and stable (no divergence).
   CHECK(std::isfinite(last_mel));
   CHECK(last_mel < first_mel * 3.0f + 1.0f);
+
+  REQUIRE(gan.export_model(g_path, exported.path().string()));
+  training::Flow trained_flow;
+  REQUIRE(trained_flow.init(exported.path().string(), 0));
+  const auto trained = trained_flow.forward(probe, Tseg).to_host();
+  double changed = 0;
+  for (std::size_t i = 0; i < trained.size(); ++i)
+    changed += std::abs(trained[i] - original[i]);
+  CHECK(changed / trained.size() > 1e-5);
+
+  auto exported_config = scfg;
+  exported_config.model_path = exported.path().string();
+  synthesizer::Synthesizer reloaded;
+  REQUIRE(reloaded.init(exported_config));
+  const auto inverted = reloaded.debug_flow_reverse(trained.data(), Tseg, 0);
+  REQUIRE(inverted.size() == mp_seg.size());
+  double error = 0, energy = 0;
+  for (std::size_t i = 0; i < inverted.size(); ++i) {
+    error += std::pow(inverted[i] - mp_seg[i], 2);
+    energy += std::pow(mp_seg[i], 2);
+  }
+  CHECK(std::sqrt(error / energy) < 1e-3);
+  const auto harmonic = reloaded.debug_har(nsff0.data.data(), Tseg);
+  const auto expected_audio = gan.generator().decode(
+      probe, Tensor::from_host(harmonic, {1, Lseg}, false), Tseg).to_host();
+  const auto actual_audio = reloaded.debug_decode(mp_seg.data(), nsff0.data.data(), Tseg, 0);
+  REQUIRE(actual_audio.size() == expected_audio.size());
+  error = 0; energy = 0;
+  for (std::size_t i = 0; i < actual_audio.size(); ++i) {
+    REQUIRE(std::isfinite(actual_audio[i]));
+    error += std::pow(actual_audio[i] - expected_audio[i], 2);
+    energy += std::pow(expected_audio[i], 2);
+  }
+  CHECK(std::sqrt(error / energy) < 1e-3);
+  struct stat before {}, after {};
+  REQUIRE(::stat(exported.path().c_str(), &before) == 0);
+  CHECK_FALSE(gan.export_model("/tmp/resonantia-missing-generator.safetensors",
+                               exported.path().string()));
+  auto& parameter = gan.generator().params().front();
+  float first_value = 0;
+  parameter.n->data.copy_to_host(&first_value, 1);
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  parameter.n->data.copy_from_host(&nan, 1);
+  CHECK_FALSE(gan.export_model(g_path, exported.path().string()));
+  parameter.n->data.copy_from_host(&first_value, 1);
+  REQUIRE(::stat(exported.path().c_str(), &after) == 0);
+  CHECK(after.st_ino == before.st_ino);
+  CHECK(after.st_size == before.st_size);
 }

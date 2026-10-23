@@ -94,17 +94,18 @@ CLI 参数、默认值和错误行为见 [`docs/CLI.md`](docs/CLI.md) 与各命�
 
 ## 测试
 
-contract 不依赖被忽略的模型和数值 fixture。当前本地检查与 CI 使用以下受限选择：
+contract 不依赖被忽略的模型和数值 fixture。当前 CI 使用以下受限选择：
 
 ```bash
 ctest --test-dir build --output-on-failure --label-regex contract \
   --exclude-regex '^test_web_transaction_failure$' --parallel 1 --no-tests=error
 ```
 
-`test_web_transaction_failure` 的源码仍保留，但其 `rename` 符号拦截不在当前执行授权内，
-因此不执行，也不计为通过或 CTest skip。CI 的 push、PR 和手动入口均保留这一边界：
-PR 只运行仓库检查；进入设备测试作业的事件使用上述排除项。其事务故障注入覆盖仍未验证。
-其他 contract 检查继续保留；其中底层 CUDA 单元检查不等于真实模型、训练或 GPU 取消验收。
+CI 保留 `test_web_transaction_failure` 的历史排除配置：PR 只运行仓库检查，进入设备测试
+作业的事件使用上述排除项。本地完整测试可包含该用例；本轮全量执行范围与结果见
+[`specs/PROJECT_STATE.md`](specs/PROJECT_STATE.md)，不把 CI 未执行项计为通过。
+底层 CUDA 单元检查不等于真实模型、训练或 GPU 取消验收。Node.js 18+ 可用时另注册
+UI 认证与取消测试；它只用于测试，缺失时这两项明确不注册，不增加运行时依赖。
 
 模型、对齐、训练和端到端测试只有在声明资产存在时才注册：
 
@@ -116,6 +117,9 @@ cmake -S . -B build-model-tests \
 cmake --build build-model-tests --parallel 2
 ctest --test-dir build-model-tests --output-on-failure
 ```
+
+需要包含真实 120 秒 Web body deadline 门禁时，再配置
+`-DVOXMUTATIO_ENABLE_SLOW_WEB_TESTS=ON`；普通配置默认关闭此慢测试。
 
 缺资产、未注册或 skip 都不等于通过。当前测试数量、环境和完整结果只维护在
 [`specs/PROJECT_STATE.md`](specs/PROJECT_STATE.md)，避免 README 复制易过期数字。

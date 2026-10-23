@@ -14,6 +14,7 @@
 #include "voxmutatio/autograd/tensor.h"
 
 namespace voxmutatio::training {
+namespace detail { struct ExportTensor; }
 
 class GeneratorTrainer {
  public:
@@ -35,6 +36,9 @@ class GeneratorTrainer {
   [[nodiscard]] int upp() const { return 400; }
 
  private:
+  friend class GANTrainer;
+  bool export_with_weights(const std::string& src, const std::string& out,
+                           const std::vector<detail::ExportTensor>& additional);
   autograd::Tensor conv_pre_w_, conv_pre_b_;
   std::array<autograd::Tensor, 4> ups_w_, ups_b_;
   std::array<autograd::Tensor, 4> noise_w_, noise_b_;

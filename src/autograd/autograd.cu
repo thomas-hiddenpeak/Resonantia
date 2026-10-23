@@ -900,7 +900,8 @@ __global__ void k_sqrt_f(const float* x, float* o, int n) {
 }
 __global__ void k_sqrt_b(float* dx, const float* dy, const float* y, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) dx[i] += dy[i] * 0.5f / fmaxf(y[i], 1e-12f);
+  // The clamped branch (including the singular endpoint) uses zero subgradient.
+  if (i < n && y[i] > 0.0f) dx[i] += dy[i] * 0.5f / y[i];
 }
 __global__ void k_log_f(const float* x, float* o, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -908,7 +909,7 @@ __global__ void k_log_f(const float* x, float* o, int n) {
 }
 __global__ void k_log_b(float* dx, const float* dy, const float* x, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) dx[i] += dy[i] / fmaxf(x[i], 1e-12f);
+  if (i < n && x[i] > 1e-12f) dx[i] += dy[i] / x[i];
 }
 __global__ void k_abs_f(const float* x, float* o, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1239,7 +1240,8 @@ AdamW::AdamW(std::vector<Tensor> params, float lr, float beta1, float beta2,
     : params_(std::move(params)), lr_(lr), beta1_(beta1), beta2_(beta2),
       eps_(eps), wd_(weight_decay) {
   if (params_.empty() || !std::isfinite(lr_) || lr_ <= 0.0f ||
-      beta1_ < 0.0f || beta1_ >= 1.0f || beta2_ < 0.0f || beta2_ >= 1.0f ||
+      !std::isfinite(beta1_) || beta1_ < 0.0f || beta1_ >= 1.0f ||
+      !std::isfinite(beta2_) || beta2_ < 0.0f || beta2_ >= 1.0f ||
       !std::isfinite(eps_) || eps_ <= 0.0f || !std::isfinite(wd_) || wd_ < 0.0f)
     throw std::invalid_argument("invalid AdamW parameters");
   m_.resize(params_.size());
@@ -1255,6 +1257,12 @@ AdamW::AdamW(std::vector<Tensor> params, float lr, float beta1, float beta2,
 
 void AdamW::zero_grad() {
   for (auto& p : params_) p.n->ensure_grad();
+}
+
+void AdamW::set_lr(float lr) {
+  if (!std::isfinite(lr) || lr <= 0.0f)
+    throw std::invalid_argument("AdamW learning rate must be finite and positive");
+  lr_ = lr;
 }
 
 float AdamW::clip_grad_norm(float max_norm) {

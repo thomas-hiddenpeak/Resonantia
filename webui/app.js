@@ -20,7 +20,9 @@ function storeAuthToken(token) {
 }
 function requestAuthToken() {
     if (!authPromptPromise) {
-        authPromptPromise = Promise.resolve(window.prompt('此服务需要访问令牌：') || '');
+        authPromptPromise = Promise.resolve()
+            .then(() => window.prompt('此服务需要访问令牌：') || '')
+            .finally(() => { authPromptPromise = null; });
     }
     return authPromptPromise;
 }

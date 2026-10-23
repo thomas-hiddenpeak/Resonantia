@@ -39,9 +39,8 @@ class GANTrainer {
                          const std::vector<float>& m_p,
                          const std::vector<float>& logs_p, int T, int L);
 
-  bool export_model(const std::string& src, const std::string& out) {
-    return initialized_ && gen_.export_model(src, out);
-  }
+  /// Atomically export the trained decoder and Flow for inference; not a resume checkpoint.
+  bool export_model(const std::string& src, const std::string& out);
   GeneratorTrainer& generator() { return gen_; }
 
   /// RVC ExponentialLR: multiply both optimizers' LR by gamma (call per epoch).

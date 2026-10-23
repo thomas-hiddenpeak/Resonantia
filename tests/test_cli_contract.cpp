@@ -162,6 +162,29 @@ void append(std::vector<std::string>& destination,
     destination.insert(destination.end(), values.begin(), values.end());
 }
 
+void expect_batch_collision_rejected(const std::string& executable, const fs::path& root) {
+    const auto input = root / "collision-input";
+    const auto output = root / "collision-output";
+    fs::create_directories(input / "a");
+    fs::create_directories(input / "b");
+    fs::create_directories(output);
+    std::ofstream(input / "a" / "clip.wav") << "first input";
+    std::ofstream(input / "b" / "clip.WAV") << "second input";
+    std::ofstream(output / "clip.wav") << "existing output";
+    const std::vector<std::string> args = {
+        "--hubert", "missing-hubert", "--rmvpe", "missing-rmvpe", "--model", "missing-model",
+        "--input-dir", input.string(), "--output-dir", output.string(), "--recursive"};
+    expect_rejected("recursive batch basename collision before model loading", executable,
+                    args, "output path collision");
+    std::ifstream file(output / "clip.wav");
+    const std::string bytes((std::istreambuf_iterator<char>(file)), {});
+    if (bytes != "existing output" || std::distance(fs::directory_iterator(output),
+                                                   fs::directory_iterator{}) != 1) {
+        ++failures;
+        std::cerr << "FAIL batch collision changed output directory\n";
+    }
+}
+
 struct DependencyCase {
     std::string label;
     std::vector<std::string> arguments;
@@ -435,6 +458,7 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL could not create temporary directory\n";
         return 1;
     }
+    expect_batch_collision_rejected(batch, temp.path());
     {
         auto args = preprocess_required(temp.path());
         append(args, {"--sr", "forty-k"});

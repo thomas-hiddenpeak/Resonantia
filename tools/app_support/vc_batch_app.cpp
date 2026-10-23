@@ -12,6 +12,7 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "tools/app_support/cli_parse.h"
@@ -235,21 +236,6 @@ ParseStatus parse_vc_batch_options(int argc, char* const argv[],
 }
 
 int run_vc_batch(const VcBatchOptions& options) {
-    Device device;
-    if (auto err = device.init(options.config.device, options.config.gpu_device)) {
-        std::cerr << "CUDA init error: " << *err << "\n";
-        return 1;
-    }
-    std::cout << "Device: " << device.name() << "\n";
-
-    pipeline::VoiceConversionPipeline pipeline;
-    if (!pipeline.init(options.config)) {
-        std::cerr << "Pipeline init failed\n";
-        return 1;
-    }
-
-    fs::create_directories(options.output_dir);
-
     std::vector<std::string> audio_files;
     auto collect = [&](auto iterator) {
         for (const auto& entry : iterator) {
@@ -264,6 +250,33 @@ int run_vc_batch(const VcBatchOptions& options) {
     if (options.recursive) collect(fs::recursive_directory_iterator(options.input_dir));
     else collect(fs::directory_iterator(options.input_dir));
     std::sort(audio_files.begin(), audio_files.end());
+
+    // Keep the established flat output layout, but reject ambiguous plans before
+    // loading models or changing any output (including earlier noncolliding files).
+    std::unordered_map<std::string, std::string> destinations;
+    for (const auto& input : audio_files) {
+        const auto output = (fs::path(options.output_dir) /
+                             (fs::path(input).stem().string() + ".wav")).string();
+        const auto [it, inserted] = destinations.emplace(output, input);
+        if (!inserted) {
+            std::cerr << "error: output path collision: " << it->second << " and "
+                      << input << " map to " << output << "\n";
+            return 1;
+        }
+    }
+
+    Device device;
+    if (auto err = device.init(options.config.device, options.config.gpu_device)) {
+        std::cerr << "CUDA init error: " << *err << "\n";
+        return 1;
+    }
+    std::cout << "Device: " << device.name() << "\n";
+    pipeline::VoiceConversionPipeline pipeline;
+    if (!pipeline.init(options.config)) {
+        std::cerr << "Pipeline init failed\n";
+        return 1;
+    }
+    fs::create_directories(options.output_dir);
 
     std::cout << "Found " << audio_files.size() << " audio files\n";
     const bool use_bounded_file_path =

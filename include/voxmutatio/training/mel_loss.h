@@ -24,12 +24,15 @@ struct MelSpecConfig {
 /// (constant) DFT matrices, so log_mel() is a pure autograd graph over audio.
 class MelLoss {
  public:
+  /// Requires n_fft > 1, positive hop/n_mels/sample_rate, finite
+  /// 0 <= fmin < effective fmax <= Nyquist and representable matrix/band sizes.
+  /// Invalid configurations throw invalid_argument before use.
   explicit MelLoss(const MelSpecConfig& cfg);
 
-  /// Number of frames for a signal of length L (no center padding).
+  /// Number of frames for L >= 0 (no center padding); zero if L < n_fft.
   [[nodiscard]] int num_frames(int L) const;
 
-  /// Differentiable log-mel of audio [1, L] -> [T, n_mels].
+  /// Differentiable log-mel of audio [1, L] -> [T, n_mels], L >= n_fft.
   [[nodiscard]] autograd::Tensor log_mel(const autograd::Tensor& audio, int L) const;
 
   /// Constant target log-mel (host) from raw audio; sets out_T.

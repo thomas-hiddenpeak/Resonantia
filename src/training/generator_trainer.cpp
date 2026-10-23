@@ -16,6 +16,7 @@
 
 #include "voxmutatio/io/safetensors.h"
 #include "checked_weights.h"
+#include "export_weights.h"
 
 namespace voxmutatio::training {
 
@@ -178,23 +179,8 @@ ag::Tensor GeneratorTrainer::decode(const ag::Tensor& z, const ag::Tensor& har, 
 
 namespace {
 
-struct Entry {
-  std::string name;
-  std::vector<int> shape;
-  std::vector<float> data;
-};
-
-// Derive weight_norm (g, v) from a fused weight [out, inner]: g=||row||, v=row.
-void derive_wn(const std::vector<float>& fused, int out, int inner,
-               std::vector<float>& g, std::vector<float>& v) {
-  g.assign(out, 0.0f);
-  v = fused;
-  for (int o = 0; o < out; ++o) {
-    double n2 = 0.0;
-    for (int i = 0; i < inner; ++i) { float x = fused[o * inner + i]; n2 += (double)x * x; }
-    g[o] = static_cast<float>(std::sqrt(n2));
-  }
-}
+using Entry = detail::ExportTensor;
+using detail::derive_wn;
 
 bool write_safetensors(const std::string& path, const std::vector<Entry>& entries) {
   // Build JSON header with contiguous data offsets.
@@ -203,8 +189,15 @@ bool write_safetensors(const std::string& path, const std::vector<Entry>& entrie
   bool first = true;
   for (const auto& e : entries) {
     std::size_t n = 1;
-    for (int s : e.shape) n *= static_cast<std::size_t>(s);
+    for (int s : e.shape) {
+      if (s <= 0 || n > std::numeric_limits<std::size_t>::max() / s) return false;
+      n *= static_cast<std::size_t>(s);
+    }
+    if (n != e.data.size() || n > std::numeric_limits<std::size_t>::max() / sizeof(float))
+      return false;
+    for (float value : e.data) if (!std::isfinite(value)) return false;
     std::size_t bytes = n * sizeof(float);
+    if (offset > std::numeric_limits<std::size_t>::max() - bytes) return false;
     if (!first) json += ",";
     first = false;
     json += "\"" + e.name + "\":{\"dtype\":\"F32\",\"shape\":[";
@@ -217,6 +210,7 @@ bool write_safetensors(const std::string& path, const std::vector<Entry>& entrie
     offset += bytes;
   }
   json += "}";
+  json.append((8 - json.size() % 8) % 8, ' ');
 
   static_assert(std::endian::native == std::endian::little,
                 "safetensors F32 export requires a little-endian host");
@@ -263,6 +257,12 @@ bool write_safetensors(const std::string& path, const std::vector<Entry>& entrie
 }  // namespace
 
 bool GeneratorTrainer::export_model(const std::string& src, const std::string& out) {
+  return export_with_weights(src, out, {});
+}
+
+bool GeneratorTrainer::export_with_weights(
+    const std::string& src, const std::string& out,
+    const std::vector<detail::ExportTensor>& additional) try {
   if (!initialized_) return false;
   io::SafetensorsLoader L;
   if (!L.load(src)) return false;
@@ -272,6 +272,11 @@ bool GeneratorTrainer::export_model(const std::string& src, const std::string& o
   std::unordered_map<std::string, int> idx;
   for (const auto& name : L.tensor_names()) {
     const io::Tensor* t = L.get_tensor(name);
+    if (t->dtype != "F32" || t->data_nbytes % sizeof(float) != 0 ||
+        reinterpret_cast<std::uintptr_t>(L.data(name)) % alignof(float) != 0)
+      return false;
+    for (auto dimension : t->shape)
+      if (dimension <= 0 || dimension > std::numeric_limits<int>::max()) return false;
     std::size_t n = t->data_nbytes / sizeof(float);
     const auto* p = reinterpret_cast<const float*>(L.data(name));
     std::vector<int> shape(t->shape.begin(), t->shape.end());
@@ -330,8 +335,12 @@ bool GeneratorTrainer::export_model(const std::string& src, const std::string& o
     }
   }
   set(P + "conv_post.weight", {1, 32, 7}, conv_post_w_.to_host());
+  for (const auto& tensor : additional) set(tensor.name, tensor.shape, tensor.data);
 
   return write_safetensors(out, entries);
+} catch (const std::exception& error) {
+  std::fprintf(stderr, "GeneratorTrainer: export failed: %s\n", error.what());
+  return false;
 }
 
 }  // namespace voxmutatio::training

@@ -4,6 +4,9 @@
 #include "voxmutatio/training/mel_loss.h"
 
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace voxmutatio::training {
@@ -32,7 +35,17 @@ float mel_to_hz(float mel) {
 }  // namespace
 
 MelLoss::MelLoss(const MelSpecConfig& cfg) : cfg_(cfg) {
+  const double nyquist = static_cast<double>(cfg.sample_rate) / 2;
+  const double upper = cfg.fmax == 0 ? nyquist : cfg.fmax;
+  if (cfg.n_fft <= 1 || cfg.hop <= 0 || cfg.n_mels <= 0 || cfg.sample_rate <= 0 ||
+      cfg.n_mels > std::numeric_limits<int>::max() - 2 ||
+      !std::isfinite(cfg.fmin) || !std::isfinite(cfg.fmax) ||
+      cfg.fmin < 0 || cfg.fmax < 0 || cfg.fmin >= upper || upper > nyquist)
+    throw std::invalid_argument("invalid mel configuration or frequency range");
   n_freq_ = cfg_.n_fft / 2 + 1;
+  if (static_cast<std::int64_t>(cfg.n_fft) * n_freq_ > std::numeric_limits<int>::max() ||
+      static_cast<std::int64_t>(cfg.n_mels) * n_freq_ > std::numeric_limits<int>::max())
+    throw std::invalid_argument("mel matrix dimensions exceed kernel limits");
   int N = cfg_.n_fft, F = n_freq_;
   float fmax = cfg_.fmax > 0 ? cfg_.fmax : cfg_.sample_rate * 0.5f;
 
@@ -65,7 +78,11 @@ MelLoss::MelLoss(const MelSpecConfig& cfg) : cfg_(cfg) {
   for (int m = 0; m < M; ++m) {
     float lo = freqs[m + 1] - freqs[m];
     float hi = freqs[m + 2] - freqs[m + 1];
+    if (!(lo > 0) || !(hi > 0))
+      throw std::invalid_argument("mel frequency bands are not representable");
     float enorm = 2.0f / (freqs[m + 2] - freqs[m]);
+    if (!std::isfinite(enorm))
+      throw std::invalid_argument("mel filter normalization is not finite");
     for (int f = 0; f < F; ++f) {
       float l = (fftfreqs[f] - freqs[m]) / lo;
       float r = (freqs[m + 2] - fftfreqs[f]) / hi;
@@ -77,12 +94,17 @@ MelLoss::MelLoss(const MelSpecConfig& cfg) : cfg_(cfg) {
 }
 
 int MelLoss::num_frames(int L) const {
+  if (L < 0) throw std::invalid_argument("mel input length must be nonnegative");
   if (L < cfg_.n_fft) return 0;
   return (L - cfg_.n_fft) / cfg_.hop + 1;
 }
 
 ag::Tensor MelLoss::log_mel(const ag::Tensor& audio, int L) const {
   int T = num_frames(L);
+  if (T <= 0 || T > std::numeric_limits<int>::max() / cfg_.n_fft ||
+      T > std::numeric_limits<int>::max() / cfg_.n_mels ||
+      !audio.n || audio.shape() != std::vector<int>{1, L})
+    throw std::invalid_argument("mel audio must have shape [1, L] and at least one frame");
   auto frames = ag::frame(audio, T, cfg_.n_fft, cfg_.hop);   // [T, n_fft]
   auto re = ag::matmul(frames, cosw_);                       // [T, F]
   auto im = ag::matmul(frames, sinw_);                       // [T, F]
@@ -94,14 +116,24 @@ ag::Tensor MelLoss::log_mel(const ag::Tensor& audio, int L) const {
 
 std::vector<float> MelLoss::target_log_mel(const float* audio, int L,
                                            int& out_T) const {
-  out_T = num_frames(L);
+  const int frames = num_frames(L);
+  if (!audio || frames <= 0 || frames > std::numeric_limits<int>::max() / cfg_.n_fft ||
+      frames > std::numeric_limits<int>::max() / cfg_.n_mels)
+    throw std::invalid_argument("mel target requires audio and at least one frame");
   std::vector<float> host(audio, audio + L);
   auto a = ag::Tensor::from_host(host, {1, L}, false);
-  return log_mel(a, L).to_host();
+  auto result = log_mel(a, L).to_host();
+  out_T = frames;
+  return result;
 }
 
 ag::Tensor MelLoss::l1(const ag::Tensor& gen_logmel, const ag::Tensor& target_const,
                        int T) const {
+  if (T <= 0 || !gen_logmel.n || !target_const.n ||
+      gen_logmel.shape() != std::vector<int>{T, cfg_.n_mels} ||
+      target_const.shape() != gen_logmel.shape() ||
+      static_cast<std::int64_t>(T) * cfg_.n_mels > std::numeric_limits<int>::max())
+    throw std::invalid_argument("mel loss tensors must have matching [T, n_mels] shapes");
   auto neg = ag::scale(target_const, -1.0f);
   auto diff = ag::add(gen_logmel, neg);
   auto s = ag::sum(ag::abs_op(diff));

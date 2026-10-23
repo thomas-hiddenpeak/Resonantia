@@ -2,7 +2,7 @@
 
 **Feature Branch**: `002-voice-training`
 **Created**: 2026-08-07
-**Updated**: 2026-08-12
+**Updated**: 2026-10-24
 **Status**: **Experimental / Partially Complete**
 **Architecture**: C++/CUDA autograd, 40 kHz v2 fine-tuning path
 
@@ -41,6 +41,10 @@ optional, separate:
 当前导出只保证代码和测试覆盖的推理权重往返。它不等于已经证明新目标声线的主观质量、
 相似度或大数据集稳定性。
 
+完整 GAN 导出必须同时写入训练后的 decoder 与 Flow；训练时折叠进偏置的说话人条件
+在导出时扣除，weight norm 按推理布局重建。两个模块合并后只做一次原子发布。
+posterior encoder、判别器、optimizer/RNG 不属于推理导出契约；该文件仍不能用于等价续训。
+
 ## 3. User Scenarios
 
 ### Story 1 — 开发者运行 decoder 微调实验（P1，已实现）
@@ -76,7 +80,7 @@ mel/KL/feature-matching/adversarial 损失。训练 loss 必须有限，错误�
 | FR-006 | KL、feature matching、LSGAN、mel 的 G/D 交替 step | 已实现，实验性 |
 | FR-007 | WAV 数据发现、前端特征/F0、训练片段采样 | `vc_train` 内实现基线路径；非完整数据产品 |
 | FR-008 | 结构化进度 | 仅 CLI 文本 step/loss；稳定机器可读协议未定义 |
-| FR-009 | inference G safetensors 导出 | 已实现；临时文件 + rename 原子提交 |
+| FR-009 | inference G safetensors 导出 | decoder-only 导出 decoder；GAN 同时导出 decoder + Flow；临时文件 + rename 一次原子提交 |
 | FR-010 | 独立 Flat Index 构建 | `build_index` 按确定路径顺序构建，并以同目录 staging + fsync/close + rename 原子发布；仍未与 G 导出形成同一训练事务 |
 | FR-011 | 持久化 checkpoint 与断点续训 | **未实现** |
 | FR-012 | 旧 `FineTuneTrainer` 门面 | **不支持，必须失败** |
@@ -92,6 +96,16 @@ mel/KL/feature-matching/adversarial 损失。训练 loss 必须有限，错误�
 - checkpoint tensor 必须验证 dtype、shape、byte range、有限值和 weight norm。
 - `GeneratorTrainer`、`GANTrainer` 初始化采用失败回滚；失败后旧权重不可继续使用。
 - loss 非有限时不得更新或导出伪成功模型。
+- `sqrt(max(x,0))` 在 `x<=0`、`log(max(x,1e-12))` 在 `x<=1e-12` 的反向取零，
+  包括裁剪端点；其余区域使用对应数学导数，梯度门禁须覆盖裁剪区间。
+- AdamW 的 beta 必须有限且位于 `[0,1)`；学习率构造/更新都必须有限且大于零，
+  无效更新抛出 `invalid_argument` 并保留旧学习率。
+- MelLoss 要求 `n_fft>1`、正 hop/mels/sample_rate、有限的
+  `0<=fmin<effective_fmax<=Nyquist`（`fmax=0` 表示 Nyquist），并在分配/索引前检查
+  matrix/frame 尺寸。负长度、空目标、短于一帧的运算和不匹配的 loss shape 必须拒绝。
+- host/GPU 线性频谱使用实际 pad=`floor((n_fft-hop)/2)`，
+  T=`1+(L+2*pad-n_fft)/hop`；奇数 padding 差也必须一致。无完整帧或不可表示的尺寸拒绝，
+  不得以 `L/hop` 强行多读一帧。
 - 最终 G 导出使用同目录临时文件、精确 little-endian 写入、flush/close 后 rename；
   失败清理临时产物。
 - `build_index` 对输入 WAV 路径排序，最终 `.index` 使用唯一同目录 staging、`0666` + caller
@@ -100,6 +114,11 @@ mel/KL/feature-matching/adversarial 损失。训练 loss 必须有限，错误�
 - 功能集成使用真实 WAV；小型合成张量只用于算子梯度/边界测试。
 
 ## 6. Verified Evidence
+
+2026-10-24 新增默认 `test_training_contract`（频谱奇数 padding、MelLoss 配置/shape），
+补充 `test_autograd` 裁剪梯度及 AdamW 非有限边界，扩展 `test_gan` 完整训练后 Flow
+变化、零步条件还原、导出后 inverse/decoder 一致性和失败保留旧文件。
+本轮命令、失败基线及全量结果见 [PROJECT_STATE](../PROJECT_STATE.md)；以下为历史基线。
 
 加固前本地资产齐全的 2026-08-12 30/30 CTest（11 contract + 19 integration、0 fail，
 `Total Test time (real) = 356.41 sec`）中包含：
@@ -110,9 +129,9 @@ mel/KL/feature-matching/adversarial 损失。训练 loss 必须有限，错误�
 - discriminator、posterior/flow 和完整 GAN step；
 - GAN 初始化回滚与未初始化失败契约。
 
-当前 CMake 资产齐全配置已扩展为 39 个 distinct tests（16 contract-labelled、24
+当时 CMake 资产齐全配置已扩展为 39 个 distinct tests（16 contract-labelled、24
 integration-labelled，WavLM preflight label 重叠），并新增 `test_build_index_contract`；
-当前树的 fresh Release/SM87 全量已 39/39 通过（0 失败，1297.94 秒）。
+该历史树的 fresh Release/SM87 全量已 39/39 通过（0 失败，1297.94 秒）。
 旧 30/30 只保留为加固前历史，注册本身也不替代本次实际执行。
 
 这些证据说明训练代码会执行真实优化且关键数值/资源边界受测试，不证明：

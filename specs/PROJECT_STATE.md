@@ -1,6 +1,6 @@
 # Resonantia 项目状态
 
-**状态日期：2026-10-10（Web 硬化、训练取消与作业所有权host验证）；模型与全量集成基线为 2026-08-12**
+**状态日期：2026-10-24（八项审计修复；本轮验证记录见下文）**
 
 本文件是当前实现与验证结果的**描述性快照**，不是替代 feature spec 的规范来源。
 规格意图和需求归属见 [`specs/README.md`](README.md) 及各 feature spec；可执行边界以
@@ -8,6 +8,85 @@
 未来目标、历史研究结论和配置结构中的预留字段都不等于已支持能力。
 
 ## 验证基线
+
+### 2026-10-24 八项审计修复
+
+基于干净的 `main@7082b96`，修复完整 GAN 导出漏写 Flow、批处理同名覆盖、host 频谱奇数
+padding 越界、sqrt/log 裁剪梯度、MelLoss 配置与形状校验、AdamW 非有限 beta、Web token
+重试，以及 WavLM 完整长度/RMSE 门禁。批处理保留 flat 输出布局，冲突在 CUDA/模型加载及
+所有输出写入前返回非零；GAN 的 decoder + Flow 只做一次原子发布，不扩展 resume。
+
+回归证据：P1 三项新门禁在旧实现 **0/3 通过**，修复后 **3/3 通过，30.88 秒**；
+autograd/MelLoss 两项新门禁在修复前 **0/2 通过**；认证重试新测试在旧 JS 退出 1，
+修复后认证与既有取消 UI 测试均退出 0。WavLM 使用隔离目录内的真实参考变体（少一帧、
+全元素偏移 0.0005），不改原资产：旧二进制两项均退出 0；新二进制分别因完整 shape
+断言与 RMSE 断言失败（均退出 1，偏移用例 RMSE `0.0004999977`）。
+
+修复后 focused contract **5/5，4.41 秒**，真实模型 focused（WavLM、generator、GAN）
+**3/3，48.47 秒**，默认 asset-free contract **27/27，23.45 秒**，均无失败或跳过。
+对 `posterior_encoder.cpp`、`mel_loss.cpp` 和新 training contract 做 host ASan/UBSan
+插桩，**2 cases / 97 assertions 通过**；`detect_leaks=0`，不声称覆盖 CUDA device 内存或泄漏。
+
+本轮最终验证：全新 Release/SM87 configure + 全目标 build 成功；完整 CTest
+**52/52 通过、0 失败、0 跳过，1409.86 秒**，包含全部 24 项真实资产 integration 和
+122.06 秒的真实 Web body deadline 门禁。实际 label 为 29 contract / 24 integration /
+1 overlap；不是 53 项。WavLM 完整 224256 元素的 RMSE 为 `1.19736e-6`，门槛 `<1e-4`。
+详细日志未发现缺资产或内部 skip，52 个执行名称与注册清单逐项一致；本轮 20 个变更的
+代码/构建/测试文件 SHA-256 在测试前后完全相同。SDD **32 项通过**，`git diff --check` 通过。
+
+复现构建/测试命令（Orin / aarch64 / SM87，Release；GNU 13.3.0、CUDA 13.2.86、
+CMake 3.28.3；现有真实模型与 LibriSpeech/reference 资产，Node.js 18.19.1）：
+
+```bash
+cmake -S . -B /tmp/resonantia-fixes-20261024.wmLxjK \
+  -DCMAKE_BUILD_TYPE=Release -DVOXMUTATIO_CUDA_ARCHITECTURES=87 \
+  -DVOXMUTATIO_ENABLE_MODEL_TESTS=ON -DVOXMUTATIO_ENABLE_SLOW_WEB_TESTS=ON \
+  -DFETCHCONTENT_SOURCE_DIR_CATCH2=/home/rm01/Resonantia/build/_deps/catch2-src \
+  -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+nice -n 10 cmake --build /tmp/resonantia-fixes-20261024.wmLxjK --parallel 1
+nice -n 10 ctest --test-dir /tmp/resonantia-fixes-20261024.wmLxjK \
+  -R '^(test_autograd|test_training_contract|test_cli_contract|test_web_auth_ui|test_web_train_cancel_ui)$' \
+  --parallel 1 --output-on-failure --no-tests=error
+nice -n 10 ctest --test-dir /tmp/resonantia-fixes-20261024.wmLxjK \
+  -R '^(test_gan|test_generator_trainer|test_wavlm_alignment)$' \
+  --parallel 1 --output-on-failure --no-tests=error
+nice -n 10 ctest --test-dir /tmp/resonantia-fixes-20261024.wmLxjK \
+  -L contract -LE 'integration|slow' --parallel 1 --output-on-failure --no-tests=error
+nice -n 10 ctest --test-dir /tmp/resonantia-fixes-20261024.wmLxjK \
+  --parallel 1 --output-on-failure --no-tests=error
+bash scripts/check_sdd.sh
+git diff --check
+```
+
+host sanitizer 编译/运行命令（其余库使用上述 Release build）：
+
+```bash
+c++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+  -I include -I /usr/local/cuda/include -I build/_deps/catch2-src/src \
+  -I /tmp/resonantia-fixes-20261024.wmLxjK/_deps/catch2-build/generated-includes \
+  tests/test_training_contract.cpp src/training/posterior_encoder.cpp src/training/mel_loss.cpp \
+  /tmp/resonantia-fixes-20261024.wmLxjK/libvoxmutatio.a \
+  /tmp/resonantia-fixes-20261024.wmLxjK/_deps/catch2-build/src/libCatch2Main.a \
+  /tmp/resonantia-fixes-20261024.wmLxjK/_deps/catch2-build/src/libCatch2.a \
+  -L /usr/local/cuda/lib64 -Wl,-rpath,/usr/local/cuda/lib64 -lcudart -lcublas -lcufft -pthread \
+  -o /tmp/resonantia-fixes-20261024.wmLxjK/training-contract-sanitized
+ASAN_OPTIONS=detect_leaks=0 /tmp/resonantia-fixes-20261024.wmLxjK/training-contract-sanitized
+```
+
+本机证据目录 `/tmp/resonantia-fixes-20261024.wmLxjK` 保存 configure/build、red/green、
+focused/contract/full CTest、sanitizer、WavLM before/after 日志及测试注册清单。
+WavLM 负对照的工作目录为该目录下 `wavlm-controls/{truncated,error}/run`；分别执行
+`wavlm-before` 与本轮 `test_wavlm_alignment`，原始模型/fixture 只读引用。
+
+当前 Node 可用且 slow=OFF 时默认 asset-free 为 **27 项**，完整资产为 **51 distinct**
+（28 contract-labelled、24 integration-labelled、1 overlap）；slow=ON 再加 1 项真实
+120 秒 body deadline，总计 **52**。缺 Node 时两个 UI 测试明确不注册，不算通过；
+因此默认/full 数量分别减 2。以下日期化记录保留各自历史数量及当时授权边界。
+
+未扩大证据：训练音质/长期稳定性、resume、真实 GPU 取消和最终发布窗口、任意时长资源
+保证、非 SM87 平台及实时产品仍未验收；Spec 006 目标声线 model/Index 资格资产仍缺失。
+
+### 历史验证记录
 
 - 2026-10-10，基于本地/远端一致的`main@0955500`，新增`test_web_job_ownership`普通host门禁：
   上传自然校验拒绝/worker先于响应退休各配合正常响应/普通异常，**4/4确定性交错通过**。
@@ -197,7 +276,7 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
 崩溃/回滚异常或真实训练。固定Library源码v9/证据v10/计划v4保持不变，另存本轮增量和日志。
 
 
-- 当前 CMake 在资产齐全配置下注册 **45 个 distinct tests**：22 个带 `contract` label、
+- 2026-10-10 当时 CMake 在资产齐全配置下注册 **45 个 distinct tests**：22 个带 `contract` label、
   24 个带 `integration` label；`test_bounded_file_wavlm_preflight` 同时带两个 label，因此
   22+24 不是 distinct 总数。2026-08-12 的 fresh Release/SM87 build
   `/tmp/resonantia-nonrt-final.a8O1Ay` 已执行全部 39 项：**39/39 通过、0 失败**，
@@ -283,7 +362,7 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
 
 | Spec | 状态 | 说明 |
 |---|---|---|
-| 001 Voice Conversion Engine | bounded HuBERT file path 已实现 / 规格验证部分完成 | R1–R5、Index/VITS snapshot、代表性 CUDA failure gates 已纳入；真实 CLI callers 与当前 39/39 全量已通过；`vc_probe` 仍无产品验收 |
+| 001 Voice Conversion Engine | bounded HuBERT file path 已实现 / 规格验证部分完成 | R1–R5、Index/VITS snapshot、代表性 CUDA failure gates 已纳入；真实 CLI callers 已有资产门禁，本轮全量见验证基线；`vc_probe` 仍无产品验收 |
 | 002 Voice Training | 实验性 / 部分完成 | 可运行的 decoder/GAN 实验路径；无生产质量与 resume 保证 |
 | 003 WebUI | 实现存在 / 验证部分完成 | 默认开放、可选 token、严格参数、正数 Index rate fail-closed、显式 no-index、step work+marker/训练三产物事务、FD 隔离与四类 CLI 失败传播有 HTTP 门禁；资源/恶意输入矩阵仍缺 |
 | 004 Source Separation | runner 实现完成 / 实验性 | 模型集成、CLI model/task 拒绝和 Web step 事务有门禁；五任务质量/资产覆盖仍不完整 |

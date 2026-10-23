@@ -3,7 +3,7 @@
 **Feature Branch**: `001-voice-conversion-engine`
 **Created**: 2026-08-05
 **Status**: Offline baseline and bounded HuBERT file path implemented; specification verification partially complete
-**Scope date**: 2026-08-12
+**Scope date**: 2026-10-24（离线范围不变；批处理冲突与 WavLM 对齐门禁修复）
 
 ## 1. Scope
 
@@ -118,8 +118,19 @@ index rate、RMS mix 与 protect。任何保留但未实现的参数都应明确
 
 ## 6. Verification and Acceptance
 
+批处理输出继续采用 `output-dir/<stem>.wav`。不同输入映射到同一输出（包括递归子目录
+同名、`.wav`/`.WAV` 同 stem）时，`vc_batch` 必须在加载模型、创建输出目录或转换任一文件
+之前返回非零并说明冲突；已有输出必须保留，不得以多次成功掩盖覆盖。
+
+WavLM 对齐必须核验完整参考 shape `[frames, 768]`、完整 payload、输出长度及双方有限值，
+并断言全元素 normalized L2（RMSE）`<1e-4`；不得只比较共同前缀或只打印误差。
+配置后资产缺失必须使已注册测试失败，不能以普通 return 伪装通过。
+
+当前注册与本轮执行结果见 [PROJECT_STATE](../PROJECT_STATE.md)。以下数量和耗时为
+2026-08-12 的历史记录，不代表当前测试数量：
+
 默认无模型资产构建必须执行 contract 测试；模型与 fixture 齐全时，启用
-`VOXMUTATIO_ENABLE_MODEL_TESTS=ON` 执行 integration。当前 CMake 在资产齐全配置下注册
+`VOXMUTATIO_ENABLE_MODEL_TESTS=ON` 执行 integration。当时 CMake 在资产齐全配置下注册
 **39 个 distinct tests**：16 个带 `contract` label、24 个带 `integration` label；
 `test_bounded_file_wavlm_preflight` 同时带两个 label，因此 16+24 不能作为 distinct 总数。
 2026-08-12 的 fresh Release/SM87 build `/tmp/resonantia-nonrt-final.a8O1Ay` 已实际执行
@@ -153,9 +164,8 @@ Spec 001 产品范围，因此这些 focused 结果不足以把整个 001 规格
 
 ## 7. Success Criteria
 
-- **SC-001**：当前所有 16 个 contract-labelled tests 实际执行并通过；label overlap 必须按
-  distinct CTest 口径报告。当前树已以 39 distinct / 16 contract-labelled /
-  24 integration-labelled / 1 overlap 口径完成全量。
+- **SC-001**：当前所有已注册 contract tests 实际执行并通过；label overlap、Node.js UI
+  门禁和 slow 开关必须按实际配置报告，不能用历史测试数量代表当前树。
 - **SC-002**：资产齐全时所有被注册的模型集成测试实际执行并通过；缺资产时清楚列出
   未注册项。
 - **SC-003**：v1 256D 与 v2 768D 的版本/特征契约均有直接测试。
@@ -164,7 +174,7 @@ Spec 001 产品范围，因此这些 focused 结果不足以把整个 001 规格
 - **SC-005**：所有明确不支持组合稳定失败，而不是静默降级。
 - **SC-006（部分满足）**：`vc_convert`/`vc_batch` 的严格参数语法与非法退出码由默认 CLI
   进程 CTest 门控；两者的真实模型 HuBERT bounded 成功路径已注册资产门禁；WAV writer 的
-  成功替换与失败保留由默认 I/O 门禁覆盖，且它们已在当前 39/39 全量中通过。
+  成功替换与失败保留由默认 I/O 门禁覆盖；批处理路径冲突由默认 CLI 门禁覆盖。
   `vc_probe` 产品范围仍未决定。
 
 本规格不以某个固定延迟、吞吐倍数或显存数字作为已达成结论；性能基准必须另附硬件、
@@ -175,7 +185,7 @@ Spec 001 产品范围，因此这些 focused 结果不足以把整个 001 规格
 > 本节是 [ADR-0004](../../docs/adr/0004-bounded-offline-file-conversion.md) 的迁移契约与
 > current implementation status。R1–R4 已实现；R5 已把 HuBERT CLI/batch caller 切到
 > bounded API，WavLM 在匹配资产资格化前保留 legacy。旧 buffer/file API 仍在兼容窗口内，
-> 当前 Release/SM87 最终全量 CTest 已 39/39 通过。本迁移只属于 Spec 001，
+> 2026-08-12 历史 Release/SM87 全量 CTest 已 39/39 通过。本迁移只属于 Spec 001，
 > 不修改 Spec 006 realtime 范围。
 
 ### 8.1 Compatibility boundary

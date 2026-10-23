@@ -75,6 +75,7 @@ set(_contract_targets
     test_pipeline
     test_bounded_pipeline_dsp
     test_autograd
+    test_training_contract
 )
 foreach(target IN LISTS _contract_targets)
     resonantia_add_test_executable(${target} "${PROJECT_SOURCE_DIR}/tests/${target}.cpp")
@@ -108,6 +109,8 @@ target_include_directories(test_bounded_pipeline_dsp PRIVATE
 resonantia_register_test(test_bounded_pipeline_dsp test_bounded_pipeline_dsp
     LABELS "contract;pipeline;gpu" TIMEOUT 60)
 resonantia_register_test(test_autograd test_autograd LABELS "contract;gpu" TIMEOUT 180)
+resonantia_register_test(test_training_contract test_training_contract
+    LABELS "contract;training;gpu" TIMEOUT 60)
 
 # Recompile the two temporary-buffer CUDA operation files with a private test-only
 # failure seam. The production component objects never receive this definition.
@@ -279,6 +282,20 @@ target_include_directories(test_realtime_benchmark_report PRIVATE
 target_link_libraries(test_realtime_benchmark_report PRIVATE Catch2::Catch2WithMain)
 resonantia_register_test(test_realtime_benchmark_report test_realtime_benchmark_report
     LABELS "contract;realtime" TIMEOUT 30 NO_GPU_LOCK)
+
+# Node is a test-only dependency; the static WebUI has no Node build/runtime dependency.
+find_program(RESONANTIA_NODE_EXECUTABLE NAMES node nodejs)
+if(RESONANTIA_NODE_EXECUTABLE)
+    foreach(ui_test IN ITEMS test_web_auth_ui test_web_train_cancel_ui)
+        add_test(NAME ${ui_test}
+            COMMAND "${RESONANTIA_NODE_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/${ui_test}.cjs")
+        set_tests_properties(${ui_test} PROPERTIES
+            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/tests"
+            LABELS "contract;web;host" TIMEOUT 10)
+    endforeach()
+else()
+    message(WARNING "Node.js 18+ not found: UI auth/cancellation tests are not registered; coverage unverified")
+endif()
 
 if(NOT VOXMUTATIO_ENABLE_MODEL_TESTS)
     message(STATUS

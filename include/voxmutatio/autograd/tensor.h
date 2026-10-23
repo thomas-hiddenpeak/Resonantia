@@ -126,8 +126,8 @@ Tensor embedding(const Tensor& table, const std::vector<int>& idx, int dim);
 Tensor scale(const Tensor& x, float s);
 
 // ---- Elementwise math (for differentiable mel loss) ----
-Tensor sqrt_op(const Tensor& x);
-Tensor log_op(const Tensor& x);   // natural log
+Tensor sqrt_op(const Tensor& x);  // sqrt(max(x, 0)); zero subgradient at x <= 0
+Tensor log_op(const Tensor& x);   // log(max(x, 1e-12)); zero subgradient at x <= 1e-12
 Tensor abs_op(const Tensor& x);
 Tensor exp_op(const Tensor& x);
 /// Frame a 1D signal [L] into overlapping frames [T, n_fft]: f[t,n]=x[t*hop+n].
@@ -148,7 +148,8 @@ class AdamW {
   float clip_grad_norm(float max_norm);
   /// Zero all parameter gradients.
   void zero_grad();
-  void set_lr(float lr) { lr_ = lr; }
+  /// Requires finite lr > 0; invalid_argument leaves the previous rate unchanged.
+  void set_lr(float lr);
   [[nodiscard]] float lr() const { return lr_; }
   [[nodiscard]] int step_count() const { return t_; }
 

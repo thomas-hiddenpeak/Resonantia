@@ -1,6 +1,6 @@
 # Resonantia 架构设计与实现边界
 
-**状态日期：2026-08-12。** 本文记录当前实现，不把目标设计写成已经支持的能力。可执行入口和测试方法以仓库当前 `CMakeLists.txt`、CLI `--help` 与 CTest 注册为准。
+**状态日期：2026-10-24（八项审计修复；产品范围不变）。** 本文记录当前实现，不把目标设计写成已经支持的能力。可执行入口和测试方法以仓库当前 `CMakeLists.txt`、CLI `--help` 与 CTest 注册为准。
 
 本文是 SDD 的“当前实现视图”，不是独立的需求来源。规范性需求、状态证据和历史材料的权威层级及阅读路由见 [`../specs/README.md`](../specs/README.md)；需求到代码和测试的映射见 [`../specs/TRACEABILITY.md`](../specs/TRACEABILITY.md)。若本文与功能规格或可执行证据冲突，必须按 SDD 漂移处理并在同一变更中校准，不能静默选择其中一份。
 
@@ -115,6 +115,10 @@ allocation、model/I/O、CUDA、标准及未知内部异常并返回既定空/fa
 
 ### `pipeline/`
 
+`vc_batch` 先冻结输入列表并检查 flat 输出映射；不同输入映射到同一
+`output-dir/<stem>.wav` 时在 CUDA/模型加载和任何输出写入之前返回冲突错误。
+这覆盖递归目录同名和扩展名大小写冲突，保留原有非冲突文件的输出布局。
+
 编排 HuBERT/WavLM、RMVPE/FCPE、可选 Index 和 Synthesizer，负责 protect、RMS、分块与拼接。
 仅接受 CUDA FP32/F0/40 kHz 契约。`index_rate > 0` 时，Index 缺失、feature width 不匹配或
 lookup failure 均显式失败，不静默旁路检索。
@@ -150,6 +154,16 @@ click/transient 边界指标；这些限制不能被 `>0.98` phase-invariant spe
 
 ### `training/`
 
+GAN 推理导出把 trained Flow 与 decoder 的权重合并到同一个 safetensors staging，再一次
+rename 发布；WaveNet/decoder 扣除初始化时折叠的 speaker condition，fused weight norm
+还原为 g/v（零行用 g=0、非零单位 v 表示）。失败保留旧文件；这仍不保存 enc_q/D/optimizer
+训练状态，不支持 resume。模块内的 `export_weights.h` 只定义私有 staging 类型及转换，
+不新增公共方法、持久化格式或运行依赖。
+
+默认 training contract 覆盖 host/GPU 频谱在奇数 padding 差下的帧数一致性，以及 MelLoss
+正参数、有限频段、尺寸乘积、输入/loss shape 校验。autograd 的 sqrt/log 裁剪分支及端点
+采用零梯度，AdamW beta 和学习率更新拒绝非有限值；真实 GAN 导出由模型门禁复验。
+
 存在 CUDA autograd、AdamW、mel loss、生成器微调、后验编码器、flow 和多周期判别器/GAN 路径。`vc_train` 可执行这些实验性训练路径，但尚无生产训练稳定性、数据规模或音质保证。公共 `FineTuneTrainer` 门面尚未实现，必须返回不支持，不能用空循环伪装成功。
 
 ### `separation/`
@@ -160,6 +174,10 @@ click/transient 边界指标；这些限制不能被 `>0.98` phase-invariant spe
 每个 CUDA 中间 activation 做全设备扫描，也不构成生产音质保证。
 
 ### WebUI / `vc_serve`
+
+浏览器认证只共享尚未完成的 token 提示 Promise，结束后清除；首次输错/取消或服务端
+token 轮换后可再次输入。token 仍限于 tab 的 sessionStorage/内存；默认开放模式不提示。
+Node 的 mock fetch 测试覆盖并发提示、后续重试、轮换及 storage 不可用，不等同于浏览器视觉验收。
 
 前端是无构建步骤的 HTML/CSS/JavaScript。`vc_serve` 使用 POSIX socket 提供静态文件与
 API，并以子进程调用 CLI。内部进程适配器用 argv 直接启动程序，不经过 shell；它合并并
@@ -298,9 +316,12 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
    子进程与真实 HTTP socket 测试。
 2. 可选 `integration`：配置 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON`；只有所需资产存在的用例才进入 CTest。
 
-测试内部“找不到文件就 return”不是可信的通过证据，因此 CMake 在注册前检查资产。当前
-slow选项OFF的资产齐全配置现注册 45 个 distinct tests：22 contract-labelled、24 integration-labelled；
-`test_bounded_file_wavlm_preflight` 同时属于两类。2026-08-12 的 fresh Release/SM87
+测试内部“找不到文件就 return”不是可信的通过证据，因此 CMake 在注册前检查资产；WavLM
+还在运行时检查完整参考 shape/payload、双方有限值及全元素 RMSE `<1e-4`。
+Node.js 18+ 可用、slow=OFF 时默认27项、资产齐全51 distinct（28 contract-labelled、24
+integration-labelled、1 overlap）；slow=ON 加1项真实 body deadline，共52项。缺 Node
+时 UI 认证/取消两项明确不注册，数量减2；Node 只用于测试，不是 WebUI 构建/运行依赖。
+当前执行结果见 `specs/PROJECT_STATE.md`。2026-08-12 的 fresh Release/SM87
 build `/tmp/resonantia-nonrt-final.a8O1Ay` 已实际执行并通过 39/39（0 失败，
 `Total Test time (real) = 1297.94 sec`）。加固前 Release/SM87 30/30（11 contract +
 19 integration，356.41 秒）只保留为历史基线。新增门禁包括 bounded

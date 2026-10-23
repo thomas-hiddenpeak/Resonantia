@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "voxmutatio/training/gan_trainer.h"
+#include "export_weights.h"
 
 #include <cmath>
 #include <chrono>
@@ -14,6 +15,16 @@
 #include <cuda_runtime.h>
 
 namespace voxmutatio::training {
+
+bool GANTrainer::export_model(const std::string& src, const std::string& out) {
+  if (!initialized_) return false;
+  try {
+    return gen_.export_with_weights(src, out, flow_.export_weights());
+  } catch (const std::exception& error) {
+    std::fprintf(stderr, "GANTrainer: export failed: %s\n", error.what());
+    return false;
+  }
+}
 
 namespace ag = voxmutatio::autograd;
 

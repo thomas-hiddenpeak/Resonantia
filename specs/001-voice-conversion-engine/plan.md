@@ -2,7 +2,7 @@
 
 **Branch**: `001-voice-conversion-engine`
 **Status**: Offline pipeline, bounded HuBERT callers, and full-suite verification complete; specification still partial because `vc_probe` has no product acceptance
-**Updated**: 2026-08-12
+**Updated**: 2026-10-24
 
 ## Current Delivery
 
@@ -33,6 +33,7 @@ WAV -> 16 kHz front-end -> HuBERT(default) -> optional Flat Index
 
 - [x] HuBERT 默认路径：v1 256D、v2 768D。
 - [x] WavLM 可选实现与资产门控对齐；要求匹配训练的 synthesizer。
+- [x] WavLM 全 shape/payload/有限值检查与全元素 RMSE `<1e-4` 断言。
 - [x] RMVPE 默认实现；算子临时 device allocation 使用 RAII buffer。
 - [x] FCPE 可选实现与资产门控对齐。
 - [x] PM 保留枚举但在 pipeline 明确拒绝。
@@ -60,11 +61,12 @@ WAV -> 16 kHz front-end -> HuBERT(default) -> optional Flat Index
 - [x] WAV 目标文件同目录 staged write + `fsync`/close + atomic rename；失败保留旧目标并
   清理 staging。
 - [x] CPU、FP16、formant shift、非 WAV、独立 target sample rate 的失败契约。
+- [x] `vc_batch` 在模型加载和输出写入前检查平铺输出路径冲突，失败保留既有输出。
 
 ### P5 — Verification
 
-- [x] 当前 CMake 资产齐全配置注册 39 个 distinct tests（16 contract-labelled、24
-  integration-labelled；WavLM preflight 同时属于两类）；fresh Release/SM87 当前工作树
+- [x] 2026-08-12 历史 CMake 资产齐全配置注册 39 个 distinct tests（16 contract-labelled、24
+  integration-labelled；WavLM preflight 同时属于两类）；当时 fresh Release/SM87 工作树
   已 39/39 通过（0 失败，1297.94 秒）。
 - [x] 加固前 30/30（11 contract + 19 integration、356.41 秒）保留为历史基线，不替代
   当前变更证据。
@@ -77,8 +79,8 @@ WAV -> 16 kHz front-end -> HuBERT(default) -> optional Flat Index
   HuBERT bounded 路由和成功 40 kHz WAV。
 - [ ] `vc_probe` 的产品验收；当前仍是骨架。
 
-注册和 focused 通过本身不等于 39/39；当前树已另行完成全量，但 `vc_probe` 等规格
-缺口仍使 001 保持 specification verification partially complete。
+注册和 focused 通过本身不等于完整测试通过；当前配置、执行命令与结果见
+[PROJECT_STATE](../PROJECT_STATE.md)。`vc_probe` 等规格缺口仍使 001 保持 partially complete。
 
 ## Current Constraints
 
@@ -145,7 +147,7 @@ qualified HuBERT callers；WavLM 保持 legacy。
   WavLM 保留 legacy。两点资源证据须与代码 hard bounds 一起解释，且没有独立 click 阈值。
 - [x] **P6-R6 compatibility/SDD**：本次已同步 DESIGN、TRACEABILITY、PROJECT_STATE、API/CLI
   文档并通过 32-file SDD/link gate；旧 `convert_file` 未 deprecated，是否增加 legacy hard cap 另行
-  批准。当前 39 项 asset-free/model integration 已在 fresh Release/SM87 合入门禁中全部通过。
+  批准。当时 39 项 asset-free/model integration 已在 fresh Release/SM87 合入门禁中全部通过。
 
 实施面包括公共 additive API、private bounded I/O/pipeline seam、共享 caller policy、DSP/
 resource/model/CLI 门禁。公共配置、旧 API 和 WAV 格式未改变；以后改变 legacy hard cap、返回

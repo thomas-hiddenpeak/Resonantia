@@ -5,6 +5,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -13,6 +15,7 @@
 #include "voxmutatio/io/safetensors.h"
 #include "voxmutatio/separation/stft.h"
 #include "checked_weights.h"
+#include "export_weights.h"
 
 namespace voxmutatio::training {
 
@@ -37,10 +40,16 @@ std::vector<float> compute_spec_host(const float* audio, int L, int n_fft, int h
   }
   const int pad = (n_fft - hop) / 2;
   const int nfreq = n_fft / 2 + 1;
-  const int T = L / hop;
+  const std::int64_t padded = static_cast<std::int64_t>(L) + 2LL * pad;
+  if (padded < n_fft || padded > std::numeric_limits<int>::max() ||
+      static_cast<std::int64_t>(nfreq) * n_fft > std::numeric_limits<int>::max())
+    throw std::invalid_argument("host spectrogram dimensions are invalid");
+  const int T = 1 + (padded - n_fft) / hop;
+  if (static_cast<std::int64_t>(nfreq) * T > std::numeric_limits<int>::max())
+    throw std::invalid_argument("host spectrogram output dimensions overflow");
   out_T = T;
 
-  std::vector<float> y(L + 2 * pad);
+  std::vector<float> y(static_cast<std::size_t>(padded));
   for (int i = 0; i < L; ++i) y[pad + i] = audio[i];
   for (int j = 0; j < pad; ++j) {
     y[pad - 1 - j] = audio[std::min(j + 1, L - 1)];        // reflect left
@@ -129,6 +138,7 @@ void WaveNet::load(const io::SafetensorsLoader& L, const std::string& prefix,
     ly.rs_ch = rs_ch;
     staged.layers_.push_back(std::move(ly));
   }
+  staged.folded_condition_ = std::move(cond);
   staged.initialized_ = true;
   params_out.insert(params_out.end(), staged_params.begin(), staged_params.end());
   *this = std::move(staged);
@@ -156,6 +166,23 @@ ag::Tensor WaveNet::forward(const ag::Tensor& x_in, int T) const {
     }
   }
   return output;
+}
+
+void WaveNet::append_export(std::vector<detail::ExportTensor>& entries,
+                            const std::string& prefix) const {
+  if (!initialized_) throw std::logic_error("WaveNet is not initialized");
+  for (std::size_t i = 0; i < layers_.size(); ++i) {
+    const auto& layer = layers_[i];
+    const auto in = prefix + ".in_layers." + std::to_string(i);
+    const auto rs = prefix + ".res_skip_layers." + std::to_string(i);
+    detail::append_weight_norm(entries, in, layer.in_w);
+    auto bias = layer.in_b.to_host();
+    for (std::size_t c = 0; c < bias.size(); ++c)
+      bias[c] -= folded_condition_.at(i * bias.size() + c);
+    entries.push_back({in + ".bias", layer.in_b.shape(), std::move(bias)});
+    detail::append_weight_norm(entries, rs, layer.rs_w);
+    detail::append_plain(entries, rs + ".bias", layer.rs_b);
+  }
 }
 
 bool PosteriorEncoder::init(const std::string& path, int speaker_id) {
@@ -250,6 +277,21 @@ ag::Tensor Flow::forward(const ag::Tensor& z, int T) const {
     x = ag::flip_rows(x, inter, T);
   }
   return x;
+}
+
+std::vector<detail::ExportTensor> Flow::export_weights() const {
+  if (!initialized_) throw std::logic_error("Flow is not initialized");
+  std::vector<detail::ExportTensor> entries;
+  for (std::size_t i = 0; i < couplings_.size(); ++i) {
+    const auto prefix = "model.flow.flows." + std::to_string(2 * i) + ".";
+    const auto& coupling = couplings_[i];
+    detail::append_plain(entries, prefix + "pre.weight", coupling.pre_w);
+    detail::append_plain(entries, prefix + "pre.bias", coupling.pre_b);
+    coupling.wn.append_export(entries, prefix + "enc");
+    detail::append_plain(entries, prefix + "post.weight", coupling.post_w);
+    detail::append_plain(entries, prefix + "post.bias", coupling.post_b);
+  }
+  return entries;
 }
 
 }  // namespace voxmutatio::training

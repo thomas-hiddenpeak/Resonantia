@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -17,6 +18,42 @@
 
 using voxmutatio::autograd::Tensor;
 namespace ag = voxmutatio::autograd;
+
+TEST_CASE("Clamped log and sqrt have zero plateau gradients", "[autograd][bounds][gradcheck]") {
+  auto x = Tensor::from_host({-4.0f, 0.0f, 4.0f}, {3}, true);
+  auto root = ag::sqrt_op(x);
+  REQUIRE(root.to_host() == std::vector<float>{0, 0, 2});
+  ag::backward(ag::sum(root));
+  CHECK(x.grad_to_host() == std::vector<float>{0, 0, 0.25f});
+
+  auto small = Tensor::from_host({-1.0f, 0.0f, 1e-13f, 1e-12f, 1.0f}, {5}, true);
+  auto logarithm = ag::log_op(small);
+  for (auto value : logarithm.to_host()) REQUIRE(std::isfinite(value));
+  ag::backward(ag::sum(logarithm));
+  CHECK(small.grad_to_host() == std::vector<float>{0, 0, 0, 0, 1});
+  const auto left = ag::log_op(Tensor::from_host({0.9e-13f}, {1})).to_host()[0];
+  const auto right = ag::log_op(Tensor::from_host({1.1e-13f}, {1})).to_host()[0];
+  CHECK((right - left) / 2e-14f == small.grad_to_host()[2]);
+}
+
+TEST_CASE("AdamW rejects non-finite betas and invalid learning-rate updates", "[autograd][bounds]") {
+  auto parameter = Tensor::from_host({1.0f}, {1}, true);
+  const auto nan = std::numeric_limits<float>::quiet_NaN();
+  const auto inf = std::numeric_limits<float>::infinity();
+  for (float beta : {nan, inf, -inf, -0.1f, 1.0f}) {
+    CHECK_THROWS_AS(ag::AdamW({parameter}, 0.01f, beta, 0.99f), std::invalid_argument);
+    CHECK_THROWS_AS(ag::AdamW({parameter}, 0.01f, 0.9f, beta), std::invalid_argument);
+  }
+  ag::AdamW optimizer({parameter}, 0.01f);
+  for (float lr : {nan, inf, -inf, 0.0f, -1.0f}) {
+    CHECK_THROWS_AS(optimizer.set_lr(lr), std::invalid_argument);
+    CHECK(optimizer.lr() == 0.01f);
+  }
+  optimizer.set_lr(0.02f);
+  ag::backward(ag::sum(parameter));
+  optimizer.step();
+  CHECK(std::abs(parameter.to_host()[0] - 0.98f) < 1e-6f);
+}
 
 namespace {
 

@@ -2,7 +2,7 @@
 
 **Feature**: `003-webui`
 **Created from implementation**: 2026-08-09
-**Updated**: 2026-10-10
+**Updated**: 2026-10-24
 **Status**: Implementation present; acceptance partially verified; deployment/training experimental
 
 ## 1. Scope
@@ -64,7 +64,10 @@ Bearer token 只保护 `/api/` 路径；静态 Web 资源仍可公开读取。�
 - **FR-001 Static UI**：无 Node/npm 构建依赖，静态 HTML/CSS/JS 可由 `vc_serve` 提供。
 - **FR-002 Configurable bind**：允许配置 IPv4 host/port，默认 `0.0.0.0:8080`。
 - **FR-003 Optional auth**：token 非空时，对所有 `/api/` 请求执行 constant-time Bearer
-  token 比较；默认不启用认证。
+  token 比较；默认不启用认证。浏览器只共享尚未完成的 token 提示，首次输错/取消或
+  token 轮换后，后续请求必须允许重新输入；已完成的提示结果不得永久缓存。
+  `test_web_auth_ui` 以生产 JS 验证重试、并发提示共享、轮换及 sessionStorage 失败回退；
+  Node.js 18+ 仅用于可选的测试运行，不增加 WebUI 构建或服务运行依赖。
 - **FR-004 WAV-only upload**：文件名扩展名必须为 `.wav`，内容必须具有 RIFF/WAVE
   signature；重复或不安全文件名失败。
 - **FR-005 CLI orchestration**：GPU 操作调用已构建 CLI，不在 HTTP worker 内嵌模型。

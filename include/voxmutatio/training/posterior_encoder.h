@@ -16,9 +16,12 @@
 namespace voxmutatio::io { class SafetensorsLoader; }
 
 namespace voxmutatio::training {
+namespace detail { struct ExportTensor; }
 
 /// Linear-magnitude spectrogram matching VITS (reflect pad (n_fft-hop)/2,
-/// Hann window). Returns [n_freq, T] (freq-major), sets out_T = L/hop.
+/// Hann window). Returns [n_freq, T] (freq-major), where
+/// T = 1 + (L + 2*floor((n_fft-hop)/2) - n_fft)/hop (L/hop for even n_fft-hop).
+/// Rejects configurations with no complete frame or unrepresentable dimensions.
 /// GPU cuFFT path (validated bit-close to compute_spec_host, rel err ~1e-7).
 std::vector<float> compute_spec(const float* audio, int L, int n_fft, int hop,
                                 int& out_T);
@@ -44,8 +47,12 @@ class WaveNet {
   autograd::Tensor forward(const autograd::Tensor& x, int T) const;
 
  private:
+  friend class Flow;
+  void append_export(std::vector<detail::ExportTensor>& entries,
+                      const std::string& prefix) const;
   int hidden_ = 0, kernel_ = 0;
   std::vector<WNLayer> layers_;
+  std::vector<float> folded_condition_;
   bool initialized_ = false;
 };
 
@@ -80,6 +87,8 @@ class Flow {
   std::vector<autograd::Tensor>& params() { return params_; }
 
  private:
+  friend class GANTrainer;
+  std::vector<detail::ExportTensor> export_weights() const;
   struct Coupling {
     autograd::Tensor pre_w, pre_b, post_w, post_b;
     WaveNet wn;

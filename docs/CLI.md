@@ -70,6 +70,10 @@ process working set 由配置、模型、Index 和固定 halo 约束，临时磁
 检查最终退出码。程序会输出所选的 `bounded HuBERT` 或 `legacy WavLM` file path；该文本
 用于诊断，自动化仍应以退出码和最终 WAV 校验为准。
 
+批量输出保持 `output-dir/<stem>.wav` 的平铺布局。若不同输入映射到同一输出，例如
+递归目录的 `a/voice.wav` 和 `b/voice.wav`，整个批次在模型加载及任何输出写入前失败，
+并列出冲突路径。请先重命名冲突输入或分批指定输出目录；不会自动选择一个文件覆盖。
+
 实验训练的推荐编排是：
 
 ```text
@@ -77,6 +81,8 @@ vc_preprocess -> vc_train -> build_index
 ```
 
 便捷脚本是 `scripts/train_voice.sh`。这条路径没有 checkpoint resume 或生产音质保证。
+decoder 模式导出训练后的 decoder；`--gan` 模式同时导出训练后的 decoder 与 Flow，
+合并为一个原子发布的推理 safetensors。它不保存 posterior/D/optimizer 恢复状态。
 分离模型名称必须存在于 registry 且与请求 task 匹配；未知、缺失默认或错任务模型会在
 加载权重前失败。
 
