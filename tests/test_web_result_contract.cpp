@@ -28,7 +28,18 @@ namespace fs = std::filesystem;
 using namespace resonantia::web;
 using namespace std::chrono_literals;
 
-const std::string kWav = "RIFFxxxxWAVEsynthetic-result";
+// A complete tiny PCM fixture: successful cleanup now crosses the native audio
+// reader before conversion. Magic bytes alone are intentionally insufficient.
+const std::string kWav = [] {
+    std::string bytes = "RIFF";
+    const auto le = [&](unsigned value, int width) {
+        while (width--) { bytes += static_cast<char>(value & 255); value >>= 8; }
+    };
+    le(44,4); bytes += "WAVEfmt "; le(16,4); le(1,2); le(1,2);
+    le(40000,4); le(80000,4); le(2,2); le(16,2); bytes += "data"; le(8,4);
+    le(0,2); le(100,2); le(65436,2); le(0,2);
+    return bytes;
+}();
 void require(bool ok, const std::string& message) {
     if (!ok) throw std::runtime_error(message);
 }

@@ -11,8 +11,15 @@
 #include <concepts>
 #include <ostream>
 #include <string_view>
+#include "voxmutatio/core/types.h"
 
 namespace voxmutatio::cli {
+
+inline bool parse_synthesis_mode(std::string_view value, SynthesisMode& mode) {
+    if (value == "sampled") { mode = SynthesisMode::kSampled; return true; }
+    if (value == "mean") { mode = SynthesisMode::kMean; return true; }
+    return false;
+}
 
 inline const char* option_value(int argc, char* const argv[], int& index,
                                 std::string_view option, std::ostream& error) {

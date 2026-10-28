@@ -5,6 +5,10 @@ file(MAKE_DIRECTORY "${_resonantia_test_output_dir}")
 
 include("${PROJECT_SOURCE_DIR}/cmake/ResonantiaCatch2.cmake")
 
+add_executable(test_joint_run_state "${PROJECT_SOURCE_DIR}/tests/test_joint_run_state.cpp")
+target_include_directories(test_joint_run_state PRIVATE "${PROJECT_SOURCE_DIR}")
+target_link_libraries(test_joint_run_state PRIVATE Catch2::Catch2WithMain)
+
 function(resonantia_add_test_executable target source)
     add_executable(${target} ${source})
     target_link_libraries(${target} PRIVATE
@@ -54,6 +58,13 @@ function(resonantia_register_test name target)
     endif()
 endfunction()
 
+resonantia_register_test(test_joint_run_state test_joint_run_state
+    LABELS "contract;training;host" TIMEOUT 30 NO_GPU_LOCK)
+resonantia_add_test_executable(test_joint_cache "${PROJECT_SOURCE_DIR}/tests/test_joint_cache.cpp")
+target_include_directories(test_joint_cache PRIVATE "${PROJECT_SOURCE_DIR}")
+resonantia_register_test(test_joint_cache test_joint_cache
+    LABELS "contract;training;host" TIMEOUT 30 NO_GPU_LOCK)
+
 set(_contract_targets
     test_core
     test_audio_io
@@ -64,12 +75,15 @@ set(_contract_targets
     test_bounded_pipeline_dsp
     test_autograd
     test_training_contract
+    test_joint_training
+    test_synth_ops
 )
 foreach(target IN LISTS _contract_targets)
     resonantia_add_test_executable(${target} "${PROJECT_SOURCE_DIR}/tests/${target}.cpp")
 endforeach()
 
 resonantia_register_test(test_core test_core LABELS "contract;gpu" TIMEOUT 60)
+resonantia_register_test(test_joint_training test_joint_training LABELS "contract;gpu;training" TIMEOUT 60)
 resonantia_register_test(test_audio_io test_audio_io LABELS "contract;gpu" TIMEOUT 60)
 
 # The private bounded file seam is deliberately host-only. Compile its source
@@ -88,6 +102,7 @@ resonantia_register_test(test_bounded_audio_io test_bounded_audio_io
 
 resonantia_register_test(test_content_kernels test_content_kernels
                          LABELS "contract;gpu" TIMEOUT 60)
+target_include_directories(test_f0 PRIVATE "${PROJECT_SOURCE_DIR}/src")
 resonantia_register_test(test_f0 test_f0 LABELS "contract;gpu" TIMEOUT 60)
 resonantia_register_test(test_index test_index LABELS "contract;gpu" TIMEOUT 60)
 resonantia_register_test(test_pipeline_smoke test_pipeline TEST_SPEC "~[contract]"
@@ -99,6 +114,9 @@ resonantia_register_test(test_bounded_pipeline_dsp test_bounded_pipeline_dsp
 resonantia_register_test(test_autograd test_autograd LABELS "contract;gpu" TIMEOUT 180)
 resonantia_register_test(test_training_contract test_training_contract
     LABELS "contract;training;gpu" TIMEOUT 60)
+target_include_directories(test_synth_ops PRIVATE "${PROJECT_SOURCE_DIR}/src")
+resonantia_register_test(test_synth_ops test_synth_ops
+    LABELS "contract;synth;gpu" TIMEOUT 60)
 
 # Recompile the two temporary-buffer CUDA operation files with a private test-only
 # failure seam. The production component objects never receive this definition.
@@ -114,10 +132,11 @@ target_compile_options(test_cuda_failure PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--use_fast_math;-Xptxas=-O3>)
 target_include_directories(test_cuda_failure PRIVATE
     "${PROJECT_SOURCE_DIR}/include"
+    "${PROJECT_SOURCE_DIR}/src"
     "${PROJECT_SOURCE_DIR}/tests"
 )
 target_link_libraries(test_cuda_failure PRIVATE
-    CUDA::cudart Catch2::Catch2WithMain)
+    CUDA::cudart CUDA::cublas Catch2::Catch2WithMain)
 resonantia_register_test(test_cuda_failure test_cuda_failure
     LABELS "contract;gpu;cuda-failure" TIMEOUT 60)
 
@@ -207,6 +226,22 @@ target_link_libraries(test_web_process_contract PRIVATE resonantia_web_support)
 resonantia_register_test(test_web_process_contract test_web_process_contract
     LABELS "contract;web;host" TIMEOUT 10 NO_GPU_LOCK)
 
+resonantia_add_process_test_executable(test_web_audio_upload
+    "${PROJECT_SOURCE_DIR}/tests/test_web_audio_upload.cpp")
+target_link_libraries(test_web_audio_upload PRIVATE resonantia_web_support)
+resonantia_register_test(test_web_audio_upload test_web_audio_upload
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+# Explicit opt-in: FFmpeg codec availability is a deployment dependency, not
+# a prerequisite for the asset-free host suite or the CUDA model tests.
+option(RESONANTIA_ENABLE_AUDIO_CODEC_TESTS "Test Web codecs with FFmpeg and real speech" OFF)
+if(RESONANTIA_ENABLE_AUDIO_CODEC_TESTS)
+    find_program(RESONANTIA_FFMPEG_EXECUTABLE ffmpeg REQUIRED)
+    resonantia_register_test(test_web_audio_codecs test_web_audio_upload
+        ARGS "${RESONANTIA_FFMPEG_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/fixtures/speech_00.wav"
+        ASSETS "${PROJECT_SOURCE_DIR}/tests/fixtures/speech_00.wav"
+        LABELS "integration;web;host;codec" TIMEOUT 60 NO_GPU_LOCK)
+endif()
+
 resonantia_add_process_test_executable(test_web_result_contract
     "${PROJECT_SOURCE_DIR}/tests/test_web_result_contract.cpp")
 target_link_libraries(test_web_result_contract PRIVATE resonantia_web_support)
@@ -269,6 +304,7 @@ add_executable(vc_train_entry_exception_fixture
     "${PROJECT_SOURCE_DIR}/tools/vc_train.cpp"
     "${PROJECT_SOURCE_DIR}/tests/vc_train_entry_exception_fixture.cpp")
 target_link_libraries(vc_train_entry_exception_fixture PRIVATE resonantia_training_control)
+target_include_directories(vc_train_entry_exception_fixture PRIVATE "${PROJECT_SOURCE_DIR}/include")
 resonantia_add_process_test_executable(test_vc_train_entry
     "${PROJECT_SOURCE_DIR}/tests/test_vc_train_entry.cpp")
 target_link_libraries(test_vc_train_entry PRIVATE resonantia_web_support)
@@ -296,7 +332,7 @@ resonantia_register_test(test_realtime_benchmark_report test_realtime_benchmark_
 # Node is a test-only dependency; the static WebUI has no Node build/runtime dependency.
 find_program(RESONANTIA_NODE_EXECUTABLE NAMES node nodejs)
 if(RESONANTIA_NODE_EXECUTABLE)
-    foreach(ui_test IN ITEMS test_web_auth_ui test_web_train_cancel_ui)
+    foreach(ui_test IN ITEMS test_web_auth_ui test_web_train_cancel_ui test_web_audio_ui test_web_joint_ui)
         add_test(NAME ${ui_test}
             COMMAND "${RESONANTIA_NODE_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/${ui_test}.cjs")
         set_tests_properties(${ui_test} PROPERTIES
@@ -327,6 +363,7 @@ set(_model_targets
     test_mel_loss
     test_generator_trainer
     test_gan
+    test_joint_training_models
     test_separation
     test_vits_stream_characterization
 )
@@ -334,6 +371,7 @@ foreach(target IN LISTS _model_targets)
     resonantia_add_test_executable(${target} "${PROJECT_SOURCE_DIR}/tests/${target}.cpp")
 endforeach()
 target_include_directories(test_rmvpe_alignment PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_include_directories(test_joint_training_models PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_include_directories(test_fcpe_alignment PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_include_directories(test_long_audio_chunking PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(test_separation PRIVATE CUDA::cufft)
@@ -379,13 +417,15 @@ resonantia_register_test(test_hubert_inference test_hubert_inference
            "${FIXTURES}/hubert_ref_v1_final256.bin")
 resonantia_register_test(test_rmvpe_alignment test_rmvpe_alignment
     LABELS "integration;model;gpu" TIMEOUT 300
-    ASSETS "${RMVPE}" "${SPEECH}" "${FIXTURES}/rmvpe_ref_salience.bin"
-           "${FIXTURES}/rmvpe_ref_f0.bin")
+    ASSETS "${RMVPE}" "${SPEECH}" "${FIXTURES}/rmvpe_htk_salience.bin"
+           "${FIXTURES}/rmvpe_htk_f0.bin")
 resonantia_register_test(test_vits_alignment test_vits_alignment
     LABELS "integration;model;gpu" TIMEOUT 600
     ASSETS "${G_V2}" "${FIXTURES}/vits_ref_phone.bin" "${FIXTURES}/vits_ref_pitch.bin"
            "${FIXTURES}/vits_ref_m_p.bin" "${FIXTURES}/vits_ref_z.bin"
-           "${FIXTURES}/vits_ref_nsff0.bin" "${FIXTURES}/vits_ref_audio.bin")
+           "${FIXTURES}/vits_ref_nsff0.bin" "${FIXTURES}/vits_ref_audio.bin"
+           "${FIXTURES}/e2e_htk_nsff0.bin" "${FIXTURES}/e2e_htk_pitch.bin"
+           "${FIXTURES}/vits_sampled_audio.bin")
 resonantia_register_test(test_vits_gen_debug test_vits_gen_debug
     LABELS "integration;model;gpu;debug" TIMEOUT 600
     ASSETS "${G_V2}" "${FIXTURES}/vits_ref_nsff0.bin" "${FIXTURES}/vits_ref_har.bin"
@@ -395,7 +435,7 @@ resonantia_register_test(test_vits_gen_debug test_vits_gen_debug
 resonantia_register_test(test_e2e_conversion test_e2e_conversion
     LABELS "integration;model;gpu" TIMEOUT 900
     ASSETS "${HUBERT}" "${RMVPE}" "${G_V2}" "${SPEECH}"
-           "${FIXTURES}/vits_ref_audio.bin")
+           "${FIXTURES}/e2e_htk_audio.bin" "${FIXTURES}/vits_sampled_audio.bin")
 resonantia_register_test(test_long_audio_chunking test_long_audio_chunking
     LABELS "integration;model;gpu;long" TIMEOUT 1200
     ASSETS "${HUBERT}" "${RMVPE}" "${G_V2}" "${SPEECH}")
@@ -430,12 +470,47 @@ resonantia_register_test(test_mel_loss test_mel_loss
 resonantia_register_test(test_generator_trainer test_generator_trainer
     LABELS "integration;training;model;gpu" TIMEOUT 1800
     ASSETS "${G_V2}" "${SPEECH}" "${FIXTURES}/vits_ref_z.bin"
-           "${FIXTURES}/vits_ref_nsff0.bin" "${FIXTURES}/vits_ref_audio.bin")
+           "${FIXTURES}/vits_ref_nsff0.bin" "${FIXTURES}/vits_ref_audio.bin"
+           "${FIXTURES}/vits_sampled_z.bin" "${FIXTURES}/vits_sampled_audio.bin"
+           "${FIXTURES}/e2e_htk_nsff0.bin")
 resonantia_register_test(test_gan test_gan
     LABELS "integration;training;model;gpu" TIMEOUT 1800
     ASSETS "${G_V2}" "${D_V2}" "${SPEECH}" "${FIXTURES}/vits_ref_z.bin"
            "${FIXTURES}/vits_ref_nsff0.bin" "${FIXTURES}/vits_ref_m_p.bin"
            "${FIXTURES}/vits_ref_logs_p.bin")
+
+resonantia_register_test(test_joint_model_contract test_joint_training_models TEST_SPEC "[model-contract]"
+    LABELS "integration;training;model;gpu" TIMEOUT 120 ASSETS "${G_V2}" "${D_V2}")
+set(_joint_assets "${G_V2}" "${D_V2}" "${FIXTURES}/joint_training/reference.json")
+foreach(name phone pitch f0 spec target eps nsf prior_mean prior_logs posterior_mean posterior_logs posterior_z flow_z audio)
+    list(APPEND _joint_assets "${FIXTURES}/joint_training/${name}.bin")
+endforeach()
+foreach(side G D)
+    foreach(kind value gradient first second)
+        list(APPEND _joint_assets "${FIXTURES}/joint_training/${side}_${kind}.safetensors")
+    endforeach()
+endforeach()
+resonantia_register_test(test_joint_numerical test_joint_training_models TEST_SPEC "[numerical]"
+    LABELS "integration;training;model;numerical;gpu" TIMEOUT 300 ASSETS ${_joint_assets})
+resonantia_register_test(test_joint_resume test_joint_training_models TEST_SPEC "[resume]"
+    LABELS "integration;training;model;numerical;gpu" TIMEOUT 300 ASSETS ${_joint_assets})
+resonantia_add_test_executable(test_joint_full_cli "${PROJECT_SOURCE_DIR}/tests/test_joint_full_cli.cpp")
+target_include_directories(test_joint_full_cli PRIVATE "${PROJECT_SOURCE_DIR}")
+target_link_libraries(test_joint_full_cli PRIVATE resonantia_web_support)
+add_dependencies(test_joint_full_cli vc_train)
+resonantia_register_test(test_joint_full_cli test_joint_full_cli
+    LABELS "integration;training;model;gpu" TIMEOUT 480
+    ASSETS "${HUBERT}" "${RMVPE}" "${G_V2}" "${D_V2}" "${SPEECH}")
+if(TEST test_joint_full_cli)
+    set_property(TEST test_joint_full_cli APPEND PROPERTY ENVIRONMENT
+        "RESONANTIA_VC_TRAIN=$<TARGET_FILE:vc_train>")
+endif()
+set(_joint_kernel_assets)
+foreach(name ups.0 ups.1 ups.2 ups.3 resblocks.8.convs1.2 resblocks.11.convs2.2)
+    list(APPEND _joint_kernel_assets "${FIXTURES}/joint_training_kernels/${name}.safetensors")
+endforeach()
+resonantia_register_test(test_joint_kernel_gradients test_joint_training_models TEST_SPEC "[kernel-gradient]"
+    LABELS "integration;training;numerical;gpu" TIMEOUT 120 ASSETS ${_joint_kernel_assets})
 
 resonantia_register_test(test_separation_stft test_separation TEST_SPEC "[stft]"
     LABELS "integration;fixture;gpu" TIMEOUT 300 ASSETS "${SPEECH}")

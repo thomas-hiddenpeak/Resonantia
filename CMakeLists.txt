@@ -56,8 +56,13 @@ function(resonantia_add_component target)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     )
     target_compile_options(${target} PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--use_fast_math;-Xptxas=-O3>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-Xptxas=-O3>
     )
+    # Training gradients need correctly rounded divide/sqrt and full-precision
+    # transcendental functions. Inference components retain their existing flags.
+    if(NOT target STREQUAL "resonantia_autograd_obj")
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    endif()
 endfunction()
 
 resonantia_add_component(resonantia_core_obj
@@ -106,6 +111,7 @@ target_link_libraries(resonantia_f0_obj PRIVATE
 resonantia_add_component(resonantia_index_obj
     src/index/cuda_flat_index.cpp
 )
+target_link_libraries(resonantia_index_obj PRIVATE Threads::Threads)
 
 resonantia_add_component(resonantia_synthesizer_obj
     src/synthesizer/synthesizer.cpp
@@ -116,6 +122,7 @@ target_link_libraries(resonantia_synthesizer_obj PRIVATE
     resonantia_cuda_ops_obj
     resonantia_io_obj
     CUDA::cudart
+    CUDA::cublas
 )
 
 resonantia_add_component(resonantia_separation_obj
@@ -146,6 +153,7 @@ resonantia_add_component(resonantia_training_obj
     src/training/discriminator.cpp
     src/training/fine_tuning.cpp
     src/training/gan_trainer.cpp
+    src/training/joint_trainer.cpp
     src/training/generator_trainer.cpp
     src/training/mel_loss.cpp
     src/training/posterior_encoder.cpp
@@ -243,6 +251,7 @@ target_link_libraries(resonantia_training_control PUBLIC Threads::Threads)
 
 resonantia_add_app_support(resonantia_vc_train_app_support
     tools/app_support/vc_train_app.cpp)
+target_sources(resonantia_vc_train_app_support PRIVATE tools/app_support/joint_full_training.cpp)
 target_link_libraries(resonantia_vc_train_app_support PRIVATE resonantia_training_control)
 
 add_library(resonantia_web_support STATIC

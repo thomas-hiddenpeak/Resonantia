@@ -74,6 +74,7 @@ void print_usage(std::ostream& output) {
         "  --deecho-model <n>    De-echo model name (default: deecho_roformer)\n"
         "  --denoise-model <n>   De-noise model name (default: denoise_roformer)\n"
         "  --no-slice         Apply separation only; write full-length files (no slicing)\n"
+        "  --preserve-stereo  Preserve L/R for cleanup (requires --no-slice --sr 44100)\n"
         "  --vad              Slice on Silero-VAD speech regions (smart slicing)\n"
         "  --vad-thresh <f>   VAD speech probability threshold (default: 0.5)\n"
         "  --vad-dir <path>   VAD model dir (default: models/vad)\n"
@@ -159,6 +160,8 @@ ParseStatus parse_vc_preprocess_options(int argc, char* const argv[],
             options.denoise_model = value;
         } else if (argument == "--no-slice") {
             options.no_slice = true;
+        } else if (argument == "--preserve-stereo") {
+            options.preserve_stereo = true;
         } else if (argument == "--vad") {
             options.vad = true;
         } else if (argument == "--vad-thresh") {
@@ -199,6 +202,11 @@ ParseStatus parse_vc_preprocess_options(int argc, char* const argv[],
 }
 
 int run_vc_preprocess(const VcPreprocessOptions& options) {
+    if (options.preserve_stereo && (!options.no_slice || options.trim || options.vad ||
+                                    options.sample_rate != 44100)) {
+        std::cerr << "error: --preserve-stereo requires --no-slice --sr 44100 without trim/VAD\n";
+        return 1;
+    }
     std::vector<std::string> files;
     if (fs::is_directory(options.input)) {
         for (const auto& entry : fs::directory_iterator(options.input)) {
@@ -321,6 +329,36 @@ int run_vc_preprocess(const VcPreprocessOptions& options) {
     int dropped = 0;
     int readable = 0;
     for (const auto& file : files) {
+        if (options.preserve_stereo) {
+            auto loaded = io::read_stereo_audio(file);
+            if (!loaded || loaded->frames() == 0) {
+                std::cerr << "error: stereo input invalid or exceeds 600 seconds / 128 MiB\n";
+                return 1;
+            }
+            const int count = static_cast<int>(loaded->frames());
+            std::vector<float> planar(loaded->data.size());
+            for (int i = 0; i < count; ++i) {
+                planar[i] = loaded->data[2*i]; planar[count+i] = loaded->data[2*i+1];
+            }
+            for (auto* stage : {vocal_separator.get(), deharmonizer.get(), dereverberator.get(),
+                                deechoer.get(), denoiser.get()}) {
+                if (!stage) continue;
+                planar = stage->separate_stereo(planar, count);
+                if (planar.size() != loaded->data.size()) {
+                    std::cerr << "error: stereo cleanup changed frame count\n"; return 1;
+                }
+            }
+            for (int i = 0; i < count; ++i) {
+                loaded->data[2*i] = planar[i]; loaded->data[2*i+1] = planar[count+i];
+            }
+            const auto output = fs::path(options.output_dir) / (fs::path(file).stem().string() + ".wav");
+            if (!io::write_stereo_audio(output.string(), loaded->data.data(), count, 44100, true)) {
+                std::cerr << "error: stereo write failed\n"; return 1;
+            }
+            ++readable; ++total;
+            std::cout << "  " << fs::path(file).filename().string() << " -> stereo processed\n";
+            continue;
+        }
         auto loaded = io::read_audio(file, options.sample_rate);
         if (!loaded) {
             std::cerr << "skip (read failed): " << file << "\n";

@@ -6,6 +6,7 @@
 #include <catch2/catch_approx.hpp>
 
 #include "voxmutatio/f0/rmvpe.h"
+#include "f0/rmvpe_frontend.h"
 #include "voxmutatio/f0/fcpe.h"
 #include "test_artifacts.h"
 
@@ -183,4 +184,38 @@ TEST_CASE("F0 extractors reject invalid configuration and public input",
     CHECK(fcpe.infer(nullptr, 0).empty());
     CHECK(fcpe.compute_mel(nullptr, 0, frames).empty());
     CHECK(frames == 0);
+}
+
+TEST_CASE("RMVPE frontend uses HTK spacing with Slaney area normalization",
+          "[f0][frontend][contract]") {
+    const auto basis = voxmutatio::f0::detail::rmvpe_mel_basis();
+    REQUIRE(basis.size() == 128 * 513);
+    // Independent goldens from upstream RVC/librosa 0.11.0 (htk=True).
+    // Bands span the spectrum; normalization must not become peak-normalization.
+    struct Golden { int band; int bin; float weight; };
+    const Golden expected[] = {
+        {0, 3, 0.0567850396f}, {1, 4, 0.0503917262f},
+        {15, 19, 0.0409837179f}, {32, 43, 0.0318208821f},
+        {64, 118, 0.0201660637f}, {100, 280, 0.00963796210f},
+        {127, 501, 0.00586089073f},
+    };
+    for (const auto& value : expected) {
+        CAPTURE(value.band, value.bin);
+        CHECK(basis[value.band * 513 + value.bin] ==
+              Catch::Approx(value.weight).margin(1e-8));
+    }
+    for (int band = 0; band < 128; ++band) {
+        double sum = 0.0;
+        for (int bin = 0; bin < 513; ++bin) {
+            const float value = basis[band * 513 + bin];
+            REQUIRE(std::isfinite(value));
+            REQUIRE(value >= 0.0f);
+            sum += value;
+        }
+        CHECK(sum > 0.05);
+        CHECK(sum < 0.08);
+        CHECK(basis[band * 513] == 0.0f);
+        // Inverting the HTK endpoint can land a few ulps above 8000 Hz.
+        CHECK(basis[band * 513 + 512] == Catch::Approx(0.0f).margin(1e-12));
+    }
 }

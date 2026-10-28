@@ -107,7 +107,7 @@ bool validate_format(const WavFormat& format) {
 }
 
 bool read_wav(const std::string& path, std::vector<float>& samples,
-              int& sample_rate, SampleFormat& source_format) {
+              int& sample_rate, SampleFormat& source_format, bool stereo = false) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return false;
 
@@ -115,6 +115,7 @@ bool read_wav(const std::string& path, std::vector<float>& samples,
     const std::streamoff stream_size = file.tellg();
     if (stream_size < 12) return false;
     const auto file_size = static_cast<std::uint64_t>(stream_size);
+    if (stereo && file_size > (128u << 20)) return false;
     if (!seek_to(file, 0)) return false;
 
     std::array<std::uint8_t, 12> riff {};
@@ -181,34 +182,40 @@ bool read_wav(const std::string& path, std::vector<float>& samples,
     }
 
     const std::size_t frame_count = data_size / format.block_align;
+    if (stereo && (format.channels > 2 ||
+        frame_count > static_cast<std::uint64_t>(format.sample_rate) * 600)) return false;
     if (frame_count > samples.max_size() || data_size > std::vector<std::uint8_t>().max_size()) {
         return false;
     }
     std::vector<std::uint8_t> encoded(data_size);
     if (!seek_to(file, data_offset) || !read_exact(file, encoded.data(), encoded.size())) return false;
 
-    samples.assign(frame_count, 0.0f);
+    samples.assign(frame_count * (stereo ? 2 : 1), 0.0f);
     const std::size_t bytes_per_sample = format.bits_per_sample / 8;
     for (std::size_t frame = 0; frame < frame_count; ++frame) {
         double mono = 0.0;
         const std::size_t frame_offset = frame * format.block_align;
         for (std::size_t channel = 0; channel < format.channels; ++channel) {
+            double decoded = 0;
             const std::uint8_t* value = encoded.data() + frame_offset + channel * bytes_per_sample;
             if (format.audio_format == kPcm) {
                 const auto bits = read_u16_le(value);
                 const std::int32_t pcm = bits >= 0x8000U
                     ? static_cast<std::int32_t>(bits) - 0x10000
                     : static_cast<std::int32_t>(bits);
-                mono += static_cast<double>(pcm) / 32768.0;
+                decoded = static_cast<double>(pcm) / 32768.0;
             } else {
                 const std::uint32_t bits = read_u32_le(value);
                 float sample = 0.0f;
                 std::memcpy(&sample, &bits, sizeof(sample));
                 if (!std::isfinite(sample)) return false;
-                mono += sample;
+                decoded = sample;
             }
+            mono += decoded;
+            if (stereo) samples[frame * 2 + channel] = static_cast<float>(decoded);
         }
-        samples[frame] = static_cast<float>(mono / format.channels);
+        if (!stereo) samples[frame] = static_cast<float>(mono / format.channels);
+        else if (format.channels == 1) samples[frame * 2 + 1] = samples[frame * 2];
     }
 
     sample_rate = static_cast<int>(format.sample_rate);
@@ -252,7 +259,7 @@ struct WavOutputLayout {
 };
 
 bool validate_wav_output(const float* samples, int num_samples, int sample_rate,
-                         WavOutputLayout& layout) {
+                         WavOutputLayout& layout, int channels = 1, bool float32 = false) {
     if (num_samples < 0 || sample_rate <= 0 || (num_samples > 0 && samples == nullptr)) {
         return false;
     }
@@ -261,7 +268,8 @@ bool validate_wav_output(const float* samples, int num_samples, int sample_rate,
     }
 
     std::uint64_t data_bytes = 0;
-    if (!checked_mul(static_cast<std::uint64_t>(num_samples), sizeof(std::int16_t), data_bytes) ||
+    const unsigned width = float32 ? 4 : 2;
+    if (!checked_mul(static_cast<std::uint64_t>(num_samples), width, data_bytes) ||
         data_bytes > std::numeric_limits<std::uint32_t>::max()) {
         return false;
     }
@@ -270,7 +278,7 @@ bool validate_wav_output(const float* samples, int num_samples, int sample_rate,
         riff_size > std::numeric_limits<std::uint32_t>::max()) {
         return false;
     }
-    const std::uint64_t byte_rate = static_cast<std::uint64_t>(sample_rate) * sizeof(std::int16_t);
+    const std::uint64_t byte_rate = static_cast<std::uint64_t>(sample_rate) * width * channels;
     if (byte_rate > std::numeric_limits<std::uint32_t>::max()) return false;
 
     layout.data_bytes = static_cast<std::uint32_t>(data_bytes);
@@ -346,17 +354,18 @@ private:
 };
 
 bool write_wav_contents(int fd, const float* samples, int num_samples,
-                        int sample_rate, const WavOutputLayout& layout) {
+                        int sample_rate, const WavOutputLayout& layout,
+                        int channels = 1, bool float32 = false) {
     if (!write_bytes(fd, "RIFF", 4) ||
         !write_u32_le(fd, layout.riff_size) ||
         !write_bytes(fd, "WAVEfmt ", 8) ||
         !write_u32_le(fd, 16) ||
-        !write_u16_le(fd, kPcm) ||
-        !write_u16_le(fd, 1) ||
+        !write_u16_le(fd, float32 ? kIeeeFloat : kPcm) ||
+        !write_u16_le(fd, channels) ||
         !write_u32_le(fd, static_cast<std::uint32_t>(sample_rate)) ||
         !write_u32_le(fd, layout.byte_rate) ||
-        !write_u16_le(fd, sizeof(std::int16_t)) ||
-        !write_u16_le(fd, 16) ||
+        !write_u16_le(fd, channels * (float32 ? 4 : 2)) ||
+        !write_u16_le(fd, float32 ? 32 : 16) ||
         !write_bytes(fd, "data", 4) ||
         !write_u32_le(fd, layout.data_bytes)) {
         return false;
@@ -365,6 +374,17 @@ bool write_wav_contents(int fd, const float* samples, int num_samples,
     std::array<std::uint8_t, kPcmWriteBufferBytes> encoded {};
     std::size_t encoded_size = 0;
     for (int i = 0; i < num_samples; ++i) {
+        if (float32) {
+            std::uint32_t bits;
+            std::memcpy(&bits, samples + i, sizeof bits);
+            for (unsigned shift = 0; shift < 32; shift += 8)
+                encoded[encoded_size++] = static_cast<std::uint8_t>(bits >> shift);
+            if (encoded_size == encoded.size()) {
+                if (!write_bytes(fd, encoded.data(), encoded_size)) return false;
+                encoded_size = 0;
+            }
+            continue;
+        }
         const float sample = std::clamp(samples[i], -1.0f, 1.0f);
         const auto pcm = static_cast<std::uint16_t>(
             static_cast<std::int16_t>(sample * 32767.0f));
@@ -379,11 +399,11 @@ bool write_wav_contents(int fd, const float* samples, int num_samples,
 }
 
 bool write_wav(const std::string& path, const float* samples,
-               int num_samples, int sample_rate) try {
+               int num_samples, int sample_rate, int channels = 1, bool float32 = false) try {
     if (path.empty() || path.find('\0') != std::string::npos) return false;
 
     WavOutputLayout layout;
-    if (!validate_wav_output(samples, num_samples, sample_rate, layout)) return false;
+    if (!validate_wav_output(samples, num_samples, sample_rate, layout, channels, float32)) return false;
 
     const std::filesystem::path target(path);
     if (target.filename().empty()) return false;
@@ -391,7 +411,7 @@ bool write_wav(const std::string& path, const float* samples,
     if (parent.empty()) parent = ".";
     StagedFile staged(parent);
     if (!staged.valid() ||
-        !write_wav_contents(staged.fd(), samples, num_samples, sample_rate, layout)) {
+        !write_wav_contents(staged.fd(), samples, num_samples, sample_rate, layout, channels, float32)) {
         return false;
     }
     return staged.commit(path);
@@ -400,6 +420,35 @@ bool write_wav(const std::string& path, const float* samples,
 }
 
 }  // namespace
+
+std::optional<StereoAudioBuffer> read_stereo_audio(const std::string& path, int target_sr) try {
+    if (target_sr < 8000 || target_sr > 192000) return std::nullopt;
+    StereoAudioBuffer buffer;
+    SampleFormat format;
+    if (!read_wav(path, buffer.data, buffer.sample_rate, format, true)) return std::nullopt;
+    if (buffer.sample_rate != target_sr && !buffer.data.empty()) {
+        std::vector<float> left(buffer.frames()), right(buffer.frames());
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            left[i] = buffer.data[2*i]; right[i] = buffer.data[2*i+1];
+        }
+        left = resample_linear(left.data(), static_cast<int>(left.size()), buffer.sample_rate, target_sr);
+        right = resample_linear(right.data(), static_cast<int>(right.size()), buffer.sample_rate, target_sr);
+        if (left.empty() || left.size() != right.size()) return std::nullopt;
+        buffer.data.resize(left.size() * 2);
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            buffer.data[2*i] = left[i]; buffer.data[2*i+1] = right[i];
+        }
+    }
+    buffer.sample_rate = target_sr;
+    return buffer;
+} catch (...) { return std::nullopt; }
+
+bool write_stereo_audio(const std::string& path, const float* samples, int frames,
+                        int sample_rate, bool float32) {
+    if (sample_rate < 8000 || sample_rate > 192000 || frames < 0 ||
+        frames > sample_rate * 600 || frames > std::numeric_limits<int>::max()/2) return false;
+    return write_wav(path, samples, frames * 2, sample_rate, 2, float32);
+}
 
 std::optional<AudioBuffer> read_audio(const std::string& path, int target_sr) try {
     if (target_sr <= 0) return std::nullopt;

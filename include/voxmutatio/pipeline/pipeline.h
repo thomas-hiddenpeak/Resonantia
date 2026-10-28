@@ -101,7 +101,8 @@ private:
     /// coarse-pitch → VITS. Timing is accumulated into `timing`.
     AudioBuffer synth_segment(const float* seg16k, int segn,
                               const float* f0_slice, const std::uint8_t* uv_slice,
-                              int f0_len, int speaker_id, VCResult& timing);
+                              int f0_len, int speaker_id, VCResult& timing,
+                              std::uint64_t sampling_frame_offset = 0);
 
     /// Long-audio path: high-pass + reflect-pad the whole clip, compute F0 once
     /// (global pitch consistency), split at silence minima, convert each chunk via

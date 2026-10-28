@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -21,6 +22,8 @@
 #include <new>
 #include <numeric>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
 #include <utility>
 
 namespace voxmutatio::index {
@@ -364,36 +367,61 @@ CudaFlatIndex::search(const float* queries, int n_queries, int k, int dim) try {
 
     std::vector<float> result_distances(result_count);
     std::vector<int64_t> result_indices(result_count);
-    std::vector<float> distances(database_count);
-    std::vector<int64_t> indices(database_count);
-    std::iota(indices.begin(), indices.end(), 0);
-
-    for (std::size_t i = 0; i < query_count; ++i) {
-        for (std::size_t j = 0; j < database_count; ++j) {
-            float distance = 0.0f;
-            for (std::size_t d = 0; d < dimension; ++d) {
-                const float difference =
-                    queries[i * dimension + d] - data_[j * dimension + d];
-                distance += difference * difference;
+    // Queries are independent. Preserve each scalar accumulation and partial_sort
+    // (including its tie behavior), with at most four O(database_count) scratch
+    // sets. No shared pool, model-sized device copy, or Nqueries x Ndatabase matrix.
+    const std::size_t worker_count = query_count >= 4 && database_count >= 256
+        ? std::min<std::size_t>(4, std::max(1u, std::thread::hardware_concurrency()))
+        : 1;
+    std::atomic<bool> failed{false};
+    const auto search_queries = [&](std::size_t worker) noexcept {
+        try {
+            std::vector<float> distances(database_count);
+            std::vector<int64_t> indices(database_count);
+            for (std::size_t i = worker; i < query_count && !failed.load();
+                 i += worker_count) {
+                for (std::size_t j = 0; j < database_count; ++j) {
+                    float distance = 0.0f;
+                    for (std::size_t d = 0; d < dimension; ++d) {
+                        const float difference =
+                            queries[i * dimension + d] - data_[j * dimension + d];
+                        distance += difference * difference;
+                    }
+                    distances[j] = distance;
+                }
+                std::iota(indices.begin(), indices.end(), 0);
+                std::partial_sort(indices.begin(), indices.begin() + k, indices.end(),
+                    [&distances](int64_t a, int64_t b) {
+                        return distances[static_cast<std::size_t>(a)] <
+                               distances[static_cast<std::size_t>(b)];
+                    });
+                for (int j = 0; j < k; ++j) {
+                    result_distances[i * k + j] =
+                        distances[static_cast<std::size_t>(indices[j])];
+                    result_indices[i * k + j] = indices[j];
+                }
             }
-            distances[j] = distance;
+        } catch (...) {
+            // Never allow an allocation failure in a worker to terminate the
+            // process, and never publish a partially populated search result.
+            failed.store(true);
         }
-        std::iota(indices.begin(), indices.end(), 0);
-        std::partial_sort(indices.begin(), indices.begin() + k, indices.end(),
-            [&distances](int64_t a, int64_t b) {
-                return distances[static_cast<std::size_t>(a)] <
-                       distances[static_cast<std::size_t>(b)];
-            });
-        for (int j = 0; j < k; ++j) {
-            result_distances[i * k + j] =
-                distances[static_cast<std::size_t>(indices[j])];
-            result_indices[i * k + j] = indices[j];
-        }
+    };
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(worker_count - 1);
+        for (std::size_t worker = 1; worker < worker_count; ++worker)
+            workers.emplace_back(search_queries, worker);
+        search_queries(0);
+        // jthread also joins already-started workers if thread creation throws.
     }
+    if (failed.load()) return {{}, {}};
     return {std::move(result_distances), std::move(result_indices)};
 } catch (const std::bad_alloc&) {
     return {{}, {}};
 } catch (const std::length_error&) {
+    return {{}, {}};
+} catch (const std::system_error&) {
     return {{}, {}};
 }
 

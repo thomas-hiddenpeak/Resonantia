@@ -6,6 +6,8 @@
 // NSF-HiFiGAN generator (SineGen source + MRF upsampling).
 
 #include "voxmutatio/synthesizer/synthesizer.h"
+#include "sampling.h"
+#include "relative_attention.h"
 #include "voxmutatio/synthesizer/vits_ops.h"
 #include "voxmutatio/content/cuda/kernels.h"
 #include "voxmutatio/io/safetensors.h"
@@ -305,7 +307,9 @@ bool validate_checkpoint(const Weights& w, int feature_dim, int& num_speakers) {
 }
 
 bool supported_architecture(const SynthesizerConfig& config) {
-    return (config.version == ModelVersion::kV1 ||
+    return (config.synthesis_mode == SynthesisMode::kSampled ||
+            config.synthesis_mode == SynthesisMode::kMean) &&
+           (config.version == ModelVersion::kV1 ||
             config.version == ModelVersion::kV2) &&
            config.spec_channels == 1025 && config.segment_size == 3200 &&
            config.inter_channels == kInter && config.hidden_channels == kHidden &&
@@ -451,143 +455,18 @@ void layer_norm_ct(std::vector<float>& x, int C, int T,
     }
 }
 
-// ---- Relative-position attention helpers (heads_share=True, n_heads_rel=1) ----
-
-// Get relative embeddings for length T. emb: [21, dk]. Returns [2T-1, dk].
-std::vector<float> get_rel_emb(const float* emb, int T, int dk) {
-    int window = kWindow;
-    int max_rel = 2 * window + 1;  // 21
-    int pad_length = std::max(T - (window + 1), 0);
-    int slice_start = std::max((window + 1) - T, 0);
-    int out_len = 2 * T - 1;
-    std::vector<float> out(out_len * dk, 0.0f);
-    // padded length = max_rel + 2*pad_length; padded[j] = emb[j-pad_length] if in range
-    for (int m = 0; m < out_len; ++m) {
-        int j = slice_start + m;               // index into padded
-        int src = j - pad_length;              // index into emb (0..20)
-        if (src >= 0 && src < max_rel)
-            std::memcpy(&out[m * dk], &emb[src * dk], dk * sizeof(float));
-    }
-    return out;
-}
-
-// x: [T, 2T-1] -> [T, T]
-std::vector<float> rel_to_abs(const std::vector<float>& x, int T) {
-    int cols = 2 * T - 1;
-    // pad last dim by (0,1): [T, 2T]
-    std::vector<float> xp(T * (cols + 1), 0.0f);
-    for (int i = 0; i < T; ++i)
-        std::memcpy(&xp[i * (cols + 1)], &x[i * cols], cols * sizeof(float));
-    // flat [T*2T], pad (0, T-1) -> [T*2T + T-1]
-    int flat = T * (cols + 1);
-    std::vector<float> xf(flat + (T - 1), 0.0f);
-    std::memcpy(xf.data(), xp.data(), flat * sizeof(float));
-    // reshape [T+1, 2T-1], slice [:T, T-1:]
-    std::vector<float> out(T * T);
-    int rc = 2 * T - 1;
-    for (int i = 0; i < T; ++i)
-        for (int j = 0; j < T; ++j)
-            out[i * T + j] = xf[i * rc + (T - 1) + j];
-    return out;
-}
-
-// x: [T, T] -> [T, 2T-1]
-std::vector<float> abs_to_rel(const std::vector<float>& x, int T) {
-    // pad last dim (0, T-1): [T, 2T-1]
-    int cols = 2 * T - 1;
-    std::vector<float> xp(T * cols, 0.0f);
-    for (int i = 0; i < T; ++i)
-        std::memcpy(&xp[i * cols], &x[i * T], T * sizeof(float));
-    // flat [T*(2T-1)], pad (T, 0) -> [T*(2T-1)+T]
-    int flat = T * cols;
-    std::vector<float> xf(flat + T, 0.0f);
-    std::memcpy(&xf[T], xp.data(), flat * sizeof(float));
-    // reshape [T, 2T], slice [:, 1:]
-    std::vector<float> out(T * cols);
-    for (int i = 0; i < T; ++i)
-        for (int j = 0; j < cols; ++j)
-            out[i * cols + j] = xf[i * (2 * T) + 1 + j];
-    return out;
-}
-
-// Multi-head relative attention. x: [C=192, T]. Returns [C, T].
+// Multi-head relative attention. Projection layout stays [C,T]; the score,
+// softmax and value operations execute on device with one per-head workspace.
 std::vector<float> rel_attention(const Weights& w, const std::string& p,
                                  const std::vector<float>& x, int T) {
-    int C = kHidden, H = kNHeads, dk = C / H;  // 96
-    float scale = 1.0f / std::sqrt((float)dk);
-
+    const int C = kHidden, H = kNHeads, dk = C / H;
     auto q = conv1x1(x, C, T, w.get(p + "conv_q.weight"), w.get(p + "conv_q.bias"), C);
-    auto kk = conv1x1(x, C, T, w.get(p + "conv_k.weight"), w.get(p + "conv_k.bias"), C);
-    auto vv = conv1x1(x, C, T, w.get(p + "conv_v.weight"), w.get(p + "conv_v.bias"), C);
-    // q,kk,vv are [C, T]. Per head h: channels [h*dk, (h+1)*dk).
-
-    const float* emb_k = w.get(p + "emb_rel_k");  // [1,21,96] -> [21,96]
-    const float* emb_v = w.get(p + "emb_rel_v");
-    auto rel_k = get_rel_emb(emb_k, T, dk);  // [2T-1, dk]
-    auto rel_v = get_rel_emb(emb_v, T, dk);
-
-    std::vector<float> out(C * T, 0.0f);
-
-    for (int h = 0; h < H; ++h) {
-        int off = h * dk;
-        // scores[i,j] = sum_d q[off+d, i]*kk[off+d, j] * scale
-        std::vector<float> scores(T * T);
-        for (int i = 0; i < T; ++i) {
-            for (int j = 0; j < T; ++j) {
-                float s = 0.0f;
-                for (int d = 0; d < dk; ++d)
-                    s += q[(off + d) * T + i] * kk[(off + d) * T + j];
-                scores[i * T + j] = s * scale;
-            }
-        }
-        // rel_logits[i,m] = sum_d (q[i,d]*scale) * rel_k[m,d]  (m in 0..2T-2)
-        int rl_cols = 2 * T - 1;
-        std::vector<float> rel_logits(T * rl_cols);
-        for (int i = 0; i < T; ++i)
-            for (int m = 0; m < rl_cols; ++m) {
-                float s = 0.0f;
-                for (int d = 0; d < dk; ++d)
-                    s += (q[(off + d) * T + i] * scale) * rel_k[m * dk + d];
-                rel_logits[i * rl_cols + m] = s;
-            }
-        auto scores_local = rel_to_abs(rel_logits, T);  // [T,T]
-        for (int i = 0; i < T * T; ++i) scores[i] += scores_local[i];
-
-        // softmax over j
-        for (int i = 0; i < T; ++i) {
-            float* row = &scores[i * T];
-            float mx = row[0];
-            for (int j = 1; j < T; ++j) mx = std::max(mx, row[j]);
-            float sum = 0.0f;
-            for (int j = 0; j < T; ++j) { row[j] = std::exp(row[j] - mx); sum += row[j]; }
-            for (int j = 0; j < T; ++j) row[j] /= sum;
-        }
-
-        // out_h[i,d] = sum_j p[i,j]*vv[off+d, j]
-        std::vector<float> out_h(T * dk);
-        for (int i = 0; i < T; ++i)
-            for (int d = 0; d < dk; ++d) {
-                float s = 0.0f;
-                for (int j = 0; j < T; ++j) s += scores[i * T + j] * vv[(off + d) * T + j];
-                out_h[i * dk + d] = s;
-            }
-        // relative values: rel_weights = abs_to_rel(p) [T, 2T-1]; out += rel_weights @ rel_v
-        auto rel_weights = abs_to_rel(scores, T);  // [T, 2T-1]
-        for (int i = 0; i < T; ++i)
-            for (int d = 0; d < dk; ++d) {
-                float s = 0.0f;
-                for (int m = 0; m < rl_cols; ++m)
-                    s += rel_weights[i * rl_cols + m] * rel_v[m * dk + d];
-                out_h[i * dk + d] += s;
-            }
-        // scatter to out [C,T]
-        for (int i = 0; i < T; ++i)
-            for (int d = 0; d < dk; ++d)
-                out[(off + d) * T + i] = out_h[i * dk + d];
-    }
-
-    // conv_o
-    return conv1x1(out, C, T, w.get(p + "conv_o.weight"), w.get(p + "conv_o.bias"), C);
+    auto key = conv1x1(x, C, T, w.get(p + "conv_k.weight"), w.get(p + "conv_k.bias"), C);
+    auto value = conv1x1(x, C, T, w.get(p + "conv_v.weight"), w.get(p + "conv_v.bias"), C);
+    auto output = ops::relative_attention(q.data(), key.data(), value.data(),
+                                          w.get(p + "emb_rel_k"), w.get(p + "emb_rel_v"),
+                                          T, H, dk, kWindow);
+    return conv1x1(output, C, T, w.get(p + "conv_o.weight"), w.get(p + "conv_o.bias"), C);
 }
 
 // FFN: conv1d(k=3,pad1) -> relu -> conv1d(k=3,pad1). x [C,T] -> [C,T]
@@ -744,9 +623,10 @@ std::vector<float> flow_reverse(const Weights& w, std::vector<float> x, int T,
     return x;
 }
 
-// SineGen: f0 [T] -> har_source [T*upp]. harmonic_num=0, deterministic (noise=0).
+// SineGen: f0 [T] -> har_source [T*upp]. harmonic_num=0; configured NSF sampling.
 std::vector<float> sine_source(const float* f0, int T, int upp, int sr,
-                               const Weights& w) {
+                               const Weights& w, const SynthesizerConfig& config,
+                               std::uint64_t frame_offset = 0) {
     // rad[t,i] = f0[t]/sr * (i+1), i in 0..upp-1
     // rad2[t] = fmod(rad[t, upp-1] + 0.5, 1.0) - 0.5
     // rad_acc[t] = cumsum_t(rad2).fmod(1.0)
@@ -773,10 +653,19 @@ std::vector<float> sine_source(const float* f0, int T, int upp, int sr,
         }
     }
     // uv: f0>0 per frame, interpolated (nearest) to upp
-    // sine_waves = sine * uv + noise(=0)
+    // Restore the upstream voiced/unvoiced excitation before source linear/tanh.
     for (int t = 0; t < T; ++t) {
         float uv = (f0[t] > 0) ? 1.0f : 0.0f;
-        for (int i = 0; i < upp; ++i) sine[t * upp + i] *= uv;
+        for (int i = 0; i < upp; ++i) {
+            const auto offset = static_cast<std::size_t>(t) * upp + i;
+            sine[offset] *= uv;
+            if (config.synthesis_mode == SynthesisMode::kSampled) {
+                const float amplitude = uv > 0.0f ? 0.003f : 0.1f / 3.0f;
+                sine[offset] += amplitude * detail::sampling_normal(
+                    config.synthesis_seed, detail::kNsfStream,
+                    frame_offset * static_cast<std::uint64_t>(upp) + offset);
+            }
+        }
     }
     // SourceModule: l_linear(1,1) + tanh
     float lw = *w.get("dec.m_source.l_linear.weight");
@@ -810,7 +699,9 @@ std::vector<float> resblock1(const Weights& w, const std::string& p,
 
 // GeneratorNSF: z [inter, T], f0 [T] -> audio [T*400]
 std::vector<float> generator(const Weights& w, std::vector<float> x, int T,
-                             const float* f0, const float* g, int sr) {
+                             const float* f0, const float* g, int sr,
+                             const SynthesizerConfig& config,
+                             std::uint64_t frame_offset = 0) {
     const int upsample_rates[4] = {10, 10, 2, 2};
     const int upsample_kernels[4] = {16, 16, 4, 4};
     const int resblock_k[3] = {3, 7, 11};
@@ -818,11 +709,12 @@ std::vector<float> generator(const Weights& w, std::vector<float> x, int T,
     int upp = 400;
 
     // Sine source [T*upp]
-    auto har = sine_source(f0, T, upp, sr, w);  // [T*upp], channels-first [1, T*upp]
+    auto har = sine_source(f0, T, upp, sr, w, config, frame_offset);  // [T*upp]
 
     // conv_pre: Conv1d(192, 512, 7, pad 3)
     auto xc = op::conv1d(x.data(), kInter, T, w.get("dec.conv_pre.weight"),
                          w.get("dec.conv_pre.bias"), 512, 7, 1, 3, 1, 1);
+    std::vector<float>().swap(x);  // The latent is consumed by conv_pre.
     int C = 512, L = T;
     // + cond(g): Conv1d(gin,512,1). g[gin] -> add per channel
     {
@@ -872,6 +764,12 @@ std::vector<float> generator(const Weights& w, std::vector<float> x, int T,
             for (int t = 0; t < use_len; ++t)
                 xn[c * use_len + t] = up[c * Lout + t] + xsrc[c * (xsrc.size() / Cout) + t];
 
+        // These stage inputs are no longer read. Release their allocations
+        // before the residual branches create several full-resolution buffers.
+        std::vector<float>().swap(xc);
+        std::vector<float>().swap(up);
+        std::vector<float>().swap(xsrc);
+
         // MRF: sum of 3 resblocks / 3
         std::vector<float> acc(Cout * use_len, 0.0f);
         for (int jr = 0; jr < 3; ++jr) {
@@ -887,8 +785,9 @@ std::vector<float> generator(const Weights& w, std::vector<float> x, int T,
         L = use_len;
     }
 
-    // final leaky_relu + conv_post (no bias) + tanh
-    op::leaky_relu_inplace(xc.data(), C * L, kLRelu);
+    // Reference GeneratorNSF uses the default slope 0.01 here; the earlier
+    // upsampling/residual activations explicitly use kLRelu (0.1).
+    op::leaky_relu_inplace(xc.data(), C * L, 0.01f);
     auto out = op::conv1d(xc.data(), C, L, w.get("dec.conv_post.weight"), nullptr, 1, 7, 1, 3, 1, 1);
     op::tanh_inplace(out.data(), (int)out.size());
     return out;  // [L] audio
@@ -995,7 +894,10 @@ std::vector<float> Synthesizer::debug_flow(const float* features, int frames,
         !valid_speaker(speaker_id, num_speakers_)) return {};
     Weights w;
     w.loader = model_state_->loader;
-    auto m_p = text_encoder(w, features, frames, feature_dim_, pitch_coarse, nullptr);
+    std::vector<float> logs;
+    const bool sampled = config_.synthesis_mode == SynthesisMode::kSampled;
+    auto m_p = text_encoder(w, features, frames, feature_dim_, pitch_coarse, sampled ? &logs : nullptr);
+    if (sampled && !detail::sample_prior(m_p, logs, frames, config_.synthesis_seed)) return {};
     const float* emb_g = w.get("emb_g.weight");  // [num_spk, gin]
     std::vector<float> g(kGin);
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
@@ -1015,7 +917,7 @@ std::vector<float> Synthesizer::debug_har(const float* f0, int frames) try {
     }
     Weights w;
     w.loader = model_state_->loader;
-    auto result = sine_source(f0, frames, 400, sample_rate_, w);
+    auto result = sine_source(f0, frames, 400, sample_rate_, w, config_);
     return all_finite(result) ? result : std::vector<float>{};
 } catch (const std::exception&) {
     return {};
@@ -1067,7 +969,7 @@ std::vector<float> Synthesizer::debug_gen_stage0(const float* z, const float* f0
     std::vector<float> g(kGin);
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
 
-    auto har = sine_source(f0, frames, 400, sample_rate_, w);
+    auto har = sine_source(f0, frames, 400, sample_rate_, w, config_);
     std::vector<float> x(z, z + kInter * frames);
     auto xc = op::conv1d(x.data(), kInter, frames, w.get("dec.conv_pre.weight"),
                          w.get("dec.conv_pre.bias"), 512, 7, 1, 3, 1, 1);
@@ -1132,7 +1034,7 @@ std::vector<float> Synthesizer::debug_decode(const float* z, const float* f0,
     std::vector<float> g(kGin);
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
     std::vector<float> x(z, z + kInter * frames);
-    auto result = generator(w, std::move(x), frames, f0, g.data(), sample_rate_);
+    auto result = generator(w, std::move(x), frames, f0, g.data(), sample_rate_, config_);
     return all_finite(result) ? result : std::vector<float>{};
 } catch (const std::exception&) {
     return {};
@@ -1180,11 +1082,18 @@ std::vector<float> Synthesizer::debug_flow_reverse(const float* x, int frames,
 
 AudioBuffer Synthesizer::infer(const float* features, int frames,
                                const float* pitch, const float* pitchf,
-                               int speaker_id) try {
+                               int speaker_id) {
+    return infer(features, frames, pitch, pitchf, speaker_id, 0);
+}
+
+AudioBuffer Synthesizer::infer(const float* features, int frames,
+                               const float* pitch, const float* pitchf,
+                               int speaker_id, std::uint64_t sampling_frame_offset) try {
     AudioBuffer result;
     result.sample_rate = sample_rate_;
 
     if (!initialized_ || !checkpoint_current() ||
+        !detail::valid_sampling_range(sampling_frame_offset, frames) ||
         !valid_features(features, frames, feature_dim_) ||
         !valid_speaker(speaker_id, num_speakers_) ||
         !valid_pitch(pitch, pitchf, frames)) {
@@ -1203,14 +1112,19 @@ AudioBuffer Synthesizer::infer(const float* features, int frames,
     std::vector<float> g(kGin);
     for (int i = 0; i < kGin; ++i) g[i] = emb_g[speaker_id * kGin + i];
 
-    // enc_p -> m_p  (deterministic: z_p = m_p)
-    auto m_p = text_encoder(w, features, frames, feature_dim_, pitch_coarse.data(), nullptr);
+    // enc_p -> sampled z_p; explicit mean mode preserves the legacy reference.
+    std::vector<float> logs;
+    const bool sampled = config_.synthesis_mode == SynthesisMode::kSampled;
+    auto m_p = text_encoder(w, features, frames, feature_dim_, pitch_coarse.data(), sampled ? &logs : nullptr);
+    if (sampled && !detail::sample_prior(m_p, logs, frames, config_.synthesis_seed,
+                                        sampling_frame_offset)) return result;
     if (m_p.size() != static_cast<std::size_t>(kInter * frames)) return result;
     // flow reverse -> z
     auto z = flow_reverse(w, m_p, frames, g.data());
     if (z.size() != static_cast<std::size_t>(kInter * frames)) return result;
     // generator -> audio
-    auto audio = generator(w, std::move(z), frames, pitchf, g.data(), sample_rate_);
+    auto audio = generator(w, std::move(z), frames, pitchf, g.data(), sample_rate_,
+                           config_, sampling_frame_offset);
     if (audio.empty() || !all_finite(audio)) return result;
 
     result.data = std::move(audio);

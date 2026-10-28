@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,6 +20,7 @@ struct Paths {
     std::string rmvpe;
     std::string gmodel;
     std::string dmodel;
+    std::string ffmpeg = "/usr/bin/ffmpeg";
 };
 
 enum class ProcessLogMode {
@@ -85,6 +87,18 @@ struct Upload {
     const Part* part = nullptr;
     std::string filename;
 };
+
+struct UploadResult {
+    int status = 200;
+    std::string error;
+};
+
+// Only writes to request-owned staging. Borrowed Parts must outlive this call.
+// Compressed uploads share one nonblocking decoder slot per WebService instance.
+[[nodiscard]] UploadResult normalize_uploads(
+    const std::vector<Upload>& uploads, const std::filesystem::path& raw,
+    const std::optional<std::filesystem::path>& work, const Paths& paths,
+    const ProcessRunner& runner, std::mutex& decode_mutex, bool stereo = false);
 
 [[nodiscard]] std::string lower(std::string value);
 [[nodiscard]] bool safe_name(const std::string& value);

@@ -1,7 +1,7 @@
 # Feature Specification: Source Separation and Vocal Cleanup
 
 **Feature**: `004-source-separation`
-**Updated**: 2026-08-12
+**Updated**: 2026-10-29
 **Status**: **Model runners complete / Experimental / Workflow acceptance partial / Asset gated**
 
 ## 1. Scope
@@ -163,3 +163,12 @@ NaN/Inf 音频，验证 loader 在上传前拒绝权重且运行入口不返回�
 - [x] 将 Web step 的 live work replacement 改为可回滚提交，并增加真实 HTTP 故障测试。
 - [x] 让 `vc_preprocess --*-model` 对未知、缺失默认或 task 不匹配的模型失败，并覆盖 CLI 门禁。
 - [x] 严格解析并约束 `sr/seg/hop/RMS/trim/VAD` 等预处理数值参数。
+
+## 2026-10-29 立体声 Web 清理契约
+
+新增 `vc_preprocess --preserve-stereo --no-slice --sr 44100`：在 RoFormer 各阶段间保留
+左右声道，mono 输入复制成双声道；禁止 trim/VAD/其他采样率，以保持歌曲时间轴。
+输出为双声道 float32 WAV，内部处理最长 600 秒、输入文件不超过 128 MiB，超界失败。
+旧 CLI 默认单声道路径不变。Web 清理显式使用此路径；模型推理前才混合成单声道。
+该路径源于 CyberTom《需要人陪》真实试听：去和声明显缓解尾段异常音高，但不保证
+清除所有错音，也不自动替代人工局部音高校正。

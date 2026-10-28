@@ -469,10 +469,58 @@ std::string log_tail(const std::string& path, std::size_t count) {
 
 namespace {
 
+const char* audio_demuxer(const std::string& extension) {
+    if (extension == ".mp3") return "mp3";
+    if (extension == ".m4a") return "mov";
+    if (extension == ".aac") return "aac";
+    if (extension == ".flac") return "flac";
+    if (extension == ".ogg" || extension == ".opus") return "ogg";
+    if (extension == ".wma") return "asf";
+    if (extension == ".aif" || extension == ".aiff") return "aiff";
+    return nullptr;
+}
+
 bool valid_audio_upload(const std::string& filename, const std::string& data) {
     const std::string extension = lower(fs::path(filename).extension().string());
+    if (extension != ".wav") return audio_demuxer(extension) && !data.empty();
     return extension == ".wav" && data.size() >= 12 && data.compare(0, 4, "RIFF") == 0 &&
            data.compare(8, 4, "WAVE") == 0;
+}
+
+// Inspect bounded chunk headers, without loading the decoded payload into RAM.
+// FFmpeg must finish a complete, nonempty PCM16/mono/44.1 kHz RIFF file.
+bool valid_decoded_wav(const fs::path& path, std::uintmax_t size, bool stereo) {
+    std::ifstream in(path, std::ios::binary);
+    auto u32 = [](const unsigned char* p) {
+        return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) |
+               (std::uint32_t(p[2]) << 16) | (std::uint32_t(p[3]) << 24);
+    };
+    unsigned char header[16];
+    if (size < 44 || !in.read(reinterpret_cast<char*>(header), 12) ||
+        std::memcmp(header, "RIFF", 4) || std::memcmp(header + 8, "WAVE", 4) ||
+        u32(header + 4) != size - 8) return false;
+    bool format = false, data = false;
+    std::uintmax_t offset = 12;
+    while (offset + 8 <= size) {
+        in.seekg(static_cast<std::streamoff>(offset));
+        if (!in.read(reinterpret_cast<char*>(header), 8)) return false;
+        const auto count = u32(header + 4);
+        const auto padded = std::uintmax_t(count) + (count & 1u);
+        if (padded > size - offset - 8) return false;
+        if (!std::memcmp(header, "fmt ", 4)) {
+            if (format || count < 16 || !in.read(reinterpret_cast<char*>(header), 16)) return false;
+            const unsigned channels = stereo ? 2 : 1;
+            format = header[0] == 1 && header[1] == 0 && header[2] == channels && header[3] == 0 &&
+                     u32(header + 4) == 44100 && u32(header + 8) == 88200 * channels &&
+                     header[12] == 2 * channels && header[13] == 0 && header[14] == 16 && header[15] == 0;
+            if (!format) return false;
+        } else if (!std::memcmp(header, "data", 4)) {
+            if (data || !count || count % (stereo ? 4 : 2)) return false;
+            data = true;
+        }
+        offset += 8 + padded;
+    }
+    return format && data && offset == size;
 }
 
 std::string mime_for(const std::string& path) {
@@ -496,7 +544,7 @@ bool collect_uploads(int fd, const std::vector<Part>& parts, std::vector<Upload>
         std::string filename = safe_filename(part.filename);
         if (filename.empty() || !valid_audio_upload(filename, part.data)) {
             send_response(fd, 400, "Bad Request", "application/json",
-                          "{\"error\":\"upload must be a valid non-empty WAV file\"}");
+                          "{\"error\":\"upload must be non-empty WAV, MP3, M4A, AAC, FLAC, OGG, Opus, WMA or AIFF/AIF audio\"}");
             return false;
         }
         fs::path normalized(filename);
@@ -551,6 +599,87 @@ bool write_uploads(const std::vector<Upload>& uploads, const fs::path& raw,
         }
     }
     return true;
+}
+
+UploadResult normalize_uploads(const std::vector<Upload>& uploads, const fs::path& raw,
+                               const std::optional<fs::path>& work, const Paths& paths,
+                               const ProcessRunner& runner, std::mutex& decode_mutex, bool stereo) {
+    constexpr std::uintmax_t file_limit = 64u << 20;
+    constexpr std::uintmax_t batch_limit = 128u << 20;
+    const auto compressed = [](const Upload& upload) {
+        return lower(fs::path(safe_filename(upload.part->filename)).extension().string()) != ".wav";
+    };
+    std::string error;
+    if (std::none_of(uploads.begin(), uploads.end(), compressed)) {
+        if (!write_uploads(uploads, raw, work, error)) return {500, "upload staging failed"};
+        return {};
+    }
+    std::unique_lock decoder_lock(decode_mutex, std::try_to_lock);
+    if (!decoder_lock.owns_lock()) return {409, "audio decoder busy; retry after the current upload"};
+    for (const auto& executable : {paths.ffmpeg, std::string("/usr/bin/timeout"), std::string("/usr/bin/prlimit")}) {
+        if (!fs::path(executable).is_absolute() || access(executable.c_str(), X_OK) != 0)
+            return {503, "audio decoder unavailable: FFmpeg, timeout and prlimit are required"};
+    }
+    std::error_code ec;
+    fs::create_directories(raw, ec);
+    if (ec) return {500, "upload staging failed"};
+    if (work) fs::create_directories(*work, ec);
+    if (ec) return {500, "upload staging failed"};
+    std::uintmax_t decoded_bytes = 0;
+    for (const auto& upload : uploads) {
+        if (!compressed(upload)) {
+            if (!write_uploads({upload}, raw, work, error)) return {500, "upload staging failed"};
+            continue;
+        }
+        const std::string extension = lower(fs::path(safe_filename(upload.part->filename)).extension().string());
+        const char* demuxer = audio_demuxer(extension);
+        if (!demuxer) return {400, "unsupported audio format"};
+        TempDir temp(raw.parent_path(), ".decode_");
+        const fs::path input = fs::path(temp.path()) / ("input" + extension);
+        const fs::path output = raw / upload.filename;
+        {
+            std::ofstream stream(input, std::ios::binary);
+            stream.write(upload.part->data.data(), static_cast<std::streamsize>(upload.part->data.size()));
+            stream.close();
+            if (!stream) return {500, "upload staging failed"};
+        }
+        ProcessSpec spec;
+        // timeout owns the process group; prlimit is exec'd in that group. No
+        // shell, network protocols, playlist probing or GPU decoding is used.
+        spec.argv = {"/usr/bin/timeout", "--signal=TERM", "--kill-after=2s", "120s",
+                     "/usr/bin/prlimit", "--as=2147483648", "--fsize=67239936", "--",
+                     paths.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror",
+                     "-max_alloc", "67108864", "-threads", "2", "-filter_threads", "1",
+                     "-protocol_whitelist", "file", "-format_whitelist", demuxer, "-f", demuxer};
+        if (extension == ".m4a")
+            spec.argv.insert(spec.argv.end(), {"-enable_drefs", "0", "-use_absolute_path", "0"});
+        spec.argv.insert(spec.argv.end(), {"-i", input.string(), "-map", "0:a:0", "-vn", "-sn", "-dn",
+                         "-map_metadata", "-1", "-threads", "2", "-ac", stereo ? "2" : "1", "-ar", "44100",
+                         "-c:a", "pcm_s16le", "-f", "wav", "-fs", "67108865", "-y", output.string()});
+        spec.log_path = fs::path(temp.path()) / "decode.log";
+        const auto result = runner.run(spec);
+        const auto size = fs::file_size(output, ec);
+        // FFmpeg's -fs may stop successfully and overshoot by one packet. The
+        // sentinel lies ABOVE the accepted cap, so truncation can never pass.
+        if (!ec && (size > file_limit || size > batch_limit - decoded_bytes))
+            return {413, "decoded audio exceeds 64 MiB per file or 128 MiB per upload"};
+        if (!result.success()) {
+            if (result.termination == ProcessTermination::kLaunchFailed ||
+                result.termination == ProcessTermination::kExecFailed ||
+                result.exit_code == 126 || result.exit_code == 127)
+                return {503, "audio decoder could not start; check the FFmpeg installation"};
+            if (result.exit_code == 124 || result.exit_code == 137)
+                return {400, "audio decoding timed out (120 seconds); split the recording"};
+            return {400, "audio decoding failed; file is damaged, has no audio, or its codec is unavailable"};
+        }
+        if (ec || !valid_decoded_wav(output, size, stereo)) return {400, "audio decoder produced incomplete or empty WAV"};
+        decoded_bytes += size;
+        if (work) {
+            fs::copy_file(output, *work / upload.filename, fs::copy_options::overwrite_existing, ec);
+            if (ec) return {500, "upload staging failed"};
+        }
+    }
+    return {};
 }
 
 bool replace_material_dirs(const fs::path& directory, const fs::path& staged_raw,

@@ -75,7 +75,7 @@ private:
     bool cancellation_requested(std::uint64_t generation);
     TrainingOutcome run_training(std::uint64_t generation, std::string name, std::string mode, int steps, int segment,
                       int epochs, bool separate, bool dereverb, bool deecho,
-                      bool denoise, bool deharmony, bool vad);
+                      bool denoise, bool deharmony, bool vad, bool resume = false, bool prepared = false);
     void run_step(std::uint64_t generation, std::string name, std::string step, std::string model,
                   std::unique_lock<std::mutex> gpu_lock);
 
@@ -88,6 +88,10 @@ private:
                                              std::string& cleaned, std::string& log) const;
 
     void handle_material(int fd, const Request& request);
+    bool stage_uploads(int fd, const std::vector<Upload>& uploads,
+                       const std::filesystem::path& raw,
+                       const std::optional<std::filesystem::path>& work = std::nullopt,
+                       bool stereo = false);
     void handle_step(int fd, const Request& request);
     void handle_preview(int fd, const Request& request);
     void handle_train(int fd, const Request& request);
@@ -95,6 +99,8 @@ private:
     void handle_cancel_train(int fd, const Request& request);
     void handle_preprocess(int fd, const Request& request);
     void handle_convert(int fd, const Request& request);
+    void handle_training_runs(int fd);
+    void handle_publish(int fd, const Request& request);
 
     [[nodiscard]] static const char* allowed_api_method(const std::string& path);
 
@@ -103,6 +109,7 @@ private:
     const std::string instance_id_;
     JobState job_;
     std::mutex gpu_mutex_;
+    std::mutex decode_mutex_;
     // Writers lock GPU before material; preview only locks material. Never hold
     // this lock during CLI execution or socket writes.
     std::mutex material_mutex_;

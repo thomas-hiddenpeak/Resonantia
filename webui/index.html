@@ -1,189 +1,932 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Resonantia — 声线训练与语音转换</title>
-    <link rel="stylesheet" href="styles.css">
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>🎙️ Resonantia</h1>
-            <p class="subtitle">纯 C++/CUDA 声线训练与语音转换引擎</p>
-        </header>
-        <div id="connBanner" class="conn-banner" style="display:none;">⚠ 无法连接后端服务（vc_serve 未启动？），请启动后稍候重试。</div>
-
-        <nav class="tabs">
-            <button class="tab-btn active" data-tab="train">① 训练声线</button>
-            <button class="tab-btn" data-tab="convert">② 语音转换</button>
-        </nav>
-
-        <main>
-            <!-- ============ 训练声线 ============ -->
-            <div class="tab-panel active" id="panel-train">
-                <section class="step">
-                    <div class="step-head"><span class="step-no">1</span><h2>目标声线</h2></div>
-                    <div class="param-group">
-                        <label for="voiceName">声线名称</label>
-                        <input type="text" id="voiceName" placeholder="例如 alice（字母/数字/_/-）">
-                    </div>
-                    <div class="param-group">
-                        <label for="trainTier">训练质量</label>
-                        <select id="trainTier"></select>
-                    </div>
-                    <p class="preset-desc" id="trainTierDesc"></p>
-                    <details class="advanced">
-                        <summary>高级参数（可选,覆盖档位）</summary>
-                        <div class="param-group">
-                            <label for="trainMode">模式</label>
-                            <select id="trainMode">
-                                <option value="decoder">解码器微调（快速，mel-L1）</option>
-                                <option value="gan">完整 GAN（高音质，enc_q+flow+判别器）</option>
-                            </select>
-                        </div>
-                        <div class="param-group">
-                            <label for="trainSteps">训练步数</label>
-                            <input type="number" id="trainSteps" value="300" min="1" max="100000">
-                        </div>
-                        <div class="param-group">
-                            <label for="trainSeg">片段帧长</label>
-                            <input type="number" id="trainSeg" value="40" min="8" max="200">
-                        </div>
-                        <div class="param-group">
-                            <label for="trainEpochs">训练轮数 epochs（&gt;0 覆盖步数,随数据量自适应）</label>
-                            <input type="number" id="trainEpochs" value="0" min="0" max="2000">
-                        </div>
-                    </details>
-                </section>
-
-                <section class="step">
-                    <div class="step-head"><span class="step-no">2</span><h2>上传目标录音</h2></div>
-                    <p class="hint">建议 ≥ 10 分钟干净单人录音（可多文件 .wav）。填好①声线名称后上传即自动进入预处理。</p>
-                    <div class="upload-area" id="trainUploadArea">
-                        <div class="upload-icon">🎵</div>
-                        <p>拖拽目标说话人音频到此，或点击选择</p>
-                        <input type="file" id="trainFileInput" accept=".wav" multiple hidden>
-                    </div>
-                    <ul class="file-list" id="trainFileList"></ul>
-                    <p class="hint" id="trainDataHint">建议提供 ≥ 10 分钟 干净的单人录音（可多文件）。</p>
-                    <div class="audition" id="trainOrigAudition" style="display:none;">
-                        <span class="audition-label">🎧 原始素材（首个文件）</span>
-                        <audio controls id="trainOrigAudio"></audio>
-                    </div>
-                </section>
-
-                <section class="step">
-                    <div class="step-head"><span class="step-no">3</span><h2>级联预处理 · 每步可听审</h2></div>
-                    <p class="hint">可按<b>任意顺序、任意组合</b>应用（实际处理顺序 = 你的点击先后）；每步完成后在该行试听，满意再继续。纯净人声可全部跳过。改顺序可「重置」后重来。</p>
-                    <div class="cascade" id="trainCascade"></div>
-                    <div class="param-group check-inline">
-                        <label class="check"><input type="checkbox" id="recVad" checked> 训练时智能切分（Silero VAD 按语音切片）</label>
-                    </div>
-                    <button class="btn-secondary" id="trainResetPre" disabled>↺ 重置预处理（恢复到原始素材）</button>
-                </section>
-
-                <section class="step">
-                    <div class="step-head"><span class="step-no">4</span><h2>开始训练</h2></div>
-                    <button class="btn-convert" id="btnTrain" disabled>开始训练</button>
-                    <button class="btn-secondary" id="btnCancelTrain" disabled>取消训练</button>
-                    <p class="hint">取消会等待当前处理阶段结束；已提交素材会保留，保存训练结果后无法取消。</p>
-                    <div class="progress-section" id="trainProgress" style="display:none;">
-                        <h3>训练进度 — <span id="trainStage">…</span></h3>
-                        <div class="progress-bar"><div class="progress-fill" id="trainFill"></div></div>
-                        <pre class="log-box" id="trainLog"></pre>
-                    </div>
-                </section>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f5f5f0" />
+    <title>Resonantia · 声音工作室</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">跳到工作区</a>
+    <aside class="sidebar">
+      <a class="brand" href="#convert" aria-label="Resonantia 首页"
+        ><span class="brand-mark"
+          ><svg
+            class="icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M3 10v4m4-8v12m5-16v20m5-16v12m4-8v4" /></svg></span
+        ><span>Resonantia<small>声音工作室</small></span></a
+      >
+      <p class="nav-caption">工作区</p>
+      <nav
+        class="tabs"
+        role="tablist"
+        aria-label="工作区导航"
+        aria-orientation="vertical"
+      >
+        <button
+          id="nav-convert"
+          class="tab-btn active"
+          data-tab="convert"
+          role="tab"
+          aria-controls="panel-convert"
+          aria-selected="true"
+        >
+          <svg
+            class="icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M3 10v4m4-8v12m5-16v20m5-16v12m4-8v4" /></svg
+          ><span>制作翻唱</span>
+        </button>
+        <button
+          id="nav-train"
+          class="tab-btn"
+          data-tab="train"
+          role="tab"
+          aria-controls="panel-train"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          <svg
+            class="icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M12 5v14M5 12h14" /></svg
+          ><span>训练声线</span
+          ><span id="trainNavStatus" class="nav-state" hidden>进行中</span>
+        </button>
+        <button
+          id="nav-library"
+          class="tab-btn"
+          data-tab="library"
+          role="tab"
+          aria-controls="panel-library"
+          aria-selected="false"
+          tabindex="-1"
+        >
+          <svg
+            class="icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.6"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="3" y="4" width="5" height="16" rx="1" />
+            <path d="M12 4v16m4-16 5 15" /></svg
+          ><span>声线库</span>
+        </button>
+      </nav>
+      <div class="sidebar-note">
+        <span class="eyebrow">为表达，留住细节</span>
+        <p>先听清，再听像。<br />保留声音的轻重与起伏。</p>
+      </div>
+      <div class="service-status">
+        <span id="serviceDot" class="status-dot"></span
+        ><span id="serviceLabel">正在连接服务</span
+        ><button
+          id="retryConnection"
+          class="text-button"
+          aria-label="重新检查服务连接"
+        >
+          重连
+        </button>
+      </div>
+    </aside>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <span class="breadcrumb">工作区</span
+          ><span class="breadcrumb-divider">/</span
+          ><span id="workspaceLabel">制作翻唱</span>
+        </div>
+        <span class="local-badge">本地音频工作室</span>
+      </header>
+      <div
+        id="connBanner"
+        class="conn-banner"
+        role="alert"
+        style="display: none"
+      >
+        暂时无法连接服务，已填写的设置仍在。<button
+          id="retryConnectionBanner"
+          class="btn-small"
+        >
+          重新连接
+        </button>
+      </div>
+      <main id="workspace" tabindex="-1">
+        <div
+          class="tab-panel active"
+          id="panel-convert"
+          role="tabpanel"
+          aria-labelledby="nav-convert"
+        >
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">VOICE STUDIO</span>
+              <h1>让一首歌，换一种表达。</h1>
+              <p>上传歌曲或人声，用你选择的声线重新演绎。</p>
             </div>
-
-            <!-- ============ 语音转换 ============ -->
-            <div class="tab-panel" id="panel-convert">
-                <section class="step">
-                    <div class="step-head"><span class="step-no">1</span><h2>选择目标声线</h2></div>
-                    <div class="param-group inline">
-                        <select id="voiceSelect"></select>
-                        <button class="btn-small" id="btnRefreshVoices">刷新</button>
+            <span class="page-number">01 / 创作</span>
+          </div>
+          <div
+            id="candidateNotice"
+            class="notice candidate-notice"
+            role="status"
+            hidden
+          ></div>
+          <button id="exitCandidate" class="text-button" hidden>
+            退出候选试听，返回正式声线
+          </button>
+          <div class="studio-grid">
+            <div class="studio-main">
+              <section class="card source-card" aria-labelledby="sourceTitle">
+                <div class="section-heading">
+                  <span class="step-no">01</span>
+                  <div>
+                    <h2 id="sourceTitle">从音频开始</h2>
+                    <p>选择一首歌曲，或一段清晰的人声。</p>
+                  </div>
+                </div>
+                <div
+                  class="upload-area"
+                  id="convUploadArea"
+                  role="button"
+                  tabindex="0"
+                  aria-label="选择待转换音频"
+                  aria-describedby="convFormats"
+                >
+                  <span class="upload-mark"
+                    ><svg
+                      class="icon"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.6"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M12 16V3m-5 5 5-5 5 5M4 16v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"
+                      /></svg></span
+                  ><strong>将音频拖到这里</strong><span>或 <b>选择文件</b></span
+                  ><input
+                    type="file"
+                    id="convFileInput"
+                    accept=".wav,.mp3,.m4a,.aac,.flac,.ogg,.opus,.wma,.aiff,.aif"
+                    hidden
+                  />
+                </div>
+                <p class="format-note" id="convFormats">
+                  WAV · MP3 · M4A · FLAC · OGG · 其他常用音频格式 · 单文件最多
+                  64 MiB
+                </p>
+                <div class="file-info" id="convFileInfo" style="display: none">
+                  <svg
+                    class="icon"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 10v4m4-8v12m5-16v20m5-16v12m4-8v4" /></svg
+                  ><span class="file-name"></span
+                  ><button
+                    class="btn-remove"
+                    id="btnConvRemove"
+                    aria-label="移除当前音频"
+                  >
+                    ×
+                  </button>
+                </div>
+                <p class="field-status" id="convUploadStatus" role="status"></p>
+                <button id="convRetryUpload" class="btn-secondary" hidden>
+                  重试上传
+                </button>
+                <div
+                  class="audition"
+                  id="convOrigAudition"
+                  style="display: none"
+                >
+                  <span class="audition-label">原始音频</span
+                  ><audio
+                    controls
+                    preload="metadata"
+                    id="convOrigAudio"
+                    aria-label="试听原始音频"
+                  ></audio>
+                </div>
+                <div class="source-options">
+                  <div class="param-group">
+                    <label for="inputKind">这份音频是什么？</label
+                    ><select id="inputKind">
+                      <option value="song">完整歌曲 · 带伴奏</option>
+                      <option value="harmonies">人声轨 · 仍含和声或伴唱</option>
+                      <option value="dry">单人干声 · 清唱或说话</option>
+                      <option value="manual">自行分步处理</option>
+                    </select>
+                  </div>
+                  <p id="workflowHint" class="hint"></p>
+                </div>
+                <details id="manualCleanup">
+                  <summary>分步清理与试听</summary>
+                  <p class="hint">
+                    依次应用需要的处理，每一步都可试听。仅在“自行分步处理”模式中使用清理后的音频。
+                  </p>
+                  <div class="cascade" id="convCascade"></div>
+                  <button class="btn-secondary" id="convResetPre" disabled>
+                    恢复原始输入
+                  </button>
+                </details>
+              </section>
+              <section class="card voice-card">
+                <div class="section-heading">
+                  <span class="step-no">02</span>
+                  <div>
+                    <h2>选择演唱声线</h2>
+                    <p>已听审的参数已为你准备好，也可以按需微调。</p>
+                  </div>
+                </div>
+                <div class="voice-choice">
+                  <div class="voice-avatar" aria-hidden="true">
+                    T<span>C</span>
+                  </div>
+                  <div class="voice-selector">
+                    <label for="voiceSelect">目标声线</label>
+                    <div class="inline">
+                      <select id="voiceSelect"></select
+                      ><button
+                        class="icon-button"
+                        id="btnRefreshVoices"
+                        aria-label="刷新声线列表"
+                      >
+                        ↻
+                      </button>
                     </div>
-                </section>
-
-                <section class="step">
-                    <div class="step-head"><span class="step-no">2</span><h2>上传待转换音频</h2></div>
-                    <div class="upload-area" id="convUploadArea">
-                        <div class="upload-icon">📁</div>
-                        <p>拖拽音频到此处，或点击选择文件</p>
-                        <input type="file" id="convFileInput" accept=".wav" hidden>
-                    </div>
-                    <div class="file-info" id="convFileInfo" style="display:none;">
-                        <span class="file-name"></span>
-                        <button class="btn-remove" id="btnConvRemove">✕</button>
-                    </div>
-                    <div class="audition" id="convOrigAudition" style="display:none;">
-                        <span class="audition-label">🎧 原始输入</span>
-                        <audio controls id="convOrigAudio"></audio>
-                    </div>
-                </section>
-
-                <section class="step">
-                    <div class="step-head"><span class="step-no">3</span><h2>级联预处理 · 每步可听审</h2></div>
-                    <p class="hint">可按<b>任意顺序、任意组合</b>应用（实际处理顺序 = 你的点击先后）；逐步应用并试听，满意后再转换。纯净人声可全部跳过。改顺序可「重置」后重来。</p>
-                    <div class="cascade" id="convCascade"></div>
-                    <button class="btn-secondary" id="convResetPre" disabled>↺ 重置预处理（恢复到原始输入）</button>
-                </section>
-
-                <section class="step">
-                    <div class="step-head"><span class="step-no">4</span><h2>转换参数与执行</h2></div>
+                  </div>
+                </div>
+                <details class="release-card" id="formalRelease" hidden>
+                  <summary>
+                    <span class="release-badge">正式版 · 已通过听审</span
+                    ><span>查看训练信息</span>
+                  </summary>
+                  <h2>Tom Cybersinger</h2>
+                  <p>200 轮 / 81,200 步 / 约 18 分钟有效素材</p>
+                  <p class="hint">
+                    普通话、粤语与串烧素材经过听审去混响。本次完整翻唱通过听审，其他歌曲仍需单独检查。
+                  </p>
+                </details>
+                <details class="advanced settings-panel">
+                  <summary>
+                    调整音色与音高<span class="summary-aside"
+                      >默认采用听审参数</span
+                    >
+                  </summary>
+                  <div class="param-group">
+                    <label for="convPreset">参数预设</label
+                    ><select id="convPreset"></select>
+                  </div>
+                  <p id="convPresetDesc" class="hint"></p>
+                  <p id="convParamSummary" class="param-summary"></p>
+                  <details class="advanced">
+                    <summary>手动微调</summary>
                     <div class="param-group">
-                        <label for="convPreset">效果档位</label>
-                        <select id="convPreset"></select>
+                      <label for="pitchShift">整体变调（半音）</label>
+                      <input
+                        type="range"
+                        id="pitchShift"
+                        min="-24"
+                        max="24"
+                        value="0"
+                        step="1"
+                      />
+                      <span class="param-value" id="pitchShiftValue">0</span>
                     </div>
-                    <p class="preset-desc" id="convPresetDesc"></p>
-                    <p class="param-summary" id="convParamSummary"></p>
-                    <details class="advanced">
-                        <summary>高级参数（可选,覆盖档位）</summary>
-                        <div class="param-group">
-                            <label for="pitchShift">音高偏移 (半音)</label>
-                            <input type="range" id="pitchShift" min="-24" max="24" value="0" step="1">
-                            <span class="param-value" id="pitchShiftValue">0</span>
-                        </div>
-                        <div class="param-group">
-                            <label for="indexRate">特征检索率</label>
-                            <input type="range" id="indexRate" min="0" max="100" value="50" step="1">
-                            <span class="param-value" id="indexRateValue">0.50</span>
-                        </div>
-                        <div class="param-group">
-                            <label for="rmsMixRate">RMS 混合率</label>
-                            <input type="range" id="rmsMixRate" min="0" max="100" value="50" step="1">
-                            <span class="param-value" id="rmsMixRateValue">0.50</span>
-                        </div>
-                        <div class="param-group">
-                            <label for="protect">清音保护</label>
-                            <input type="range" id="protect" min="0" max="100" value="50" step="1">
-                            <span class="param-value" id="protectValue">0.50</span>
-                        </div>
-                        <div class="param-group">
-                            <label for="filterRadius">F0 平滑半径</label>
-                            <input type="range" id="filterRadius" min="0" max="7" value="3" step="1">
-                            <span class="param-value" id="filterRadiusValue">3</span>
-                        </div>
-                    </details>
-                    <button class="btn-convert" id="btnConvert" disabled>开始转换</button>
-                    <div class="progress-section" id="convProgress" style="display:none;">
-                        <div class="progress-bar"><div class="progress-fill" id="convFill"></div></div>
-                        <div class="progress-info" id="convInfo">准备中…</div>
+                    <div class="param-group">
+                      <label for="indexRate">特征检索率</label>
+                      <input
+                        type="range"
+                        id="indexRate"
+                        min="0"
+                        max="100"
+                        value="50"
+                        step="1"
+                      />
+                      <span class="param-value" id="indexRateValue">0.50</span>
                     </div>
-                    <div class="result-section" id="resultSection" style="display:none;">
-                        <h3>转换结果</h3>
-                        <div class="audio-player"><audio controls id="resultAudio"></audio></div>
-                        <div class="result-actions">
-                            <button class="btn-download" id="btnDownload">下载 WAV</button>
-                        </div>
+                    <div class="param-group">
+                      <label for="rmsMixRate">合成音量占比</label>
+                      <input
+                        type="range"
+                        id="rmsMixRate"
+                        min="0"
+                        max="100"
+                        value="50"
+                        step="1"
+                      />
+                      <span class="param-value" id="rmsMixRateValue">0.50</span>
                     </div>
-                </section>
+                    <div class="param-group">
+                      <label for="protect">清音保护</label>
+                      <input
+                        type="range"
+                        id="protect"
+                        min="0"
+                        max="100"
+                        value="50"
+                        step="1"
+                      />
+                      <span class="param-value" id="protectValue">0.50</span>
+                    </div>
+                    <div class="param-group">
+                      <label for="filterRadius">音高平滑窗口</label>
+                      <select id="filterRadius">
+                        <option value="0">关闭</option>
+                        <option value="3" selected>3（推荐）</option>
+                        <option value="5">5</option>
+                        <option value="7">7</option>
+                      </select>
+                      <span class="param-value" id="filterRadiusValue">3</span>
+                    </div>
+                    <p class="hint">
+                      合成音量占比为 0 时跟随原唱强弱，为 1 时保留模型自身音量。
+                    </p>
+                  </details>
+                </details>
+              </section>
             </div>
-        </main>
+            <aside class="task-rail" aria-labelledby="taskTitle">
+              <section class="card task-card">
+                <div class="task-heading">
+                  <span class="eyebrow">本次任务</span
+                  ><span id="taskState" class="pill">等待音频</span>
+                </div>
+                <h2 id="taskTitle">准备你的翻唱</h2>
+                <dl class="task-facts">
+                  <div>
+                    <dt>音频</dt>
+                    <dd id="summaryInput">尚未上传</dd>
+                  </div>
+                  <div>
+                    <dt>声线</dt>
+                    <dd id="summaryVoice">载入中</dd>
+                  </div>
+                </dl>
+                <div class="param-group">
+                  <label for="outputKind">想获得什么？</label
+                  ><select id="outputKind">
+                    <option value="mix">完整翻唱 · 保留原伴奏</option>
+                    <option value="vocal">仅转换后的人声</option>
+                  </select>
+                </div>
+                <label class="check optional-cleanup"
+                  ><input id="conversionDereverb" type="checkbox" /><span
+                    >额外去混响<small>仅在原声有明显空间感时启用</small></span
+                  ></label
+                >
+                <div class="route-heading">处理流程<span>按当前设置</span></div>
+                <ol id="routePlan" class="route-plan"></ol>
+                <button class="btn-convert" id="btnConvert" disabled>
+                  生成翻唱
+                  <svg
+                    class="icon"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M5 12h14m-6-6 6 6-6 6" />
+                  </svg>
+                </button>
+                <p id="conversionReadiness" class="readiness" role="status">
+                  上传一份音频后即可开始。
+                </p>
+                <div
+                  class="progress-section"
+                  id="convProgress"
+                  style="display: none"
+                  role="status"
+                >
+                  <div class="progress-bar">
+                    <div class="progress-fill" id="convFill"></div>
+                  </div>
+                  <p id="convInfo">准备中…</p>
+                </div>
+                <p class="task-footnote">
+                  文件在这台服务器上处理。完整歌曲需要先分离人声与和声，耗时会比干声转换更长。
+                </p>
+              </section>
+            </aside>
+          </div>
+          <section
+            class="card result-section"
+            id="resultSection"
+            style="display: none"
+            aria-labelledby="resultTitle"
+            tabindex="-1"
+          >
+            <div class="result-heading">
+              <div>
+                <span class="eyebrow">LISTEN & REFINE</span>
+                <h2 id="resultTitle">听一听，新的表达。</h2>
+                <p id="resultContext" class="hint"></p>
+              </div>
+              <button class="btn-download" id="btnDownload">
+                下载 WAV
+                <svg
+                  class="icon"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M5 12h14m-6-6 6 6-6 6" />
+                </svg>
+              </button>
+            </div>
+            <div class="comparison-bar">
+              <div class="segmented" role="group" aria-label="切换对照音频">
+                <button id="compareOriginal" aria-pressed="false">
+                  原始音频</button
+                ><button id="compareConverted" aria-pressed="true">
+                  转换结果
+                </button>
+              </div>
+              <span class="hint">切换时保留播放位置</span>
+            </div>
+            <p id="resultStale" class="notice" role="status" hidden>
+              设置已调整。下面仍是上一版结果，重新生成后才会应用新设置。
+            </p>
+            <audio
+              controls
+              preload="metadata"
+              id="resultAudio"
+              aria-label="试听转换结果"
+            ></audio
+            ><audio
+              controls
+              preload="metadata"
+              id="comparisonAudio"
+              aria-label="对照原始音频"
+              hidden
+            ></audio>
+            <div class="listen-checklist">
+              <svg
+                class="icon"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M4 13v-1a8 8 0 0 1 16 0v1" />
+                <rect x="3" y="12" width="4" height="8" rx="2" />
+                <rect x="17" y="12" width="4" height="8" rx="2" />
+              </svg>
+              <p>
+                先听清晰度，再听音色和动态。特别留意长音、尾音和高音处是否自然。
+              </p>
+            </div>
+            <details class="advanced">
+              <summary>听到局部跳音？添加修正并重新生成</summary>
+              <p class="hint">
+                以这次上传音频的秒数为准。平滑用于短促跳变，半音偏移用于局部高/低八度（±12）。每段
+                0.02–2 秒，最多 16
+                段，按时间排序、不重叠；平滑不能跨无声区。输入最长 10
+                分钟。修改后重新转换并试听，避免抹掉正常滑音。
+              </p>
+              <p id="pitchError" class="field-error" role="alert" hidden></p>
+              <div id="pitchEdits"></div>
+              <button class="btn-secondary" id="addPitchEdit">
+                添加修音区间
+              </button>
+              <button id="regeneratePitch" class="btn-secondary">
+                应用修正，重新生成
+              </button>
+            </details>
+          </section>
+        </div>
+        <div
+          class="tab-panel"
+          id="panel-train"
+          role="tabpanel"
+          aria-labelledby="nav-train"
+          hidden
+        >
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">VOICE TRAINING</span>
+              <h1>从你的录音，建立你的声线。</h1>
+              <p>先确认素材质量，再开始训练。训练完成后，听审通过才能发布。</p>
+            </div>
+            <span class="page-number">02 / 训练</span>
+          </div>
+          <div class="studio-grid">
+            <div class="studio-main" id="trainingForm">
+              <section class="card">
+                <div class="section-heading">
+                  <span class="step-no">01</span>
+                  <div><h2>建立训练任务</h2></div>
+                </div>
+                <div class="param-group">
+                  <label for="voiceName"
+                    >任务名称 <span class="required">必填</span></label
+                  ><input
+                    id="voiceName"
+                    type="text"
+                    autocomplete="off"
+                    maxlength="64"
+                    placeholder="例如 MySinger_01"
+                    aria-describedby="voiceNameHint"
+                  />
+                  <p id="voiceNameHint" class="hint">
+                    使用字母、数字、下划线或短横线。每次完整训练使用一个新名称。
+                  </p>
+                </div>
+              </section>
+              <section class="card">
+                <div class="section-heading">
+                  <span class="step-no">02</span>
+                  <div>
+                    <h2>准备与听审素材</h2>
+                    <p>同一个歌手，清晰的单人演唱或说话。建议至少 10 分钟。</p>
+                  </div>
+                </div>
+                <div
+                  class="upload-area compact"
+                  id="trainUploadArea"
+                  role="button"
+                  tabindex="0"
+                  aria-label="选择训练录音，可多选"
+                >
+                  <span class="upload-mark"
+                    ><svg
+                      class="icon"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.6"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M12 16V3m-5 5 5-5 5 5M4 16v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"
+                      /></svg></span
+                  ><strong>拖入录音，或选择多个文件</strong
+                  ><span>WAV · MP3 · M4A · FLAC · OGG · 其他常用音频格式</span
+                  ><input
+                    type="file"
+                    id="trainFileInput"
+                    accept=".wav,.mp3,.m4a,.aac,.flac,.ogg,.opus,.wma,.aiff,.aif"
+                    multiple
+                    hidden
+                  />
+                </div>
+                <ul
+                  class="file-list"
+                  id="trainFileList"
+                  aria-label="已选训练素材"
+                ></ul>
+                <p id="trainDataHint" class="hint">
+                  单文件最多 64 MiB；清理时建议每份录音不超过 6 分钟。
+                </p>
+                <p
+                  class="field-status"
+                  id="trainUploadStatus"
+                  role="status"
+                ></p>
+                <button
+                  class="btn-secondary"
+                  id="trainRetryUpload"
+                  style="display: none"
+                >
+                  重试上传
+                </button>
+                <div
+                  class="audition"
+                  id="trainOrigAudition"
+                  style="display: none"
+                >
+                  <span class="audition-label">原始素材 · 首个文件</span
+                  ><audio
+                    controls
+                    preload="metadata"
+                    id="trainOrigAudio"
+                    aria-label="试听首个训练素材"
+                  ></audio>
+                </div>
+                <details class="training-cleanup">
+                  <summary>
+                    按需清理素材<span class="summary-aside"
+                      >单人干声可以跳过</span
+                    >
+                  </summary>
+                  <p class="hint">
+                    歌曲先分离人声，再去和声。有混响时再试去混响，逐步听审厚度与尾音。粤语和串烧可用，重点是同一歌手且没有重叠人声。
+                  </p>
+                  <div class="cascade" id="trainCascade"></div>
+                  <div class="param-group check-inline">
+                    <label class="check"
+                      ><input type="checkbox" id="recVad" />
+                      按语音活动切分（歌唱默认关闭，避免切断长音）</label
+                    >
+                  </div>
+                  <button class="btn-secondary" id="trainResetPre" disabled>
+                    ↺ 重置预处理（恢复到原始素材）
+                  </button>
+                </details>
+              </section>
+              <section class="card">
+                <div class="section-heading">
+                  <span class="step-no">03</span>
+                  <div><h2>确定训练计划</h2></div>
+                </div>
+                <div class="param-group">
+                  <label for="trainTier">训练方式</label
+                  ><select id="trainTier"></select>
+                </div>
+                <p id="trainTierDesc" class="preset-desc"></p>
+                <details class="advanced">
+                  <summary>高级训练设置</summary>
+                  <div class="param-group">
+                    <label for="trainMode">模式</label>
+                    <select id="trainMode">
+                      <option value="decoder">
+                        解码器微调（快速，mel-L1）
+                      </option>
+                      <option value="gan">旧版 GAN 微调</option>
+                      <option
+                        value="joint"
+                        id="trainJointOption"
+                        hidden
+                        disabled
+                      >
+                        联合微调（最多 50 步，待听审）
+                      </option>
+                      <option
+                        value="joint-full"
+                        id="trainFullOption"
+                        hidden
+                        disabled
+                      >
+                        完整联合训练（可恢复，完成后待听审）
+                      </option>
+                    </select>
+                  </div>
+                  <div class="param-group">
+                    <label for="trainSteps">训练步数</label>
+                    <input
+                      type="number"
+                      id="trainSteps"
+                      value="300"
+                      min="1"
+                      max="100000"
+                    />
+                  </div>
+                  <div class="param-group">
+                    <label for="trainSeg">片段帧长</label>
+                    <input
+                      type="number"
+                      id="trainSeg"
+                      value="40"
+                      min="8"
+                      max="200"
+                    />
+                  </div>
+                  <div class="param-group">
+                    <label for="trainEpochs"
+                      >训练轮数（完整训练默认 200）</label
+                    >
+                    <input
+                      type="number"
+                      id="trainEpochs"
+                      value="0"
+                      min="0"
+                      max="2000"
+                    />
+                  </div>
+                </details>
 
-        <footer><p>Resonantia | Powered by C++20/CUDA · 零 Python 运行时</p></footer>
+                <p class="hint" id="trainJointHint" hidden>
+                  短试听最多 50 步，用来检查素材与流程，不等于正式训练。
+                </p>
+                <div id="trainFullControls" hidden>
+                  <p class="hint">
+                    完整训练会保存进度和阶段候选。可以安全停止，并从保存点恢复。
+                  </p>
+                  <label class="check"
+                    ><input
+                      type="checkbox"
+                      id="trainResume"
+                    />恢复此任务已保存的训练进度</label
+                  >
+                </div>
+              </section>
+            </div>
+            <aside class="task-rail">
+              <section class="card task-card">
+                <span class="eyebrow">训练概览</span>
+                <h2>准备好了，再开始。</h2>
+                <dl class="task-facts">
+                  <div>
+                    <dt>任务</dt>
+                    <dd id="trainingNameSummary">尚未命名</dd>
+                  </div>
+                  <div>
+                    <dt>素材</dt>
+                    <dd id="trainingFilesSummary">尚未上传</dd>
+                  </div>
+                  <div>
+                    <dt>计划</dt>
+                    <dd id="trainingPlanSummary">载入中</dd>
+                  </div>
+                </dl>
+                <p class="hint">
+                  实际耗时取决于素材量和设备速度。开始后显示实测进度，不预设完成时间。
+                </p>
+                <button class="btn-convert" id="btnTrain" disabled>
+                  检查并开始训练
+                  <svg
+                    class="icon"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M5 12h14m-6-6 6 6-6 6" />
+                  </svg>
+                </button>
+                <p class="readiness" id="trainingReadiness" role="status">
+                  先命名任务并上传录音。
+                </p>
+              </section>
+              <section
+                class="card progress-section"
+                id="trainProgress"
+                style="display: none"
+                aria-labelledby="trainProgressTitle"
+              >
+                <span class="eyebrow">当前任务</span>
+                <h2 id="trainProgressTitle">训练进度</h2>
+                <p id="trainStage" role="status">准备中</p>
+                <div class="progress-bar">
+                  <div class="progress-fill" id="trainFill"></div>
+                </div>
+                <p class="hint">进度对应当前阶段，不代表整项任务剩余时间。</p>
+                <button class="btn-secondary" id="btnCancelTrain" disabled>
+                  安全停止训练
+                </button>
+                <p class="hint">
+                  等待当前阶段或训练步结束，完整训练保留已保存进度。
+                </p>
+                <details>
+                  <summary>查看运行日志</summary>
+                  <pre class="log-box" id="trainLog"></pre>
+                </details>
+                <button id="reviewCompleted" class="text-button" hidden>
+                  前往声线库听审候选 →
+                </button>
+              </section>
+            </aside>
+          </div>
+        </div>
+        <div
+          class="tab-panel"
+          id="panel-library"
+          role="tabpanel"
+          aria-labelledby="nav-library"
+          hidden
+        >
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">VOICE LIBRARY</span>
+              <h1>每一种声音，都有来处。</h1>
+              <p>使用已发布的声线，或继续听审训练候选。</p>
+            </div>
+            <span class="page-number">03 / 声线库</span>
+          </div>
+          <section class="card">
+            <div class="section-heading">
+              <div>
+                <h2>已发布声线</h2>
+                <p>可直接用于翻唱与声音转换。</p>
+              </div>
+            </div>
+            <div id="publishedVoices" class="published-voices">
+              <p class="hint">正在读取声线…</p>
+            </div>
+          </section>
+          <section class="card candidate-card">
+            <div class="section-heading">
+              <div>
+                <h2>训练记录与候选</h2>
+                <p>训练结束只是起点。试听、核对，再决定发布。</p>
+              </div>
+            </div>
+            <p class="hint">
+              完成训练 → 短片段试听 → 确认音质 →
+              发布到转换列表。暂停或中断的完整训练可从已保存进度恢复。
+            </p>
+            <div class="param-group inline">
+              <select id="trainingRun" aria-label="训练记录"></select
+              ><button id="refreshRuns" class="btn-small">刷新记录</button>
+            </div>
+            <p id="runInfo" class="hint" role="status"></p>
+            <details>
+              <summary>查看这次训练的日志</summary>
+              <button id="refreshRunLog" class="btn-small">读取最新日志</button>
+              <pre class="log-box" id="runLog"></pre>
+            </details>
+            <div class="param-group inline">
+              <select id="trainingCandidate" aria-label="候选轮次"></select
+              ><button id="previewCandidate" class="btn-secondary">
+                试听此候选</button
+              ><button id="resumeRun" class="btn-secondary">
+                填入恢复设置
+              </button>
+            </div>
+            <p class="hint">
+              候选试听会转到翻唱页，请上传一段短音频。完整训练索引就绪前使用检索率
+              0。
+            </p>
+            <div class="param-group">
+              <label for="publishName">发布名称（字母 / 数字 / _ / -）</label
+              ><input
+                id="publishName" maxlength="64"
+                type="text"
+                placeholder="例如 MySinger_Final"
+              />
+            </div>
+            <label class="check"
+              ><input id="publishReviewed" type="checkbox" />
+              我已听审此候选，清晰度、音色与动态符合要求</label
+            >
+            <button id="publishVoice" class="btn-secondary">发布此候选</button>
+            <p id="publishStatus" class="hint" role="status"></p>
+          </section>
+        </div>
+      </main>
+      <footer>Resonantia <span>声音的质感，来自每一步的认真。</span></footer>
     </div>
+    <dialog id="trainingConfirm" aria-labelledby="trainingConfirmTitle">
+      <form method="dialog">
+        <span class="eyebrow">开始前，最后确认</span>
+        <h2 id="trainingConfirmTitle">启动这次训练？</h2>
+        <p id="trainingConfirmSummary"></p>
+        <p class="hint">
+          任务会占用计算设备。你可以安全停止；完整训练从最近保存点恢复。训练结束后仍需听审和发布。
+        </p>
+        <div class="dialog-actions">
+          <button id="dismissTraining" class="btn-secondary" value="cancel">
+            返回检查</button
+          ><button id="confirmTraining" class="btn-convert" value="confirm">
+            确认开始训练
+          </button>
+        </div>
+      </form>
+    </dialog>
     <script src="app.js"></script>
-</body>
+    <script src="workflows.js"></script>
+    <script src="studio.js"></script>
+  </body>
 </html>

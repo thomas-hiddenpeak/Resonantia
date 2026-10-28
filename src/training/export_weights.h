@@ -17,6 +17,7 @@ struct ExportTensor {
   std::vector<int> shape;
   std::vector<float> data;
 };
+bool write_safetensors_atomic(const std::string& path, const std::vector<ExportTensor>& entries);
 
 inline void derive_wn(const std::vector<float>& fused, int rows, int inner,
                       std::vector<float>& g, std::vector<float>& v) {

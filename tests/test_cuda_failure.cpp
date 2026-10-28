@@ -6,11 +6,13 @@
 #include "cuda_failure_injection.h"
 #include "voxmutatio/f0/rmvpe_ops.h"
 #include "voxmutatio/synthesizer/vits_ops.h"
+#include "synthesizer/relative_attention.h"
 
 #include <array>
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -98,6 +100,43 @@ TEST_CASE("VITS CUDA temporary resources unwind at injected failures",
             input.data(), 1, 1, weight.data(), bias.data(), 1, 1, 1, 0, 1, 1);
     };
     exercise_failure_boundaries(call);
+}
+
+TEST_CASE("VITS GPU attention and transpose GEMM unwind all injected boundaries",
+          "[cuda][failure][vits]") {
+    namespace failure = resonantia_test::cuda_failure;
+    namespace ops = voxmutatio::synthesizer::ops;
+    const auto check = [](auto&& call) {
+        failure::reset();
+        REQUIRE_FALSE(call().empty());
+        REQUIRE(failure::live_allocation_count() == 0);
+        const std::array operations{Operation::kAllocation, Operation::kCopy,
+                                    Operation::kLaunch, Operation::kSynchronize};
+        std::array<std::size_t, 4> counts{};
+        for (std::size_t i=0;i<operations.size();++i) counts[i]=failure::call_count(operations[i]);
+        for (std::size_t i=0;i<operations.size();++i) {
+            for (std::size_t invocation=1;invocation<=counts[i];++invocation) {
+                CAPTURE(i,invocation);
+                failure::reset();
+                failure::fail_nth(operations[i],invocation);
+                REQUIRE_THROWS_AS(call(),std::runtime_error);
+                CHECK(failure::live_allocation_count()==0);
+            }
+        }
+        failure::reset();
+        REQUIRE_FALSE(call().empty());
+        CHECK(failure::live_allocation_count()==0);
+        failure::reset();
+    };
+    SECTION("relative attention") {
+        const std::vector<float> x(2*3*7,0.25f),relative(3*3,0.1f);
+        check([&] { return ops::relative_attention(x.data(),x.data(),x.data(),
+            relative.data(),relative.data(),7,2,3,1); });
+    }
+    SECTION("transpose convolution") {
+        const std::vector<float> x(8*7,0.25f),weight(8*8*4,0.1f),bias(8,0.2f);
+        check([&] { return ops::conv_transpose1d(x.data(),8,7,weight.data(),bias.data(),8,4,2,1); });
+    }
 }
 
 TEST_CASE("VITS direct ops reject invalid structural parameters before CUDA",

@@ -97,6 +97,13 @@ bool filter_stable_source(
     io::detail::RawFloatSpool& filtered,
     std::string& error);
 
+bool process_f0(
+    io::detail::RawFloatSpool& raw,
+    const std::filesystem::path& spool_directory,
+    const VCConfig& config,
+    io::detail::RawFloatSpool& processed,
+    std::string& error, double pad_seconds = 0, double duration_seconds = 0);
+
 bool plan_first_quiet_core(
     io::detail::RawFloatSpool& source,
     std::uint64_t source_samples,

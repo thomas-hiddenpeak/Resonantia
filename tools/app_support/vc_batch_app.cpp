@@ -46,6 +46,8 @@ void print_usage(std::ostream& output) {
         << "  --rms-mix <0-1>       RMS energy mix rate (default: 0.5)\n"
         << "  --protect <0-1>       Unvoiced protection (default: 0.5)\n"
         << "  --filter-radius <n>   F0 median filter radius (default: 0)\n"
+        << "  --synthesis-mode <m>  sampled (default) or legacy mean\n"
+        << "  --synthesis-seed <n>  Reproducible uint64 seed (default: 0)\n"
         << "  --version <v1|v2>     Checkpoint architecture (default: v1)\n"
         << "  --speakers <n>        Legacy hint; checkpoint speaker count is authoritative\n"
         << "  --sr <hz>             Model rate; only 40 kHz is currently supported\n"
@@ -121,6 +123,16 @@ ParseStatus parse_vc_batch_options(int argc, char* const argv[],
                 error << "error: --content-encoder must be hubert or wavlm\n";
                 return ParseStatus::kExitFailure;
             }
+        } else if (arg == "--synthesis-mode") {
+            const char* value = next(i, arg); if (!value) return ParseStatus::kExitFailure;
+            if (!cli::parse_synthesis_mode(value, options.config.synthesis_mode)) {
+                error << "error: --synthesis-mode must be sampled or mean\n";
+                return ParseStatus::kExitFailure;
+            }
+        } else if (arg == "--synthesis-seed") {
+            if (!cli::parse_integer_option<std::uint64_t>(argc, argv, i, arg, 0,
+                    std::numeric_limits<std::uint64_t>::max(), options.config.synthesis_seed, error))
+                return ParseStatus::kExitFailure;
         } else if (arg == "--speaker") {
             if (!cli::parse_integer_option(argc, argv, i, arg, 0,
                                            std::numeric_limits<int>::max(),

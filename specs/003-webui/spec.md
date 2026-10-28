@@ -2,7 +2,7 @@
 
 **Feature**: `003-webui`
 **Created from implementation**: 2026-08-09
-**Updated**: 2026-10-24
+**Updated**: 2026-10-29
 **Status**: Implementation present; acceptance partially verified; deployment/training experimental
 
 ## 1. Scope
@@ -15,13 +15,13 @@ browser -> vc_serve -> vc_preprocess / vc_train / build_index / vc_convert
 ```
 
 服务不是独立模型后端，不在进程内常驻加载模型，也不是实时音频服务器。训练端点只
-暴露 Spec 002 的实验性 decoder/GAN 路径，不能把 Web 可点击解释为训练已产品化。
+暴露 Spec 002 的实验性 decoder/GAN及显式joint路径，不能把 Web 可点击解释为训练已产品化。
 
 ## 2. Startup Contract
 
 ```text
 vc_serve [--host IPv4] [--port 8080] [--webroot PATH]
-         [--repo PATH] [--auth-token TOKEN]
+         [--repo PATH] [--auth-token TOKEN] [--ffmpeg /absolute/path]
 ```
 
 | Option | Default / behavior |
@@ -31,6 +31,7 @@ vc_serve [--host IPv4] [--port 8080] [--webroot PATH]
 | `--webroot` | `webui`，启动时解析为存在的 canonical directory |
 | `--repo` | 默认取 canonical webroot 的父目录 |
 | `--auth-token` | 默认空，即 **API 不认证**；非空时要求 `Authorization: Bearer ...` |
+| `--ffmpeg` | `/usr/bin/ffmpeg`，必须为绝对路径；缺依赖时仍可启动并接受 WAV |
 
 默认配置是为了本机/受信网络便捷使用的“开放”模式。服务在
 `0.0.0.0` 且 token 为空时打印警告，但仍会启动。公网或不受信网络部署必须显式增加
@@ -44,20 +45,30 @@ Bearer token 只保护 `/api/` 路径；静态 Web 资源仍可公开读取。�
 | Method and path | Behavior |
 |---|---|
 | `GET /` and static paths | 从 canonical webroot 提供 WebUI 文件 |
-| `GET /api/voices` | 枚举 base/已导出声线及当前训练状态 |
+| `GET /api/voices` | 枚举 base/已导出声线、当前训练状态及`training_profiles`（decoder/gan/joint/joint-full） |
 | `GET /api/sep-models` | 按任务返回已安装分离模型 |
-| `POST /api/material` | 上传一组 WAV，并 staged 替换 raw/work material |
+| `POST /api/material` | 上传一组支持的音频，归一化为 WAV 后 staged 替换 raw/work material |
 | `POST /api/step` | 对 work set 执行一次 separation/de-reverb/de-echo/de-noise/de-harmony |
 | `GET /api/preview?name=...` | 返回 work set 的首个 WAV |
-| `POST /api/preprocess` | 对单个 WAV 执行可选预处理并返回 WAV preview |
-| `POST /api/train` | 启动单个 decoder 或 GAN 实验训练任务 |
+| `POST /api/preprocess` | 对单个支持的音频归一化后执行可选预处理并返回 WAV preview |
+| `POST /api/train` | 启动单个decoder/GAN/joint/joint-full训练任务；joint默认50步、seg32、epochs0；joint-full独立契约见下文 |
 | `GET /api/train/status` | 返回 job_id/kind/state、stage/running/done/error、cancel_requested/cancelled/cancellable/cancel_boundary 与受限 log tail |
 | `POST /api/train/cancel` | 单个 job_id 定位训练作业；202接受请求、200重复请求，阶段/完整训练迭代边界取消，发布开始后409 |
 | `POST /api/convert` | 对上传或 material session 的 WAV 运行离线转换，返回 WAV；正数 `index_rate` 要求所选声线存在 Index，零值显式 no-index |
 
 未知 API 返回 404；已知 API 的方法不匹配返回 405 并带对应 `Allow`；非 API 静态路径
 的非 GET 请求返回 405/`Allow: GET`。这些方法语义由 `test_web_contract` 真实 socket
-门禁覆盖。上传和输出均为 WAV-only。
+门禁覆盖。上传支持 FR-012 的格式清单；内部素材、模型 CLI 输入及输出仍为 WAV。
+
+joint映射到`vc_train --gan --gan-profile joint`，复用原取消和model/index/clips事务发布。
+UI仅在`training_profiles`明确声明joint时显示选项；不声明的旧服务继续隐藏，刷新能力
+不覆盖用户已填参数。joint选中时步数上限50，seg32/epochs0固定；详细输入边界见Spec 002。
+
+`presets.json`的推理预设可用可选`voice`精确匹配一个声线名。用户选择该声线时自动
+应用对应预设；异步声线/预设加载顺序不影响结果，同一声线刷新不覆盖用户后续手动调整。
+未匹配声线保持当前参数。正式声线`Tom_Cybersinger`匹配`tom_cybersinger`：index0.35、RMS0、
+protect0.5、filter3、pitch0。RMS0跟随原唱强弱，1保留模型音量；这是参数说明，不是
+任意输入质量保证。是否已部署及听审范围见PROJECT_STATE。
 
 ## 4. Functional Requirements
 
@@ -68,8 +79,9 @@ Bearer token 只保护 `/api/` 路径；静态 Web 资源仍可公开读取。�
   token 轮换后，后续请求必须允许重新输入；已完成的提示结果不得永久缓存。
   `test_web_auth_ui` 以生产 JS 验证重试、并发提示共享、轮换及 sessionStorage 失败回退；
   Node.js 18+ 仅用于可选的测试运行，不增加 WebUI 构建或服务运行依赖。
-- **FR-004 WAV-only upload**：文件名扩展名必须为 `.wav`，内容必须具有 RIFF/WAVE
-  signature；重复或不安全文件名失败。
+- **FR-004 Upload validation**：扩展名按 FR-012 白名单校验，不区分大小写；WAV 保持原有
+  RIFF/WAVE signature 校验及字节，新格式必须完整解码后提交；不安全文件名或归一化为
+  `.wav` 后重名的整次上传失败（如 `song.mp3` 与 `song.flac`）。
 - **FR-005 CLI orchestration**：GPU 操作调用已构建 CLI，不在 HTTP worker 内嵌模型。
   子进程以参数向量直接启动，不拼接 shell 命令；日志过滤不得改变真实退出状态；监听与
   客户端 socket 必须 close-on-exec，不能被长寿命 CLI 继承。
@@ -86,7 +98,9 @@ Bearer token 只保护 `/api/` 路径；静态 Web 资源仍可公开读取。�
   成功提交或完整回滚才允许销毁备份。异常可能留下部分 live 与保留备份，保证可恢复，
   不保证自动恢复或不中断可用；服务诊断须记录保留路径，恢复方式见 `docs/DESIGN.md`。
 - **FR-008 Temporary cleanup**：一次性预处理/转换使用 `mkdtemp` 唯一路径并由 RAII
-  清理。
+  清理。成功转换在清理前把 CLI 日志末尾最多 2048 bytes（包含 HuBERT/F0/Index/Synth
+  timing）写入服务日志，并记录子进程至结果读回的 wall time；不改变 WAV 响应或新增
+  持久任务/进度 API。该 wall time 不包含此前输入预处理，也不是纯 GPU kernel 时间。
 - **FR-009 Path containment**：静态路径拒绝绝对路径、`.`/`..`，解析 canonical path
   后确认仍位于 canonical webroot；越界 symlink 不得读取。
 - **FR-010 Error honesty**：CLI 非零退出、信号终止、启动/等待/日志 I/O 失败、空输出或
@@ -174,6 +188,33 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
 
 
 
+## 2026-10-26完整联合训练增量（实施中）
+
+沿用[ADR-0009](../../docs/adr/0009-resumable-joint-training.md)的已授权迁移。
+`mode=joint-full`显式选择完整联合训练，默认200轮、crop32，单GPU batch1。
+旧decoder/gan/joint接口与发布行为保持；新模式的结果留在声线目录的
+`full_training/result/`，仅表示训练产物完成，听审接受前不加入声线列表或替换现有声线。
+
+- 新作业固定一份`full_training/clips/`；缓存、恢复点和阶段候选保存在相邻目录，
+  与一次性staging分离。取消、失败及服务重启后保留。一个声线名称仅容纳一个完整作业，
+  重开完整训练使用新名称；不能静默覆盖已有完整状态。
+- `resume=1`仅用于本模式，复用固定clips及最新完整恢复点，禁止同时上传或改变清理选项。
+  若预处理已完成但尚无恢复点，允许从第0步启动并在日志中明确说明。
+  数据/配方身份由CLI再次校验，不能用推理G代替恢复点。
+- `prepared=1`是本模式的可选API参数：已有work/raw是人工审核的40k、0.32..6秒切片，
+  原样固定，不重切、不加清理；与VAD及所有清理选项互斥，CLI在CUDA前验证每片元信息。
+  默认`prepared=0`沿用Web预处理。此入口供固定训练/留出集，浏览器默认仍自动切片。
+- 参数中显式boolean仍只接受0/1；`steps`不用于joint-full，轮次1..2000。
+
+页面载入时读取现有`/api/train/status`，仅对仍在运行且有name/job_id的train任务恢复进度
+轮询和取消按钮，不要求重新上传文件；不改变用户已填名称，不恢复step或历史终态。
+异步状态返回不能覆盖页面内已经发起的新作业。此功能只恢复浏览器跟踪，不自动开始、
+取消或恢复服务端训练；服务进程重启后的续训仍须显式`resume=1`。
+训练进度区分模型/数据核验、冻结前端缓存段数和联合训练步数/轮次；缓存准备阶段不得
+显示旧的固定55%训练进度。恢复作业追加日志时，使用较新的阶段，避免显示前次运行的步数。
+  状态返回`resumable`和`review_required`，长训练日志包含epoch/step/LR和阶段耗时。
+  UI区分待听审结果与已发布声线。GPU串行、作业归属、取消安全点及失败诚实契约不变。
+
 ## 5. Request and Resource Boundaries
 
 当前实现的硬边界：
@@ -220,6 +261,34 @@ multipart part header 必须逐行解析：每个 part 有唯一的 `Content-Dis
 [RFC 5322 §2.2.3](https://www.rfc-editor.org/rfc/rfc5322.html#section-2.2.3)；不据此宣称完整 MIME 兼容。
 上述拒绝发生在 upload staging 前，必须保留旧 raw/work/marker，不启动模型 CLI。
 
+### Multi-format upload (WEB-FR-012)
+
+2026-10-24 维护者明确批准服务器 FFmpeg 方案，见
+[ADR-0007](../../docs/adr/0007-web-audio-upload-decoding.md)。material、带文件 training、
+preprocess、convert 共享同一归一化入口，支持 WAV、MP3、M4A（AAC/ALAC）、AAC、FLAC、
+OGG（Vorbis/Opus）、Opus、WMA、AIFF/AIF。WAV 字节保持不变；其他格式在 request staging
+中由 CPU FFmpeg 解码成 PCM16、44.1 kHz、mono WAV；模型输出继续遵守 40 kHz WAV 契约。
+原输入可能有损；下混/重采样/量化不承诺保存原始多声道或高位深。
+
+仅允许对应 demuxer 和本地 file 协议，禁用 MOV 外部引用，选取首个音轨，丢弃视频、字幕、
+数据和 metadata。以 argv 启动 `/usr/bin/timeout`、`/usr/bin/prlimit`、配置的 FFmpeg；
+不使用 shell。每实例最多一个解码批次，解码线程2、filter线程1、地址空间2 GiB、单次
+分配64 MiB、每文件120秒 deadline，TERM后2秒未退出则KILL。此限制不适用于模型进程。
+新解码产物每文件最多64 MiB、每批累计128 MiB（约12.7/25.4分钟 PCM16单声道），超限
+整批413；FFmpeg截断停止的输出不得被接纳。原HTTP body128 MiB/inflight256 MiB仍生效。
+错误为400（格式/损坏/无音轨/超时）、409（decoder busy）、413（解码超限）、503（依赖
+不可启动），磁盘staging错误500。失败不得提交素材或调用模型；已存在素材及marker保留。
+
+UI 两个选择/拖拽入口使用相同白名单；训练支持多文件。上传和准备期间禁用预处理与主
+操作按钮，失败显示原因；同一入口按序上传，过期响应不能重新启用旧素材。时长仅用
+浏览器metadata估算，浏览器不认识的格式仍可由服务器解码为WAV试听。
+
+迁移：保留现有WAV路径与数据，部署完整音频codec的FFmpeg及coreutils/util-linux；
+独立构建和短音频验证后备份vc_serve及UI，在无活动任务时一起切换并重启。回滚恢复
+二进制与UI，新增素材已是标准WAV，无需迁移模型或原文件。部署验证仅GET，由用户试听。
+`test_web_audio_upload`覆盖四入口、失败事务、大小/并发/超时；`test_web_audio_ui`覆盖界面；
+`RESONANTIA_ENABLE_AUDIO_CODEC_TESTS=ON`注册真实短人声的`test_web_audio_codecs`。
+
 ## 6. Security Boundary and Non-goals
 
 已实现的输入安全边界不能替代部署安全设施。当前明确不提供：
@@ -229,7 +298,7 @@ multipart part header 必须逐行解析：每个 part 有唯一的 `Content-Dis
 - CSRF/session 体系、速率限制或分布式防滥用；
 - 容器/OS 沙箱；CLI 子进程仍拥有服务进程的文件与设备权限；
 - WebSocket、麦克风采集或实时音频 streaming；
-- 非 WAV 上传或输出。
+- FR-012 白名单外的输入、视频/播放列表/DRM媒体及非 WAV 输出。
 
 因此默认 `0.0.0.0` + 空 token 只适合受信环境。面向公网时必须由部署者补齐 TLS、
 身份认证、网络限制、进程权限和持久数据保护。
@@ -335,7 +404,7 @@ P2结束时默认快速回归为**19/19，0失败/skip，21.78秒**；长门禁�
 
 ## 8. Success Criteria
 
-- 已配置的受信环境中，用户可通过 Web 完成 WAV material、可选预处理、实验训练状态
+- 已配置的受信环境中，用户可通过 Web 完成音频上传并归一化为 WAV material、可选预处理、实验训练状态
   查看和离线 WAV 转换。
 - 启用 token 后 API 不允许匿名访问。
 - 路径穿越和越界 symlink 不暴露 webroot 外文件。
@@ -365,3 +434,77 @@ Spec 的鉴权、资源、事务或路由契约；它不是 `vc_serve` 的库形
 回滚触发条件是公共头消费者无法编译/链接、`vc_serve` 现有 HTTP 契约回退或默认门禁注册
 减少。回滚应恢复兼容声明/符号并修复迁移层，不能恢复占用 CPU 的忙循环，也不涉及任何
 用户模型、音频或训练数据迁移。
+
+## 2026-10-29 正式声线与翻唱工作流（已实现，限定资产验证）
+
+用户已听审通过 CyberTom 200 epoch / 81,200 step 正式训练及修正版完整翻唱。
+新增能力沿用现有 C++ CLI、单 GPU 串行 HTTP 服务与 runs 目录，不改变模型格式。
+
+- 发布须显式确认听审，完整训练候选可先试听；训练结束不等于发布。已有声线不得被覆盖。
+- 完整歌曲使用立体声人声分离 → 立体声去和声 → 主唱转换；干声可跳过清理。
+  去混响仍可选，不能默认为所有素材有益。歌曲可输出带原伴奏的翻唱，使用固定增益避免削波，
+  不使用压缩器；分离残留与局部错音仍须听审。
+- 转换会话隔离、处理中锁定输入；处理失败不展示旧结果为新结果。兼容旧 HTTP 字段；
+  新字段缺省保留旧行为。FFmpeg 立体声解码仅对显式请求开启，保留原资源限制。
+- 训练界面默认完整联合训练 200 epoch；短试验最多 50 step，显示其用途。
+  展示实际阶段、轮次/步数与日志；提供历史任务、断点恢复、候选试听及发布入口。
+- 人工局部修音以输入音频的秒为坐标，只支持短区间平滑或半音偏移，默认关闭，
+  不允许跨无声区插音；不将本次歌词特定校正宣称为自动通用修复。
+- 新能力须通过接口错误路径、前端状态、真实模型短片段及完整回归验证后部署。
+
+兼容与回滚：发布操作保留已有声线/训练素材/完整训练状态；旧 CLI 单声道预处理默认不变。
+新增立体声处理仅适用于完整文件、不剪切时间轴；回滚可使用原服务二进制和静态页面，
+保留正式模型供后续恢复。实际验证记录见 PROJECT_STATE。
+
+同日维护者另行明确要求清除历史声线并改名：本机仅保留正式发布的 **Tom Cybersinger**，
+内部安全名称为`Tom_Cybersinger`，8个旧声线的模型/索引及其目录内的候选模型副本实际删除，
+不以界面隐藏代替清理。原正式训练任务`CyberTom_Full_20261026`保留素材、checkpoint、
+阶段候选和日志；它是训练来源，不再作为第二个发布声线。正式模型与索引字节、听审参数不变。
+声线列表、默认预设、正式版说明及训练记录显示名称同步；这次删除不改变以后显式训练/发布的能力。
+
+### 新增 HTTP 字段与端点
+
+| 接口 | 新增契约 |
+|---|---|
+| `GET /api/train/runs` | 发现含 `full_training` 的任务，列出规范命名的阶段候选、`result_ready` 与 `resumable`；恢复须同时存在固定clips与非空checkpoint |
+| `POST /api/train/publish` | multipart `name,candidate,publish_name,reviewed=1`；仅接受该run的正规候选文件与完成索引。400非法/未听审，404缺资产，409忙/目标已有model、index或clips，500发布失败。复用三件套回滚事务，review记录随clips发布；不覆盖现有声线 |
+| `GET /api/voices` | 保留 `voices` 字符串数组，新增 `reviewed_voices` 供区分听审发布与历史声线 |
+| `POST /api/material` | 可选 `preserve_stereo=1`，非WAV音频用FFmpeg解码到44.1k双声道PCM16；缺省仍为mono，WAV保持原内容 |
+| `POST /api/step` | 原返回对象新增 `job_id`，浏览器只认领相同任务；清理显式调用立体声完整文件路径 |
+| `POST /api/convert` | `workflow=manual|song|harmonies|dry`（缺省manual）、`output_kind=vocal|mix`（缺省vocal）。mix仅限song。manual取session/work，其他取session/raw，锁定GPU后固定输入快照；pp_*也适用于session输入 |
+| `POST /api/convert` | 可选 `training_run,candidate` 试听未发布候选；检索率>0仍须完成索引。可选 `pitch_edits` 沿用Spec001的严格语法与边界 |
+
+song先独立生成全人声，随后去和声；干声可选去混响。RoFormer之间用双声道float32 WAV，
+清理结束后转mono40k PCM16再进入模型，与已听审交付路径相同。需要时对主唱作一次固定
+降增益防止PCM16削波。混音为 `原立体声 − 全人声 + 转换主唱`，使用全曲单一增益使峰值≤0.95，
+不使用压缩/限制器，也不加入原伴唱。库仍只读WAV，压缩格式解码依赖已批准的FFmpeg方案。
+清理输入上限600秒/128MiB，上传、解码与HTTP响应原上限不扩大；超大float32清理预览可
+生成PCM16试听副本，原处理结果不变，副本仍须≤64MiB。
+
+界面默认完整歌曲与混音输出，默认Tom Cybersinger及听审参数；若未安装正式声线，不显示
+已发布说明。训练只推荐完整联合200轮与最多50步短试验，旧配方保留高级入口。
+每标签页独立material会话；处理中锁定输入与参数，不接受旧job完成冒充当前步骤。
+进度条表示当前阶段真实计数，未知进度不提供伪百分比；训练展示日志实测计算秒/步，
+不等于完整墙钟时间或GPU利用率。候选试听与发布必须由使用者确认，不自动晋升。
+
+## 2026-10-29 工作室交互（WEB-FR-013）
+
+维护者要求按实际业务重设计UI并自审后发布。前端仍为无构建HTML/CSS/JS；不改变HTTP、
+GPU所有权、存储格式或音频算法。设计、验收清单与证据见
+[工作室交互记录](../../docs/WEBUI_STUDIO_20261029.md)。
+
+- 三个独立入口：制作翻唱、训练声线、声线库。翻唱先上传并确认输入类型，再选择声线，
+  最后生成和听审；新训练按任务名称、录音检查/清理、训练计划、启动确认排序。
+- 处理概览从当前设置生成，清楚区分将要执行的步骤和真正执行状态；没有后端计数时
+  只展示等待时间。不得以模拟阶段、GPU利用率或估算百分比冒充执行证据。
+- 上传失败可以原位重试；HTTP业务错误不等于服务离线；连接中断可重连。处理中锁定
+  相应输入，活动训练阻止新的生成，训练启动须确认摘要；训练阶段仍使用原取消契约。
+- 生成结果记录其输入、声线和参数背景；修改设置明确提示结果仍是上一版。原始与转换
+  音频可同位置切换且不重叠播放。局部修音放在结果听审后，非法区间在请求前拒绝并保留结果。
+- 声线库分开已发布声线与训练候选；空记录/无候选/无恢复点时禁用相应操作，候选试听
+  明确标记未发布。发布保留原显式听审确认，正式声线Tom Cybersinger及参数不变。
+- 提供键盘上传与页签导航、可见焦点、状态/错误文本、桌面双列与手机单列布局；可选
+  浏览器门禁验证320/390/768/1440宽度及WCAG相关自动规则，不把自动检查称为完整认证。
+
+迁移仅替换静态页面；开发期间正式服务使用冻结页面，验收后切换。回退使用同一服务的
+旧页面，不改模型/Index/素材。现有Node和Web门禁继续保留，独立浏览器HTTP替身明确标记。

@@ -36,6 +36,15 @@ ADR 记录会长期影响模块边界、依赖、持久格式、运行时、部�
 - [`ADR-0006`](0006-training-cancellation-ownership.md)：训练作业代号、单一所有者和阶段边界取消
   （`Proposed`，2026-10-10；用户已明确授权本增量实施，正式ADR审查状态保留；无强杀/自动超时）。
 
+- [`ADR-0007`](0007-web-audio-upload-decoding.md)：Web 常见音频格式上传与服务器 FFmpeg
+  解码（`Accepted`，2026-10-24；维护者明确同意服务器 FFmpeg 方案，已实施上传归一化）。
+
+- [`ADR-0008`](0008-joint-voice-training-alignment.md)：有界联合微调、可训练prior/说话人
+  条件及独立训练对齐（`Accepted`，2026-10-25；维护者已批准，库内单步验证中；不授权长训练）。
+
+- [`ADR-0009`](0009-resumable-joint-training.md)：联合长训练完整状态恢复、冻结前端缓存与
+  有界产物管理（`Proposed`；2026-10-26维护者已授权能力补齐及200轮计划推进，实施状态见Spec 002）。
+
 ## 最小模板
 
 ```markdown

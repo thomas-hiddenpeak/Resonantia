@@ -56,7 +56,7 @@ TEST_CASE("RMVPE salience alignment", "[rmvpe][alignment]") {
 
     std::string model_path = "../models/rmvpe.safetensors";
     std::string audio_path = "../tests/fixtures/speech_librispeech.wav";
-    std::string ref_path = "../tests/fixtures/rmvpe_ref_salience.bin";
+    std::string ref_path = "../tests/fixtures/rmvpe_htk_salience.bin";
 
     auto audio = io::read_audio(audio_path);
     REQUIRE(audio.has_value());
@@ -100,7 +100,7 @@ TEST_CASE("RMVPE F0 alignment (SC-002)", "[rmvpe][alignment][f0]") {
 
     std::string model_path = "../models/rmvpe.safetensors";
     std::string audio_path = "../tests/fixtures/speech_librispeech.wav";
-    std::string ref_path = "../tests/fixtures/rmvpe_ref_f0.bin";
+    std::string ref_path = "../tests/fixtures/rmvpe_htk_f0.bin";
 
     auto audio = io::read_audio(audio_path);
     REQUIRE(audio.has_value());
@@ -121,11 +121,14 @@ TEST_CASE("RMVPE F0 alignment (SC-002)", "[rmvpe][alignment][f0]") {
     std::cout << "C++ F0: " << f0v.size() << " frames" << std::endl;
     REQUIRE(static_cast<int>(f0v.size()) == ref_T);
 
-    // Compare voiced frames (where reference F0 > 0)
+    REQUIRE(ref.shape == std::vector<int>{ref_T});
+    // Compare every UV decision as well as the voiced pitch against upstream.
     int voiced = 0, matched = 0;
     double max_err = 0.0, sum_err = 0.0;
     for (int t = 0; t < ref_T; ++t) {
         float ref_f0 = ref.data[t];
+        REQUIRE(std::isfinite(f0v[t]));
+        CHECK((f0v[t] > 0) == (ref_f0 > 0));
         if (ref_f0 > 0) {
             voiced++;
             double err = std::abs(f0v[t] - ref_f0);
@@ -140,6 +143,8 @@ TEST_CASE("RMVPE F0 alignment (SC-002)", "[rmvpe][alignment][f0]") {
     std::cout << "Mean F0 error: " << mean_err << " Hz, max: " << max_err << " Hz" << std::endl;
 
     // SC-002: mean F0 error < 0.5 Hz on voiced frames
+    REQUIRE(voiced > 0);
+    CHECK(max_err < 0.5);
     CHECK(mean_err < 0.5);
     // Most voiced frames should match tightly
     CHECK(matched >= voiced * 0.95);

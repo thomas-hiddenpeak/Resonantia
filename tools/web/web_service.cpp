@@ -11,6 +11,7 @@
 #include <limits>
 #include <random>
 #include <chrono>
+#include <cmath>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include "voxmutatio/separation/sep_registry.h"
+#include "voxmutatio/io/audio_io.h"
 
 namespace resonantia::web {
 
@@ -50,6 +52,17 @@ bool nonempty_regular_file(const fs::path& path) {
     return !error && size != 0;
 }
 
+bool candidate_name(const std::string& name) {
+    return name.size() == 38 && name.starts_with("candidate_epoch_") &&
+           name.ends_with(".safetensors") &&
+           name.substr(16, 10).find_first_not_of("0123456789") == std::string::npos;
+}
+
+bool regular_candidate(const fs::path& path) {
+    std::error_code ec;
+    return fs::is_regular_file(fs::symlink_status(path, ec)) && !ec && nonempty_regular_file(path);
+}
+
 bool valid_wav_file(const fs::path& path) {
     if (!nonempty_regular_file(path)) return false;
     std::error_code error;
@@ -68,6 +81,33 @@ bool exceeds_buffered_response_limit(const fs::path& path) {
     return !error && size > kMaxFileBytes;
 }
 
+// Constant gain only: preserve the original stereo residual and the converted
+// vocal envelope. No compressor, limiter, or automatic loudness normalization.
+bool mix_cover(const std::string& original, const std::string& all_vocals,
+               const std::string& converted, const std::string& output) {
+    namespace io = voxmutatio::io;
+    auto source = io::read_stereo_audio(original);
+    auto vocals = io::read_stereo_audio(all_vocals);
+    auto voice = io::read_audio(converted, 44100);
+    if (!source || !vocals || !voice || source->data.empty() || voice->data.empty() ||
+        source->frames() != vocals->frames() ||
+        std::abs(static_cast<long long>(source->frames()) -
+                 static_cast<long long>(voice->data.size())) > 2) return false;
+    double peak = 0;
+    for (std::size_t i = 0; i < source->data.size(); ++i) {
+        source->data[i] = source->data[i] - vocals->data[i] +
+            voice->data[std::min(i / 2, voice->data.size() - 1)];
+        if (!std::isfinite(source->data[i])) return false;
+        peak = std::max(peak, static_cast<double>(std::abs(source->data[i])));
+    }
+    const double gain = peak > 0.95 ? 0.95 / peak : 1.0;
+    for (float& value : source->data) value *= gain;
+    std::fprintf(stderr, "[vc_serve] cover fixed gain=%.6f dB frames=%zu\n",
+                 20 * std::log10(gain), source->frames());
+    return io::write_stereo_audio(output, source->data.data(),
+                                  static_cast<int>(source->frames()), 44100);
+}
+
 std::optional<fs::path> first_valid_wav(const fs::path& directory) {
     std::error_code error;
     for (fs::directory_iterator entry(directory, error), end; !error && entry != end;
@@ -80,6 +120,30 @@ std::optional<fs::path> first_valid_wav(const fs::path& directory) {
         if (valid_wav_file(entry->path())) return entry->path();
     }
     return std::nullopt;
+}
+
+std::optional<fs::path> latest_full_checkpoint(const fs::path& directory) {
+    if(!fs::is_directory(directory))return std::nullopt;
+    std::optional<fs::path> latest;
+    for(const auto& entry:fs::directory_iterator(directory)) {
+        const auto name=entry.path().filename().string();
+        if(name.size()==33 && name.starts_with("state_step_") && name.ends_with(".safetensors") &&
+           name.substr(11,10).find_first_not_of("0123456789")==std::string::npos &&
+           fs::is_regular_file(entry.symlink_status()) && entry.file_size()>0 && (!latest || entry.path()>*latest))
+            latest=entry.path();
+    }
+    return latest;
+}
+
+void copy_training_clips(const fs::path& source,const fs::path& destination) {
+    fs::create_directories(destination);std::size_t count=0;
+    for(const auto& entry:fs::directory_iterator(source)) {
+        if(lower(entry.path().extension().string())!=".wav")continue;
+        if(!fs::is_regular_file(entry.symlink_status()) || !valid_wav_file(entry.path()) || ++count>4096)
+            throw std::runtime_error("invalid or excessive prepared training clips");
+        fs::copy_file(entry.path(),destination/entry.path().filename());
+    }
+    if(!count)throw std::runtime_error("no prepared training clips");
 }
 
 }  // namespace
@@ -156,7 +220,7 @@ bool WebService::training_checkpoint(std::uint64_t generation, const std::string
 WebService::TrainingOutcome WebService::run_training(std::uint64_t generation, std::string name, std::string mode, int steps,
                               int segment, int epochs, bool separate,
                               bool dereverb, bool deecho, bool denoise,
-                              bool deharmony, bool vad) {
+                              bool deharmony, bool vad, bool resume, bool prepared) {
     std::unique_lock<std::mutex> gpu_lock(gpu_mutex_, std::defer_lock);
     while (!gpu_lock.try_lock()) {
         std::unique_lock<std::mutex> lock(job_.mu);
@@ -168,6 +232,11 @@ WebService::TrainingOutcome WebService::run_training(std::uint64_t generation, s
     }
     if (!training_checkpoint(generation, "preparing")) return TrainingOutcome::kCancelled;
     const fs::path directory = fs::path(paths_.runs) / name;
+    const bool full=mode=="joint-full";
+    const fs::path full_dir=directory/"full_training";
+    if(full&&!resume) {
+        if(!fs::create_directory(full_dir))throw std::runtime_error("full training directory already exists");
+    }
     const fs::path log = directory / "train.log";
     TempDir staged(directory, ".train_stage_");
     const fs::path staged_root = staged.path();
@@ -175,7 +244,7 @@ WebService::TrainingOutcome WebService::run_training(std::uint64_t generation, s
     const fs::path model = staged_root / "model.safetensors";
     const fs::path index = staged_root / "model.index";
     {
-        std::ofstream output(log, std::ios::trunc);
+        std::ofstream output(log, resume ? std::ios::app : std::ios::trunc);
         output << "[serve] training '" << name << "' mode=" << mode
                << (epochs > 0 ? " epochs=" + std::to_string(epochs)
                               : " steps=" + std::to_string(steps))
@@ -196,6 +265,11 @@ WebService::TrainingOutcome WebService::run_training(std::uint64_t generation, s
     if (!training_checkpoint(generation, !preprocessed && has_separation ? "separating" : "preprocessing"))
         return TrainingOutcome::kCancelled;
 
+    if(full && resume) {
+        copy_training_clips(full_dir/"clips",clips);
+    } else if(full && prepared) {
+        copy_training_clips(source,clips);
+    } else {
     ProcessSpec preprocess;
     preprocess.argv = {paths_.build + "/vc_preprocess", "--input", source.string(),
                        "--output-dir", clips.string(), "--sr", "40000",
@@ -224,16 +298,33 @@ WebService::TrainingOutcome WebService::run_training(std::uint64_t generation, s
     if (!process_runner_->run(preprocess).success() || !first_valid_wav(clips)) {
         return TrainingOutcome::kError;
     }
+    }
+    if(full&&!resume) {
+        // Commit a complete fixed dataset before the trainer starts. Staging
+        // cleanup can never delete this copy or its checkpoints on cancellation.
+        const auto fixed_staged=staged_root/"fixed_clips";
+        copy_training_clips(clips,fixed_staged);fs::rename(fixed_staged,full_dir/"clips");
+    }
 
     if (!training_checkpoint(generation, "training")) return TrainingOutcome::kCancelled;
     ProcessSpec training;
     training.argv = {paths_.build + "/vc_train"};
-    if (mode == "gan") {
+    if (mode == "gan" || mode == "joint" || full) {
         training.argv.insert(training.argv.end(), {"--gan", "--dmodel", paths_.dmodel});
+    }
+    if(mode=="joint")training.argv.insert(training.argv.end(),{"--gan-profile","joint"});
+    if(full) {
+        training.argv.insert(training.argv.end(),{"--gan-profile","joint-full",
+            "--cache-dir",(full_dir/"cache").string(),"--checkpoint-dir",(full_dir/"checkpoints").string()});
+        if(resume) {
+            if(const auto saved=latest_full_checkpoint(full_dir/"checkpoints"))
+                training.argv.insert(training.argv.end(),{"--resume",saved->string()});
+            else std::ofstream(log,std::ios::app)<<"[serve] no completed checkpoint; restarting fixed clips from step 0\n";
+        }
     }
     training.argv.insert(training.argv.end(),
                          {"--hubert", paths_.hubert, "--rmvpe", paths_.rmvpe,
-                          "--pretrained", paths_.gmodel, "--target", clips.string(),
+                          "--pretrained", paths_.gmodel, "--target", (full?full_dir/"clips":clips).string(),
                           "--out", model.string()});
     if (epochs > 0) {
         training.argv.insert(training.argv.end(),
@@ -245,7 +336,8 @@ WebService::TrainingOutcome WebService::run_training(std::uint64_t generation, s
     training.argv.insert(training.argv.end(), {"--seg", std::to_string(segment)});
     training.log_path = log;
     training.log_filter_terms = {"step", "mel", "Device", "frames", "Epochs",
-                                 "Exported", "clips", "done", "error", "GAN", "cancelled"};
+                                 "Exported", "clips", "done", "error", "GAN", "cancelled",
+                                 "Cache", "Checkpoint", "Candidate", "seconds", "identity", "Resumed"};
     ProcessResult training_result;
     {
         const auto token = staged_root / "cancel";
@@ -289,30 +381,118 @@ WebService::TrainingOutcome WebService::run_training(std::uint64_t generation, s
 
     if (!training_checkpoint(generation, "publishing")) return TrainingOutcome::kCancelled;
     std::string publish_error;
-    if (!replace_training_artifacts(directory, clips, model, index, publish_error)) {
+    const auto destination=full?full_dir/"result":directory;
+    fs::create_directories(destination);
+    if (!replace_training_artifacts(destination, clips, model, index, publish_error)) {
         std::fprintf(stderr, "[vc_serve] training publish failed for '%s': %s\n",
                      name.c_str(), publish_error.c_str());
         return TrainingOutcome::kError;
     }
-    std::ofstream(log, std::ios::app) << "[serve] done.\n";
+    std::ofstream(log, std::ios::app) << (full?"[serve] done; review required; candidate retained in full_training/result, existing voice unchanged.\n":"[serve] done.\n");
     return TrainingOutcome::kDone;
 }
 
 std::string WebService::voices_json() {
+    std::lock_guard<std::mutex> material_lock(material_mutex_);
     std::string j = "{\"base\":\"base (pretrained)\",\"voices\":[";
     bool first = true;
+    std::vector<std::string> reviewed;
     if (fs::is_directory(paths_.runs)) {
         std::vector<std::string> names;
         for (auto& e : fs::directory_iterator(paths_.runs))
             if (e.is_directory() && fs::exists(e.path() / "model.safetensors"))
                 names.push_back(e.path().filename().string());
         std::sort(names.begin(), names.end());
-        for (auto& n : names) { if (!first) j += ","; j += "\"" + json_escape(n) + "\""; first = false; }
+        for (auto& n : names) {
+            if (!first) j += ","; j += "\"" + json_escape(n) + "\""; first = false;
+            if (regular_candidate(fs::path(paths_.runs)/n/"clips/release.json")) reviewed.push_back(n);
+        }
+    }
+    j += "],\"reviewed_voices\":["; first = true;
+    for (const auto& name : reviewed) {
+        if (!first) j += ','; first = false; j += "\"" + json_escape(name) + "\"";
     }
     { std::lock_guard<std::mutex> lk(job_.mu);
-      j += "],\"training\":{\"running\":" + std::string(job_.running ? "true" : "false") +
+      j += "],\"training_profiles\":[\"decoder\",\"gan\",\"joint\",\"joint-full\"],\"training\":{\"running\":" + std::string(job_.running ? "true" : "false") +
            ",\"name\":\"" + json_escape(job_.name) + "\",\"stage\":\"" + json_escape(job_.stage) + "\"}}"; }
     return j;
+}
+
+void WebService::handle_training_runs(int fd) {
+    std::string json = "{\"runs\":[";
+    bool first = true;
+    std::error_code ec;
+    std::vector<fs::path> runs;
+    for (fs::directory_iterator it(paths_.runs, ec), end; !ec && it != end; it.increment(ec))
+        if (safe_name(it->path().filename().string()) && fs::is_directory(it->path()/"full_training"))
+            runs.push_back(it->path());
+    std::sort(runs.begin(), runs.end());
+    for (const auto& run : runs) {
+        const auto full = run/"full_training";
+        std::vector<std::string> candidates;
+        std::error_code scan_error;
+        for (fs::directory_iterator it(full/"checkpoints", scan_error), end;
+             !scan_error && it != end; it.increment(scan_error)) {
+            const auto name = it->path().filename().string();
+            if (candidate_name(name) && regular_candidate(it->path())) candidates.push_back(name);
+        }
+        std::sort(candidates.begin(), candidates.end());
+        if (!first) json += ','; first = false;
+        json += "{\"name\":\"" + json_escape(run.filename().string()) + "\",\"resumable\":" +
+            (latest_full_checkpoint(full/"checkpoints") && first_valid_wav(full/"clips") ? "true" : "false") +
+            ",\"result_ready\":" + (regular_candidate(full/"result/model.safetensors") &&
+               regular_candidate(full/"result/model.index") ? "true" : "false") + ",\"candidates\":[";
+        bool first_candidate = true;
+        for (const auto& name : candidates) {
+            if (!first_candidate) json += ','; first_candidate = false;
+            json += "\"" + json_escape(name) + "\"";
+        }
+        json += "]}";
+    }
+    send_json(fd, json + "]}");
+}
+
+void WebService::handle_publish(int fd, const Request& request) {
+    std::vector<Part> parts;
+    if (!request_parts(fd, request, parts)) return;
+    const auto run = field(parts, "name", ""), candidate = field(parts, "candidate", "");
+    const auto name = field(parts, "publish_name", "");
+    if (!safe_name(run) || !safe_name(name) || !candidate_name(candidate) ||
+        field(parts, "reviewed", "0") != "1") {
+        send_response(fd, 400, "Bad Request", "text/plain", "请选择候选、填写新声线名称并确认听审通过"); return;
+    }
+    std::unique_lock gpu_lock(gpu_mutex_, std::try_to_lock);
+    if (!gpu_lock.owns_lock() || job_.running) {
+        send_response(fd, 409, "Conflict", "text/plain", "GPU 工作中，请结束后发布"); return;
+    }
+    const auto source = fs::path(paths_.runs)/run/"full_training";
+    const auto model = source/"checkpoints"/candidate, index = source/"result/model.index";
+    if (!regular_candidate(model) || !regular_candidate(index)) {
+        send_response(fd, 404, "Not Found", "text/plain", "候选或训练索引尚未就绪"); return;
+    }
+    std::lock_guard material_lock(material_mutex_);
+    const auto destination = fs::path(paths_.runs)/name;
+    for (const auto* artifact : {"model.safetensors", "model.index", "clips"}) {
+        if (fs::exists(fs::symlink_status(destination/artifact))) {
+            send_response(fd, 409, "Conflict", "text/plain", "声线已存在，请使用新名称；已有文件不会被覆盖"); return;
+        }
+    }
+    fs::create_directories(destination);
+    TempDir staging(destination, ".release_");
+    const fs::path staged(staging.path());
+    fs::create_directory(staged/"clips");
+    fs::copy_file(model, staged/"model.safetensors");
+    fs::copy_file(index, staged/"model.index");
+    std::ofstream record(staged/"clips/release.json");
+    record << "{\"reviewed\":true,\"run\":\"" << json_escape(run)
+           << "\",\"candidate\":\"" << json_escape(candidate) << "\"}\n";
+    record.close();
+    std::string error;
+    if (!record || !replace_training_artifacts(destination, staged/"clips", staged/"model.safetensors",
+                                               staged/"model.index", error)) {
+        send_response(fd, 500, "Internal Server Error", "text/plain", "发布失败，旧声线保留"); return;
+    }
+    send_json(fd, "{\"published\":\"" + json_escape(name) + "\"}");
 }
 
 // Installed separation models grouped by stage, for the WebUI per-stage picker.
@@ -359,7 +539,7 @@ void WebService::run_step(std::uint64_t generation, std::string name, std::strin
     ProcessSpec process;
     process.argv = {paths_.build + "/vc_preprocess", "--input", work.string(),
                     "--output-dir", staged_work.string(), "--sr", "44100",
-                    "--no-slice", flag};
+                    "--no-slice", "--preserve-stereo", flag};
     if (!model.empty()) {
         process.argv.insert(process.argv.end(),
                             {"--" + step + "-model", model});
@@ -420,6 +600,17 @@ void WebService::run_step(std::uint64_t generation, std::string name, std::strin
 }
 
 // POST /api/material : multipart {name, files[]} -> store raw + init work set.
+bool WebService::stage_uploads(int fd, const std::vector<Upload>& uploads,
+                              const fs::path& raw, const std::optional<fs::path>& work, bool stereo) {
+    const auto result = normalize_uploads(uploads, raw, work, paths_, *process_runner_, decode_mutex_, stereo);
+    if (result.status == 200) return true;
+    const char* reason = result.status == 400 ? "Bad Request" : result.status == 409 ? "Conflict" :
+                         result.status == 413 ? "Payload Too Large" :
+                         result.status == 503 ? "Service Unavailable" : "Internal Server Error";
+    send_response(fd, result.status, reason, "application/json", "{\"error\":\"" + json_escape(result.error) + "\"}");
+    return false;
+}
+
 void WebService::handle_material(int fd, const Request& req) {
     std::vector<Part> parts;
     if (!request_parts(fd, req, parts)) return;
@@ -435,11 +626,11 @@ void WebService::handle_material(int fd, const Request& req) {
     fs::path staged_raw = fs::path(staged.path()) / "raw";
     fs::path staged_work = fs::path(staged.path()) / "work";
     std::string error;
-    if (!write_uploads(uploads, staged_raw, staged_work, error)) {
-        send_response(fd, 500, "Internal Server Error", "application/json",
-                      "{\"error\":\"upload staging failed\"}");
-        return;
+    bool stereo = false;
+    if (!parse_bool_field(field(parts, "preserve_stereo", "0"), stereo)) {
+        send_response(fd, 400, "Bad Request", "text/plain", "invalid preserve_stereo"); return;
     }
+    if (!stage_uploads(fd, uploads, staged_raw, staged_work, stereo)) return;
 
     std::unique_lock<std::mutex> gpu_lk(gpu_mutex_, std::try_to_lock);
     if (!gpu_lk.owns_lock() || job_.running) {
@@ -543,7 +734,7 @@ void WebService::handle_step(int fd, const Request& req) {
                       "{\"error\":\"cannot start worker\"}");
         return;
     }
-    send_json(fd, "{\"step\":\"" + json_escape(step) + "\"}");
+    send_json(fd, "{\"step\":\"" + json_escape(step) + "\",\"job_id\":\"" + ticket.public_id + "\"}");
 }
 
 // GET /api/preview?name=X : return the first work-set file as WAV for listening.
@@ -555,13 +746,23 @@ void WebService::handle_preview(int fd, const Request& req) {
     if (!fs::exists(work)) { material_lock.unlock(); send_response(fd, 404, "Not Found", "text/plain", "no material"); return; }
     const std::optional<fs::path> first = first_valid_wav(work);
     if (!first) { material_lock.unlock(); send_response(fd, 404, "Not Found", "text/plain", "empty"); return; }
+    TempDir preview_temp("/tmp", "resonantia-preview-");
+    std::string preview_path = first->string();
     if (exceeds_buffered_response_limit(*first)) {
+        auto stereo = voxmutatio::io::read_stereo_audio(preview_path);
+        if (stereo && 44 + stereo->frames() * 4 <= kMaxFileBytes) {
+            const auto compact = preview_temp.path() + "/preview.wav";
+            if (voxmutatio::io::write_stereo_audio(compact, stereo->data.data(),
+                    static_cast<int>(stereo->frames()), 44100)) preview_path = compact;
+        }
+    }
+    if (exceeds_buffered_response_limit(preview_path)) {
         material_lock.unlock();
         send_response(fd, 413, "Payload Too Large", "application/json",
                       "{\"error\":\"audio response exceeds 64 MiB\"}");
         return;
     }
-    const std::string wav = read_file(first->string());
+    const std::string wav = read_file(preview_path);
     material_lock.unlock();
     if (wav.empty()) {
         send_response(fd, 500, "Internal Server Error", "text/plain",
@@ -579,9 +780,10 @@ void WebService::handle_train(int fd, const Request& req) {
     std::string name = field(parts, "name", ""), mode = field(parts, "mode", "decoder");
     int steps = 0, seg = 0, epochs = 0;
     bool separate = false, dereverb = false, deecho = false, denoise = false;
-    bool deharmony = false, vad = false;
+    bool deharmony = false, vad = false, resume = false, prepared = false;
     if (!safe_name(name)) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"invalid voice name (letters, digits, _ or - only)\"}"); return; }
-    if (mode != "decoder" && mode != "gan") {
+    const bool full=mode=="joint-full";
+    if (mode != "decoder" && mode != "gan" && mode != "joint" && !full) {
         send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"invalid training mode\"}"); return;
     }
     if (!parse_bool_field(field(parts, "separate", "0"), separate) ||
@@ -589,24 +791,42 @@ void WebService::handle_train(int fd, const Request& req) {
         !parse_bool_field(field(parts, "deecho", "0"), deecho) ||
         !parse_bool_field(field(parts, "denoise", "0"), denoise) ||
         !parse_bool_field(field(parts, "deharmony", "0"), deharmony) ||
-        !parse_bool_field(field(parts, "vad", "0"), vad)) {
+        !parse_bool_field(field(parts, "vad", "0"), vad) ||
+        !parse_bool_field(field(parts, "resume", "0"), resume) ||
+        !parse_bool_field(field(parts, "prepared", "0"), prepared)) {
         send_response(fd, 400, "Bad Request", "application/json",
                       "{\"error\":\"boolean parameters must be 0 or 1\"}");
         return;
     }
-    if (!parse_int_field(field(parts, "steps", "300"), 1, 100000, steps) ||
-        !parse_int_field(field(parts, "seg", "40"), 8, 200, seg) ||
-        !parse_int_field(field(parts, "epochs", "0"), 0, 2000, epochs)) {
+    if (!parse_int_field(field(parts, "steps", mode=="joint"?"50":"300"), 1, 100000, steps) ||
+        !parse_int_field(field(parts, "seg", mode=="joint"||full?"32":"40"), 8, 200, seg) ||
+        !parse_int_field(field(parts, "epochs", full?"200":"0"), 0, 2000, epochs)) {
         send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"training parameter out of range\"}"); return;
+    }
+    if(mode=="joint" && (steps>50 || seg!=32 || epochs!=0)) {
+        send_response(fd,400,"Bad Request","application/json",
+                      "{\"error\":\"joint training requires 1..50 steps, seg 32 and epochs 0\"}");return;
+    }
+    if((!full&&(resume||prepared)) || (full&&(epochs<1||seg!=32||!field(parts,"steps","").empty())) ||
+       ((resume||prepared)&&(separate||dereverb||deecho||denoise||deharmony||vad)) || (resume&&prepared)) {
+        send_response(fd,400,"Bad Request","application/json",
+            "{\"error\":\"joint-full requires epochs >0, seg 32, no steps; resume/prepared are full-only and cannot combine with cleanup or each other\"}");return;
     }
 
     std::vector<Upload> uploads;
     if (!collect_uploads(fd, parts, uploads)) return;
     int nfiles = static_cast<int>(uploads.size());
     fs::path voice_dir = fs::path(paths_.runs) / name;
+    const auto full_dir=voice_dir/"full_training";
+    if(full && !resume && fs::exists(full_dir)) {
+        send_response(fd,409,"Conflict","application/json","{\"error\":\"full training state already exists; resume it or use a new name\"}");return;
+    }
+    if(resume && (nfiles || fs::is_symlink(full_dir) || fs::is_symlink(full_dir/"clips") || !first_valid_wav(full_dir/"clips"))) {
+        send_response(fd,400,"Bad Request","application/json","{\"error\":\"resume requires retained full training clips and no uploads\"}");return;
+    }
     fs::create_directories(voice_dir);
     bool has_work = fs::exists(paths_.runs + "/" + name + "/work") && !fs::is_empty(paths_.runs + "/" + name + "/work");
-    if (nfiles == 0 && !has_work) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"no audio files uploaded\"}"); return; }
+    if (nfiles == 0 && !has_work && !resume) { send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"no audio files uploaded\"}"); return; }
 
     TrainingOwner owner(*this); // Declared first: staging retires before the reservation.
     std::optional<TempDir> staged;
@@ -615,11 +835,7 @@ void WebService::handle_train(int fd, const Request& req) {
         staged.emplace(voice_dir, ".train_upload_");
         staged_raw = fs::path(staged->path()) / "raw";
         staged_work = fs::path(staged->path()) / "work";
-        std::string error;
-        if (!write_uploads(uploads, staged_raw, staged_work, error)) {
-            send_response(fd, 500, "Internal Server Error", "application/json", "{\"error\":\"upload staging failed\"}");
-            return;
-        }
+        if (!stage_uploads(fd, uploads, staged_raw, staged_work)) return;
     }
 
     JobTicket ticket;
@@ -677,11 +893,11 @@ void WebService::handle_train(int fd, const Request& req) {
     try {
         const std::shared_ptr<WebService> self = shared_from_this();
         std::thread worker([self, generation = ticket.generation, name, mode, steps, seg, epochs, separate, dereverb,
-                            deecho, denoise, deharmony, vad] {
+                            deecho, denoise, deharmony, vad, resume, prepared] {
             TrainingOwner completion(*self); completion.generation = generation;
             try {
                 completion.outcome = self->run_training(generation, name, mode, steps, seg, epochs, separate, dereverb,
-                                   deecho, denoise, deharmony, vad);
+                                   deecho, denoise, deharmony, vad, resume, prepared);
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[vc_serve] training exception: %s\n", e.what());
             } catch (...) {
@@ -714,11 +930,16 @@ void WebService::handle_status(int fd, const Request& req) {
     }
     std::string which = qn.empty() ? jname : qn, logtail;
     if (safe_name(which)) logtail = log_tail(paths_.runs + "/" + which + "/train.log", 4000);
+    const auto full_dir=fs::path(paths_.runs)/which/"full_training";
+    const bool resumable=safe_name(which)&&first_valid_wav(full_dir/"clips").has_value()&&
+        latest_full_checkpoint(full_dir/"checkpoints").has_value();
+    const bool review_required=safe_name(which)&&nonempty_regular_file(full_dir/"result/model.safetensors");
     send_json(fd, std::string("{\"name\":\"") + json_escape(jname) + "\",\"stage\":\"" + json_escape(stage) +
         "\",\"job_id\":\"" + id + "\",\"kind\":\"" + kind + "\",\"state\":\"" + state +
         "\",\"running\":" + (running ? "true" : "false") + ",\"done\":" + (done ? "true" : "false") +
         ",\"error\":" + (error ? "true" : "false") + ",\"cancel_requested\":" + (requested ? "true" : "false") +
         ",\"cancelled\":" + (cancelled ? "true" : "false") + ",\"cancellable\":" + (cancellable ? "true" : "false") +
+        ",\"resumable\":"+(resumable?"true":"false")+",\"review_required\":"+(review_required?"true":"false")+
         ",\"cancel_boundary\":\"stage_or_iteration\",\"log\":\"" + json_escape(logtail) + "\"}");
 }
 
@@ -771,7 +992,7 @@ bool WebService::preprocess_audio_file(const std::string& in, const std::string&
     fs::create_directories(outdir);
     ProcessSpec process;
     process.argv = {paths_.build + "/vc_preprocess", "--input", in,
-                    "--output-dir", outdir, "--sr", "40000", "--no-slice"};
+                    "--output-dir", outdir, "--sr", "44100", "--no-slice", "--preserve-stereo"};
     if (sep) process.argv.push_back("--separate");
     if (deharm) process.argv.push_back("--deharmony");
     if (derev) process.argv.push_back("--dereverb");
@@ -794,13 +1015,11 @@ void WebService::handle_preprocess(int fd, const Request& req) {
     std::vector<Upload> uploads;
     if (!collect_uploads(fd, parts, uploads)) return;
     if (uploads.size() != 1) { send_response(fd, 400, "Bad Request", "text/plain", "exactly one audio file required"); return; }
-    const Part* audio = uploads.front().part;
     std::unique_lock<std::mutex> gpu_lk(gpu_mutex_, std::try_to_lock);
     if (!gpu_lk.owns_lock()) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"GPU 忙（正在训练或转换），请稍候重试\"}"); return; }
     TempDir temp("/tmp", "resonantia-preprocess-");
-    std::string in = temp.path() + "/input.wav", cleaned, log;
-    { std::ofstream o(in, std::ios::binary | std::ios::trunc); o.write(audio->data.data(), audio->data.size());
-      if (!o) { send_response(fd, 500, "Internal Server Error", "text/plain", "input write failed"); return; } }
+    const fs::path upload_dir = fs::path(temp.path()) / "upload";
+    std::string in = (upload_dir / uploads.front().filename).string(), cleaned, log;
     bool sep = false, deharm = false, derev = false, denoise = false, deecho = false;
     if (!parse_bool_field(field(parts, "pp_separate", "0"), sep) ||
         !parse_bool_field(field(parts, "pp_deharmony", "0"), deharm) ||
@@ -811,6 +1030,7 @@ void WebService::handle_preprocess(int fd, const Request& req) {
                       "{\"error\":\"boolean parameters must be 0 or 1\"}");
         return;
     }
+    if (!stage_uploads(fd, uploads, upload_dir)) return;
     if (!preprocess_audio_file(in, temp.path(), sep, deharm, derev, deecho, denoise, cleaned, log)) {
         send_response(fd, 500, "Internal Server Error", "text/plain", "预处理失败：" + log_tail(log)); return; }
     if (exceeds_buffered_response_limit(cleaned)) {
@@ -841,26 +1061,43 @@ void WebService::handle_convert(int fd, const Request& req) {
     if (!session.empty() && !safe_name(session)) {
         send_response(fd, 400, "Bad Request", "text/plain", "bad session"); return;
     }
-    if (!session.empty()) {
-        std::string work = paths_.runs + "/" + session + "/work";
-        if (fs::exists(work))
-            for (auto& e : fs::directory_iterator(work)) {
-                if (lower(e.path().extension().string()) == ".wav") { conv_in = e.path().string(); break; }
-            }
+    const std::string workflow = field(parts, "workflow", "manual");
+    const bool song = workflow == "song";
+    if (workflow != "manual" && workflow != "dry" && workflow != "harmonies" && !song) {
+        send_response(fd, 400, "Bad Request", "text/plain", "invalid workflow"); return;
     }
-    if (conv_in.empty() && !audio) { send_response(fd, 400, "Bad Request", "text/plain", "no audio"); return; }
+    const std::string output_kind = field(parts, "output_kind", "vocal");
+    if ((output_kind != "vocal" && output_kind != "mix") || (output_kind == "mix" && !song)) {
+        send_response(fd, 400, "Bad Request", "text/plain", "mix output requires song workflow"); return;
+    }
     std::unique_lock<std::mutex> gpu_lk(gpu_mutex_, std::try_to_lock);
     if (!gpu_lk.owns_lock()) { send_response(fd, 409, "Conflict", "application/json", "{\"error\":\"GPU 忙（正在训练或转换），请稍候重试\"}"); return; }
     TempDir temp("/tmp", "resonantia-convert-");
+    if (!session.empty()) {
+        std::lock_guard<std::mutex> material_lock(material_mutex_);
+        const auto input = first_valid_wav(fs::path(paths_.runs) / session /
+                                          (workflow == "manual" ? "work" : "raw"));
+        if (input) {
+            conv_in = temp.path() + "/source.wav";
+            fs::copy_file(*input, conv_in);
+        }
+    }
+    if (conv_in.empty() && !audio) { send_response(fd, 400, "Bad Request", "text/plain", "no audio"); return; }
 
     std::string voice = field(parts, "voice", "base");
+    const auto pitch_edits = field(parts, "pitch_edits", "");
+    std::vector<voxmutatio::PitchEdit> validated_edits;
+    if (!voxmutatio::parse_pitch_edits(pitch_edits, validated_edits)) {
+        send_response(fd, 400, "Bad Request", "text/plain", "局部修音需按时间排序且不重叠；每段 0.02–2 秒，最多 16 段"); return;
+    }
     int pitch = 0, filter_radius = 0;
     double index_rate = 0.0, rms = 0.0, protect = 0.0;
     if (!parse_int_field(field(parts, "f0_up_key", "0"), -48, 48, pitch) ||
         !parse_double_field(field(parts, "index_rate", "0"), 0.0, 1.0, index_rate) ||
         !parse_double_field(field(parts, "rms_mix_rate", "0.5"), 0.0, 1.0, rms) ||
         !parse_double_field(field(parts, "protect", "0.5"), 0.0, 1.0, protect) ||
-        !parse_int_field(field(parts, "filter_radius", "3"), 0, 31, filter_radius)) {
+        !parse_int_field(field(parts, "filter_radius", "3"), 0, 31, filter_radius) ||
+        (filter_radius != 0 && (filter_radius < 3 || filter_radius % 2 == 0))) {
         send_response(fd, 400, "Bad Request", "application/json", "{\"error\":\"conversion parameter out of range\"}");
         return;
     }
@@ -877,7 +1114,19 @@ void WebService::handle_convert(int fd, const Request& req) {
     }
 
     std::string model = paths_.gmodel, index;
-    if (voice != "base" && voice != "base (pretrained)") {
+    const auto candidate_run = field(parts, "training_run", "");
+    const auto candidate = field(parts, "candidate", "");
+    if (!candidate_run.empty() || !candidate.empty()) {
+        if (!safe_name(candidate_run) || !candidate_name(candidate)) {
+            send_response(fd, 400, "Bad Request", "text/plain", "invalid training candidate"); return;
+        }
+        const auto full = fs::path(paths_.runs)/candidate_run/"full_training";
+        model = (full/"checkpoints"/candidate).string();
+        if (!regular_candidate(model)) {
+            send_response(fd, 404, "Not Found", "text/plain", "candidate not found"); return;
+        }
+        if (regular_candidate(full/"result/model.index")) index = (full/"result/model.index").string();
+    } else if (voice != "base" && voice != "base (pretrained)") {
         if (!safe_name(voice)) { send_response(fd, 400, "Bad Request", "text/plain", "bad voice"); return; }
         std::string vm = paths_.runs + "/" + voice + "/model.safetensors";
         if (!nonempty_regular_file(vm)) {
@@ -895,14 +1144,45 @@ void WebService::handle_convert(int fd, const Request& req) {
         return;
     }
 
-    std::string in = temp.path() + "/input.wav", out = temp.path() + "/output.wav";
+    std::string out = temp.path() + "/output.wav";
     std::string preprocess_log;
     if (conv_in.empty()) {
-        { std::ofstream o(in, std::ios::binary | std::ios::trunc); o.write(audio->data.data(), audio->data.size());
-          if (!o) { send_response(fd, 500, "Internal Server Error", "text/plain", "input write failed"); return; } }
-        if (!preprocess_audio_file(in, temp.path(), pp_sep, pp_deharm, pp_derev, pp_deecho, pp_denoise,
-                                   conv_in, preprocess_log)) {
-            send_response(fd, 500, "Internal Server Error", "text/plain", "输入预处理失败：" + log_tail(preprocess_log)); return; }
+        const fs::path upload_dir = fs::path(temp.path()) / "upload";
+        if (!stage_uploads(fd, uploads, upload_dir, std::nullopt, workflow != "manual")) return;
+        conv_in = (upload_dir / uploads.front().filename).string();
+    }
+    const std::string original = conv_in;
+    std::string all_vocals;
+    if (song) {
+        if (!preprocess_audio_file(original, temp.path() + "/vocals", true, false, false, false, false,
+                                   all_vocals, preprocess_log)) {
+            send_response(fd, 500, "Internal Server Error", "text/plain", "分离人声失败：" + log_tail(preprocess_log)); return;
+        }
+        conv_in = all_vocals;
+    }
+    const std::string before_cleanup = conv_in;
+    if (!preprocess_audio_file(before_cleanup, temp.path() + "/cleanup",
+            workflow == "manual" && pp_sep, song || workflow == "harmonies" || pp_deharm,
+            pp_derev, pp_deecho, pp_denoise, conv_in, preprocess_log)) {
+        send_response(fd, 500, "Internal Server Error", "text/plain", "主唱清理失败：" + log_tail(preprocess_log)); return;
+    }
+    if (conv_in != original) {
+        // Match the reviewed delivery path: retain stereo through cleanup,
+        // then mono 40k PCM16 before the model's 16k analysis frontend.
+        auto lead = voxmutatio::io::read_audio(conv_in, 40000);
+        if (!lead || lead->data.empty()) {
+            send_response(fd, 500, "Internal Server Error", "text/plain", "清理后的人声文件无效"); return;
+        }
+        if (lead->data.size() > 40000u * 600) {
+            send_response(fd, 413, "Payload Too Large", "text/plain", "清理后的人声超过 10 分钟"); return;
+        }
+        float peak = 0;
+        for (float value : lead->data) peak = std::max(peak, std::abs(value));
+        if (peak > 0.99f) for (float& value : lead->data) value *= 0.99f / peak;
+        conv_in = temp.path() + "/lead40.wav";
+        if (!voxmutatio::io::write_audio(conv_in, lead->data.data(), static_cast<int>(lead->data.size()), 40000)) {
+            send_response(fd, 500, "Internal Server Error", "text/plain", "主唱保存失败"); return;
+        }
     }
     std::string convert_log = temp.path() + "/convert.log";
     ProcessSpec process;
@@ -919,11 +1199,20 @@ void WebService::handle_convert(int fd, const Request& req) {
                              std::to_string(index_rate)});
     }
     process.log_path = convert_log;
+    if (!pitch_edits.empty()) process.argv.insert(process.argv.end(), {"--pitch-edits", pitch_edits});
+    const auto conversion_start = std::chrono::steady_clock::now();
     const ProcessResult process_result = process_runner_->run(process);
     if (!process_result.success() || !valid_wav_file(out)) {
         send_response(fd, 500, "Internal Server Error", "text/plain",
                       "转换失败：" + log_tail(convert_log));
         return;
+    }
+    if (output_kind == "mix") {
+        const std::string mixed = temp.path() + "/cover.wav";
+        if (!mix_cover(original, all_vocals, out, mixed)) {
+            send_response(fd, 500, "Internal Server Error", "text/plain", "伴奏合成失败：音频长度或格式不匹配"); return;
+        }
+        out = mixed;
     }
     if (exceeds_buffered_response_limit(out)) {
         send_response(fd, 413, "Payload Too Large", "application/json",
@@ -936,11 +1225,19 @@ void WebService::handle_convert(int fd, const Request& req) {
                       "转换失败：output read failed");
         return;
     }
-    printf("[vc_serve] convert voice=%s -> %zu bytes\n", voice.c_str(), wav.size());
+    const double conversion_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - conversion_start).count();
+    const std::string timings = log_tail(convert_log, 2048);
+    // Preserve CLI stage timings in the service journal before RAII removes the
+    // request directory. Child wall time also includes initialization and I/O.
+    std::fprintf(stderr, "[vc_serve] convert voice=%s -> %zu bytes, child/readback %.3f ms\n%s\n",
+                 voice.c_str(), wav.size(), conversion_ms, timings.c_str());
     send_response(fd, 200, "OK", "audio/wav", wav);
 }
 
 const char* WebService::allowed_api_method(const std::string& path) {
+    if (path == "/api/train/runs") return "GET";
+    if (path == "/api/train/publish") return "POST";
     if (path == "/api/voices" || path == "/api/sep-models" ||
         path == "/api/train/status" || path == "/api/preview") {
         return "GET";
@@ -953,7 +1250,11 @@ const char* WebService::allowed_api_method(const std::string& path) {
 }
 
 void WebService::handle_request(int fd, const Request& request) {
-    if (request.method == "GET" && request.path == "/api/voices") {
+    if (request.method == "GET" && request.path == "/api/train/runs") {
+        handle_training_runs(fd);
+    } else if (request.method == "POST" && request.path == "/api/train/publish") {
+        handle_publish(fd, request);
+    } else if (request.method == "GET" && request.path == "/api/voices") {
         send_json(fd, voices_json());
     } else if (request.method == "GET" && request.path == "/api/sep-models") {
         send_json(fd, separation_models_json());

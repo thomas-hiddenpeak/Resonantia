@@ -124,6 +124,13 @@ Tensor reflect_pad_end(const Tensor& x, int target_len);
 Tensor embedding(const Tensor& table, const std::vector<int>& idx, int dim);
 /// Scale by a constant.
 Tensor scale(const Tensor& x, float s);
+/// Owning contiguous reshape; same element count, preserves gradient routing.
+Tensor reshape(const Tensor& x, std::vector<int> shape);
+/// PyTorch clamp_min semantics, including derivative 1 at the lower boundary.
+Tensor clamp_min(const Tensor& x, float lower);
+/// Weight normalization along dimension 0; g has one value per first-axis row.
+/// Rejects zero/non-finite row norms. Preserves gradients to both v and g.
+Tensor weight_norm(const Tensor& v, const Tensor& g);
 
 // ---- Elementwise math (for differentiable mel loss) ----
 Tensor sqrt_op(const Tensor& x);  // sqrt(max(x, 0)); zero subgradient at x <= 0
@@ -152,6 +159,16 @@ class AdamW {
   void set_lr(float lr);
   [[nodiscard]] float lr() const { return lr_; }
   [[nodiscard]] int step_count() const { return t_; }
+  /// Restore moments/count/rate for the same ordered parameter set and immutable
+  /// hyperparameters. Calls read_moment(index, second) synchronously, retaining no
+  /// callback/data. Stages device buffers one tensor at a time; any error preserves
+  /// all old state. Rejects bad lengths, nonfinite values, negative second moments,
+  /// nonpositive LR and counts outside [0, INT_MAX-1]. Parameters are not changed.
+  void restore_state(int steps, float lr,
+                     const std::function<std::vector<float>(std::size_t, bool)>& read_moment);
+  /// Read-only moment snapshots, also usable by checkpoint serialization.
+  [[nodiscard]] std::vector<float> first_moment(std::size_t index) const;
+  [[nodiscard]] std::vector<float> second_moment(std::size_t index) const;
 
  private:
   std::vector<Tensor> params_;

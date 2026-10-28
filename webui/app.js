@@ -54,6 +54,7 @@ async function errText(r) {
 }
 function setConn(online) {
     const b = $('connBanner'); if (b) b.style.display = online ? 'none' : 'block';
+    globalThis.resonantiaStudio?.connection(online);
 }
 
 // ---------- Tabs ----------
@@ -63,11 +64,53 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
         document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));
         btn.classList.add('active');
         $('panel-' + btn.dataset.tab).classList.add('active');
+        globalThis.resonantiaStudio?.navigate(btn.dataset.tab);
         if (btn.dataset.tab === 'convert') loadVoices();
     });
 });
 
-// ---------- Presets (AINDAW-style tiers with plain-language descriptions) ----------
+// ---------- Training profiles ----------
+let previousTrainingMode = null;
+let knownTrainingProfiles = null;
+function applyTrainingMode(reset = true) {
+    const joint = $('trainMode').value === 'joint';
+    const full = $('trainMode').value === 'joint-full';
+    if (previousTrainingMode === 'joint-full' && !full) $('trainEpochs').value = '0';
+    previousTrainingMode = $('trainMode').value;
+    $('trainSteps').max = joint ? '50' : '100000';
+    $('trainSteps').disabled = full;
+    $('trainSeg').disabled = joint || full;
+    $('trainEpochs').disabled = joint;
+    const hint = $('trainJointHint'); if (hint) hint.hidden = !joint;
+    const controls = $('trainFullControls'); if (controls) controls.hidden = !full;
+    const resume = $('trainResume'); if (resume && !full) resume.checked = false;
+    if (joint) {
+        if (reset) $('trainSteps').value = '50';
+        $('trainSeg').value = '32'; $('trainEpochs').value = '0';
+    }
+    if (full) {
+        $('trainSeg').value = '32';
+        if (reset) $('trainEpochs').value = '200';
+    }
+}
+function configureTrainingProfiles(profiles) {
+    knownTrainingProfiles = Array.isArray(profiles) ? profiles : [];
+    const supported = Array.isArray(profiles) && profiles.includes('joint');
+    const option = $('trainJointOption');
+    if (option) { option.hidden = !supported; option.disabled = !supported; }
+    const fullSupported = Array.isArray(profiles) && profiles.includes('joint-full');
+    const fullOption = $('trainFullOption');
+    if (fullOption) { fullOption.hidden = !fullSupported; fullOption.disabled = !fullSupported; }
+    // Static assets may be newer than a running server. Expose the new mode
+    // only after that server advertises it; preserve existing user settings.
+    if ((!supported && $('trainMode').value === 'joint') || (!fullSupported && $('trainMode').value === 'joint-full')) {
+        $('trainMode').value = 'gan'; applyTrainingMode(false);
+        if ($('trainTierDesc')) $('trainTierDesc').textContent = '当前服务尚不支持所选训练档位，请更新服务；已切回旧版模式。';
+    }
+}
+$('trainMode').addEventListener('change', () => applyTrainingMode());
+
+// ---------- Presets with plain-language descriptions ----------
 let PRESETS = { inference: [], training: [] };
 async function loadPresets() {
     try { PRESETS = await (await fetch('presets.json')).json(); } catch (e) { return; }
@@ -79,11 +122,18 @@ async function loadPresets() {
     PRESETS.inference.forEach((p) => { const o = document.createElement('option'); o.value = p.id; o.textContent = p.name; cs.appendChild(o); });
     cs.onchange = () => applyPreset(cs.value);
     if (PRESETS.inference[1]) { cs.value = PRESETS.inference[1].id; applyPreset(cs.value); }
+    applyVoicePreset();
 }
 function applyTier(id) {
     const t = PRESETS.training.find((x) => x.id === id); if (!t) return;
     $('trainTierDesc').textContent = t.desc;
+    if (knownTrainingProfiles && !knownTrainingProfiles.includes(t.mode)) {
+        $('trainTierDesc').textContent = '当前服务尚不支持此训练档位，请更新服务后使用。已切回旧版模式。';
+        $('trainMode').value = 'gan'; applyTrainingMode(false); $('trainEpochs').value = '0'; return;
+    }
     $('trainMode').value = t.mode; $('trainSteps').value = t.steps; $('trainSeg').value = t.seg;
+    applyTrainingMode(false);
+    if (t.epochs !== undefined) $('trainEpochs').value = t.epochs;
 }
 function applyPreset(id) {
     const p = PRESETS.inference.find((x) => x.id === id); if (!p) return;
@@ -95,10 +145,34 @@ function applyPreset(id) {
     set('protect', Math.round(p.protect * 100), 'protectValue', () => p.protect.toFixed(2));
     set('filterRadius', p.filter_radius, 'filterRadiusValue');
     $('convParamSummary').textContent =
-        `当前参数 → F0:${p.f0method} · 检索:${p.index_rate.toFixed(2)} · 保护:${p.protect.toFixed(2)}` +
-        ` · RMS:${p.rms_mix_rate.toFixed(2)} · 平滑:${p.filter_radius} · 变调:${p.f0_up_key}`;
+        `音色检索 ${p.index_rate.toFixed(2)} · 辅音保护 ${p.protect.toFixed(2)}` +
+        ` · 合成音量占比 ${p.rms_mix_rate.toFixed(2)} · 平滑 ${p.filter_radius} · 变调 ${p.f0_up_key} 半音`;
+    globalThis.resonantiaStudio?.render();
 }
-const CONV_SESSION = '__convert__';
+// ---------- Voice presets ----------
+let lastVoicePreset = null;
+function applyVoicePreset() {
+    const voice = $('voiceSelect').value;
+    // The voice list and presets load independently. Wait for preset data and
+    // don't reset manual adjustments when the same voice list is refreshed.
+    if (!PRESETS.inference.length || voice === lastVoicePreset) return;
+    lastVoicePreset = voice;
+    const preset = PRESETS.inference.find((p) => p.voice === voice);
+    if (preset) { $('convPreset').value = preset.id; applyPreset(preset.id); }
+}
+$('voiceSelect').addEventListener('change', applyVoicePreset);
+
+const CONV_SESSION = (() => {
+    // A duplicated tab inherits sessionStorage, so allocate a fresh identity on
+    // each page load. Uploads are explicitly reselected after reload anyway.
+    let id;
+    try { id = 'convert_' + crypto.randomUUID(); }
+    catch { id = 'convert_' + Date.now().toString(36) + Math.random().toString(36).slice(2); }
+    try {
+        sessionStorage.setItem('resonantiaConvertSession', id);
+    } catch { /* blocked storage does not prevent isolated uploads */ }
+    return id;
+})();
 
 // ---------- Shared cascade preprocessing (upload -> apply stages, per-step audition) ----------
 const STAGES = [
@@ -129,24 +203,28 @@ async function loadSepModels() {
         if (r.ok) { SEP_MODELS = await r.json(); populateModelSelects(); }
     } catch (e) { /* offline: pickers stay hidden, server uses defaults */ }
 }
-function pollJob(name) {
-    return new Promise((resolve) => {
+function pollJob(name, jobId) {
+    return new Promise((resolve, reject) => {
         const tick = async () => {
             try {
-                const s = await (await apiFetch(`${API}/train/status?name=${encodeURIComponent(name)}`)).json();
+                const r = await apiFetch(`${API}/train/status?name=${encodeURIComponent(name)}`);
+                if (!r.ok) throw new Error(await errText(r));
+                const s = await r.json();
+                if (!jobId || s.job_id !== jobId || s.name !== name) throw new Error('处理任务已变化，请重新确认输入');
                 setConn(true);
                 if (s.running) setTimeout(tick, 1000); else resolve(s);
-            } catch (e) { setConn(false); setTimeout(tick, 1500); }
+            } catch (e) { reject(e); }
         };
         tick();
     });
 }
 // Fetch the current work-set audio as a frozen blob snapshot for per-stage audition.
-async function auditionSnapshot(name, audioEl) {
+async function auditionSnapshot(name, audioEl, isCurrent = () => true) {
     try {
         const r = await apiFetch(`${API}/preview?name=${encodeURIComponent(name)}&t=${Date.now()}`);
         if (!r.ok) return false;
         const blob = await r.blob();
+        if (!isCurrent()) return false;
         if (audioEl._url) URL.revokeObjectURL(audioEl._url);
         audioEl._url = URL.createObjectURL(blob);
         audioEl.src = audioEl._url; audioEl.style.display = 'block';
@@ -174,6 +252,7 @@ function Cascade(containerId, getName, resetBtnId) {
         state.busy = b;
         box.querySelectorAll('.btn-step').forEach((x) => { x.disabled = b || !state.ready; });
         const rb = $(resetBtnId); if (rb) rb.disabled = b || !state.ready;
+        globalThis.resonantiaStudio?.render();
     }
     function enable() {
         state.ready = true;
@@ -193,7 +272,8 @@ function Cascade(containerId, getName, resetBtnId) {
             const sel = row.querySelector('.stage-model'); if (sel && sel.value) fd.append('model', sel.value);
             const r = await apiFetch(`${API}/step`, { method: 'POST', body: fd });
             if (!r.ok) throw new Error(await errText(r));
-            const done = await pollJob(name);
+            const accepted = await r.json();
+            const done = await pollJob(name, accepted.job_id);
             if (done.error) throw new Error('处理失败（见服务端日志）');
             state.applied.push(s.name);
             st.textContent = state.applied.length + '. 已应用 ✓'; row.classList.add('applied');
@@ -208,6 +288,17 @@ const trainCascade = Cascade('trainCascade', () => $('voiceName').value.trim(), 
 const convCascade = Cascade('convCascade', () => CONV_SESSION, 'convResetPre');
 loadSepModels();  // populate per-stage model pickers from installed models
 
+// ---------- Audio uploads ----------
+const AUDIO_FORMATS = 'WAV、MP3、M4A/AAC、FLAC、OGG/Opus、WMA、AIFF/AIF';
+function supportedAudio(file) {
+    return /\.(wav|mp3|m4a|aac|flac|ogg|opus|wma|aiff|aif)$/i.test(file.name);
+}
+function invalidateMaterial(cascade, auditionId) {
+    cascade.state.ready = false;
+    cascade.setBusy(false);
+    $(auditionId).style.display = 'none';
+}
+
 // ---------- Training ----------
 let trainFiles = [];
 const trainArea = $('trainUploadArea');
@@ -221,21 +312,38 @@ trainArea.addEventListener('drop', (e) => {
 $('trainFileInput').addEventListener('change', (e) => addTrainFiles(e.target.files));
 
 function addTrainFiles(list) {
-    for (const f of list) if (f.name.match(/\.wav$/i)) { trainFiles.push(f); estimateDuration(f); }
+    if (activeTrain || trainCascade.state.busy) return;
+    const files = Array.from(list);
+    const rejected = files.filter((f) => !supportedAudio(f));
+    if (rejected.length) {
+        alert('不支持的文件：' + rejected.map((f) => f.name).join('、') + '。支持 ' + AUDIO_FORMATS);
+        return;
+    }
+    for (const f of files) { trainFiles.push(f); estimateDuration(f); }
     renderTrainFiles();
     ensureTrainMaterial();
 }
-async function estimateDuration(f) {
-    try {
-        const buf = await f.arrayBuffer();
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const audio = await ctx.decodeAudioData(buf);
-        f._dur = audio.duration; ctx.close(); updateDataHint();
-    } catch (e) { /* undecodable header; ignore */ }
+function estimateDuration(f) {
+    // Metadata only: do not expand a long compressed recording into browser PCM.
+    // Browser codec support is optional; the server supplies the WAV preview.
+    const audio = new Audio(), url = URL.createObjectURL(f);
+    let done = false;
+    const finish = () => {
+        if (done) return;
+        done = true; clearTimeout(timer);
+        if (Number.isFinite(audio.duration) && audio.duration > 0) f._dur = audio.duration;
+        audio.onloadedmetadata = audio.onerror = null;
+        audio.removeAttribute('src'); audio.load(); URL.revokeObjectURL(url);
+        updateDataHint();
+    };
+    const timer = setTimeout(finish, 10000);
+    audio.preload = 'metadata'; audio.onloadedmetadata = audio.onerror = finish; audio.src = url;
 }
 function updateDataHint() {
     const sec = trainFiles.reduce((s, f) => s + (f._dur || 0), 0), m = sec / 60, el = $('trainDataHint');
-    el.textContent = `已上传约 ${m.toFixed(1)} 分钟` + (m < 10 ? '，建议 ≥ 10 分钟以获得更好效果。' : '，数据量充足 ✓');
+    const unknown = trainFiles.some((f) => !f._dur);
+    el.textContent = `已选择 ${trainFiles.length} 个文件，已识别时长约 ${m.toFixed(1)} 分钟` +
+        (unknown ? '（部分文件时长未知，仍可上传试听）。' : m < 10 ? '，建议至少 10 分钟。' : '。请继续检查清晰度、混响与重叠人声。');
     el.style.color = m < 10 ? '' : 'var(--success-color)';
 }
 function renderTrainFiles() {
@@ -244,7 +352,8 @@ function renderTrainFiles() {
         const li = document.createElement('li');
         const span = document.createElement('span'); span.textContent = f.name;
         const btn = document.createElement('button'); btn.textContent = '✕';
-        btn.onclick = () => { trainFiles.splice(i, 1); renderTrainFiles(); ensureTrainMaterial(); };
+        btn.setAttribute?.('aria-label', '移除训练素材 ' + f.name);
+        btn.onclick = () => { if (activeTrain) return; trainFiles.splice(i, 1); renderTrainFiles(); ensureTrainMaterial(); };
         li.append(span, ' ', btn);
         ul.appendChild(li);
     });
@@ -254,33 +363,82 @@ function renderTrainFiles() {
 let activeTrain = null;
 function updateTrainBtn() {
     const name = $('voiceName').value.trim();
-    $('btnTrain').disabled = !!activeTrain || !(trainCascade.state.ready && /^[A-Za-z0-9_-]+$/.test(name));
+    const resume = $('trainMode').value === 'joint-full' && $('trainResume')?.checked;
+    $('btnTrain').disabled = !!activeTrain || !((trainCascade.state.ready || resume) && /^[A-Za-z0-9_-]{1,64}$/.test(name));
+    globalThis.resonantiaStudio?.render();
 }
 $('voiceName').addEventListener('input', () => { updateTrainBtn(); ensureTrainMaterial(); });
+$('trainResume')?.addEventListener('change', updateTrainBtn);
+$('trainMode').addEventListener('change', updateTrainBtn);
 
 // Create/refresh the training work-set (raw+work) so the cascade can operate.
 let trainMatSig = '';
-async function ensureTrainMaterial() {
+let trainUploadGeneration = 0, trainUploadQueue = Promise.resolve();
+function ensureTrainMaterial() {
+    if ($('trainMode').value === 'joint-full' && $('trainResume')?.checked) return;
     const name = $('voiceName').value.trim();
-    if (!/^[A-Za-z0-9_-]+$/.test(name) || trainFiles.length === 0) return;
-    const sig = name + '|' + trainFiles.map((f) => f.name + f.size).join(',');
+    const files = [...trainFiles];
+    const sig = name + '|' + files.map((f) => f.name + f.size + f.lastModified).join(',');
     if (sig === trainMatSig && trainCascade.state.ready) return;
-    trainMatSig = sig;
-    const fd = new FormData(); fd.append('name', name);
-    trainFiles.forEach((f) => fd.append('files', f, f.name));
-    try {
-        const r = await apiFetch(`${API}/material`, { method: 'POST', body: fd });
-        if (!r.ok) throw new Error(await errText(r));
-        setConn(true);
-        trainCascade.enable();
-        await auditionSnapshot(name, $('trainOrigAudio')); $('trainOrigAudition').style.display = 'flex';
-        updateDataHint(); updateTrainBtn();
-    } catch (e) { setConn(false); $('trainDataHint').textContent = '上传失败: ' + e.message; }
+    const generation = ++trainUploadGeneration;
+    const current = () => generation === trainUploadGeneration;
+    invalidateMaterial(trainCascade, 'trainOrigAudition'); updateTrainBtn();
+    $('trainUploadStatus').textContent = '';
+    $('trainRetryUpload').style.display = 'none';
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || files.length === 0) return;
+    $('trainUploadStatus').textContent = '正在上传并准备音频，请稍候…';
+    // Serialize mutations: an older in-flight upload must finish before a newer
+    // one can publish to the same server material session.
+    trainUploadQueue = trainUploadQueue.catch(() => {}).then(async () => {
+        if (!current()) return;
+        const fd = new FormData(); fd.append('name', name);
+        files.forEach((f) => fd.append('files', f, f.name));
+        try {
+            const r = await apiFetch(`${API}/material`, { method: 'POST', body: fd });
+            setConn(true);
+            if (!r.ok) throw new Error(await errText(r));
+            if (!current()) return;
+            const preview = await auditionSnapshot(name, $('trainOrigAudio'), current);
+            if (!current()) return;
+            setConn(true); trainMatSig = sig; trainCascade.enable();
+            $('trainOrigAudition').style.display = preview ? 'flex' : 'none';
+            $('trainUploadStatus').textContent = preview ? '上传完成，可试听或继续预处理。' : '上传完成，预览暂不可用。';
+            updateTrainBtn();
+        } catch (e) {
+            if (!current()) return;
+            if (e instanceof TypeError) setConn(false);
+            $('trainUploadStatus').textContent = '上传失败: ' + e.message;
+            $('trainRetryUpload').style.display = '';
+            globalThis.resonantiaStudio?.render();
+        }
+    });
+    return trainUploadQueue;
 }
 $('trainResetPre').onclick = () => { trainMatSig = ''; ensureTrainMaterial(); };
+$('trainRetryUpload').onclick = () => ensureTrainMaterial();
 
 // ---------- Training job controls ----------
+async function restoreActiveTraining() {
+    if (activeTrain) return;
+    try {
+        const r = await apiFetch(`${API}/train/status`);
+        if (!r.ok) return;
+        const s = await r.json();
+        // A manual submission may have started while this request was pending.
+        if (activeTrain || !s.running || s.kind !== 'train' || !s.job_id || !s.name) return;
+        const job = { name: s.name, id: s.job_id, cancelSent: !!s.cancel_requested, cancelInFlight: false };
+        activeTrain = job;
+        updateTrainBtn();
+        $('trainProgress').style.display = 'block';
+        $('btnCancelTrain').disabled = true;
+        $('trainStage').textContent = '正在恢复训练进度…';
+        pollTrain(job);
+    } catch (_) { /* A later page load can retry; never submit or cancel a job here. */ }
+}
+
 $('btnTrain').addEventListener('click', async () => {
+    if (activeTrain) return;
+    if (globalThis.resonantiaStudio && !(await globalThis.resonantiaStudio.confirmTraining())) return;
     if (activeTrain) return;
     const name = $('voiceName').value.trim();
     const job = { name, id: null, cancelSent: false, cancelInFlight: false };
@@ -289,15 +447,18 @@ $('btnTrain').addEventListener('click', async () => {
     const fd = new FormData();
     fd.append('name', name);
     fd.append('mode', $('trainMode').value);
-    fd.append('steps', $('trainSteps').value);
+    const full = $('trainMode').value === 'joint-full';
+    const resume = full && $('trainResume')?.checked;
+    if (!full) fd.append('steps', $('trainSteps').value);
+    if (full) fd.append('resume', resume ? '1' : '0');
     fd.append('seg', $('trainSeg').value);
     fd.append('epochs', $('trainEpochs').value);
-    fd.append('vad', $('recVad').checked ? '1' : '0');
+    fd.append('vad', !resume && $('recVad').checked ? '1' : '0');
     updateTrainBtn();
     $('btnCancelTrain').disabled = true;
     $('trainProgress').style.display = 'block';
     $('trainStage').textContent = '提交中…';
-    $('trainFill').style.width = '5%';
+    $('trainFill').style.width = '0%';
     try {
         const r = await apiFetch(`${API}/train`, { method: 'POST', body: fd });
         if (!r.ok) throw new Error(await errText(r));
@@ -337,7 +498,7 @@ $('btnCancelTrain').addEventListener('click', async () => {
     }
 });
 
-const STAGES_PCT = { queued: 10, preparing: 15, preprocessing: 25, separating: 30, training: 55, indexing: 90, publishing: 95, done: 100, error: 100, cancelled: 100 };
+const STAGE_LABELS = {queued:'等待设备',preparing:'准备素材',preprocessing:'清理与切分素材',separating:'分离人声',training:'训练中',indexing:'构建音色检索索引',publishing:'保存候选',done:'完成',error:'失败',cancelled:'已停止'};
 async function pollTrain(job) {
     if (activeTrain !== job) return;
     try {
@@ -350,24 +511,46 @@ async function pollTrain(job) {
             $('btnCancelTrain').disabled = true;
             activeTrain = null; updateTrainBtn(); return;
         }
-        $('trainFill').style.width = (STAGES_PCT[s.stage] || 50) + '%';
+        $('trainFill').style.width = s.done ? '100%' : '0%';
         $('trainLog').textContent = s.log || '';
         $('trainLog').scrollTop = $('trainLog').scrollHeight;
         $('btnCancelTrain').disabled = !s.cancellable || job.cancelSent || job.cancelInFlight || s.cancel_requested;
         if (s.running) {
             $('trainStage').textContent = s.cancel_requested || job.cancelSent ? '已请求取消，等待当前阶段结束…' :
-                job.cancelInFlight ? '正在请求取消…' : s.stage === 'publishing' ? '正在保存训练结果，已无法取消…' : s.stage;
+                job.cancelInFlight ? '正在请求取消…' : s.stage === 'publishing' ? '正在保存训练结果，已无法取消…' : (STAGE_LABELS[s.stage] || s.stage);
+            if (s.stage === 'training' && !s.cancel_requested && !job.cancelSent && !job.cancelInFlight) {
+                const progress = [...(s.log || '').matchAll(/joint-full step=(\d+)\/(\d+) epoch=(\d+)/g)].pop();
+                const cache = [...(s.log || '').matchAll(/Cache (\d+)\/(\d+) frames=/g)].pop();
+                const preparing = (s.log || '').lastIndexOf('Preparing model/data identity');
+                if (cache && Number(cache[2]) > 0 && (!progress || cache.index > progress.index)) {
+                    $('trainStage').textContent = `准备训练特征：${cache[1]}/${cache[2]} 段`;
+                    $('trainFill').style.width = Math.min(100, Math.floor(100 * Number(cache[1]) / Number(cache[2]))) + '%';
+                } else if (preparing >= 0 && (!progress || preparing > progress.index)) {
+                    $('trainStage').textContent = '准备训练：核验素材并载入模型…';
+                    $('trainFill').style.width = '0%';
+                } else if (progress && Number(progress[2]) > 0) {
+                    $('trainStage').textContent = `训练中：${progress[1]}/${progress[2]} 步，已完成 ${progress[3]} 轮`;
+                    $('trainFill').style.width = Math.min(100, Math.floor(100 * Number(progress[1]) / Number(progress[2]))) + '%';
+                    const times = [...(s.log || '').matchAll(/train_seconds=([\d.]+)/g)].map(m=>Number(m[1])).filter(v=>Number.isFinite(v)&&v>0);
+                    if (times.length) $('trainStage').textContent += ` · 最近计算耗时 ${(times.reduce((a,b)=>a+b,0)/times.length).toFixed(2)} 秒/步（不含准备与保存）`;
+                }
+            }
             setTimeout(() => pollTrain(job), 1500);
         } else if (s.done) {
             $('btnCancelTrain').disabled = true;
             activeTrain = null; updateTrainBtn();
-            if (s.cancelled) $('trainStage').textContent = '已取消；已提交素材保留';
+            if (s.cancelled) $('trainStage').textContent = s.resumable ? '已停止；完整训练进度和固定素材已保留，可恢复' : '已取消；已提交素材保留';
             else if (s.error) $('trainStage').textContent = '训练失败，请查看日志';
+            else if (s.review_required) {
+                $('trainStage').textContent = '训练完成，候选已保存，等待听审；现有声线保持不变';
+                globalThis.resonantiaWorkflow?.refreshRuns();
+            }
             else { $('trainStage').textContent = '完成 ✓ 已生成声线「' + job.name + '」'; loadVoices(); }
         } else {
             $('trainStage').textContent = '等待作业状态…';
             setTimeout(() => pollTrain(job), 1500);
         }
+        globalThis.resonantiaStudio?.trainingStatus(s);
     } catch (e) {
         if (activeTrain !== job) return;
         $('btnCancelTrain').disabled = true;
@@ -379,7 +562,10 @@ async function pollTrain(job) {
 // ---------- Voices ----------
 async function loadVoices() {
     try {
-        const d = await (await apiFetch(`${API}/voices`)).json();
+        const response = await apiFetch(`${API}/voices`);
+        if (!response.ok) throw new Error(await errText(response));
+        const d = await response.json();
+        configureTrainingProfiles(d.training_profiles);
         setConn(true);
         const sel = $('voiceSelect'), cur = sel.value, voices = d.voices || [];
         sel.innerHTML = '';
@@ -388,15 +574,22 @@ async function loadVoices() {
             o.value = ''; o.textContent = '无（请先在①训练声线创建）'; o.disabled = true; o.selected = true;
             sel.appendChild(o);
         } else {
-            voices.forEach((v) => { const o = document.createElement('option'); o.value = v; o.textContent = v; sel.appendChild(o); });
+            voices.forEach((v) => { const o = document.createElement('option'); o.value = v;
+                o.textContent = v === 'Tom_Cybersinger' ? 'Tom Cybersinger · 正式版（200 轮，听审通过）' : v + ((d.reviewed_voices || []).includes(v) ? '（听审通过）' : '（历史声线）'); sel.appendChild(o); });
             if (cur && voices.includes(cur)) sel.value = cur;
+            else if (voices.includes('Tom_Cybersinger')) sel.value = 'Tom_Cybersinger';
         }
+        applyVoicePreset();
+        if ($('formalRelease')) $('formalRelease').hidden = !voices.includes('Tom_Cybersinger');
+        globalThis.resonantiaStudio?.voices(d);
     } catch (e) { setConn(false); }
 }
 $('btnRefreshVoices').addEventListener('click', loadVoices);
 
 // ---------- Convert ----------
 let convFile = null, convUrl = null;
+let convRunning = false;
+let convUploadGeneration = 0, convUploadQueue = Promise.resolve();
 const convArea = $('convUploadArea');
 convArea.addEventListener('click', () => $('convFileInput').click());
 convArea.addEventListener('dragover', (e) => { e.preventDefault(); convArea.classList.add('drag'); });
@@ -405,32 +598,62 @@ convArea.addEventListener('drop', (e) => { e.preventDefault(); convArea.classLis
 $('convFileInput').addEventListener('change', (e) => { if (e.target.files[0]) setConvFile(e.target.files[0]); });
 
 function setConvFile(f) {
-    if (!f.name.match(/\.wav$/i)) { alert('请上传 WAV'); return; }
+    if (convRunning || convCascade.state.busy) return;
+    if (!supportedAudio(f)) { alert('请上传 ' + AUDIO_FORMATS); return; }
     convFile = f;
+    globalThis.resonantiaStudio?.conversion('input');
+    globalThis.resonantiaWorkflow?.resetPitchEdits();
+    $('resultSection').style.display = 'none';
     $('convFileInfo').querySelector('.file-name').textContent = f.name;
     $('convFileInfo').style.display = 'flex';
     convArea.style.display = 'none';
     ensureConvMaterial();
 }
 $('btnConvRemove').addEventListener('click', () => {
+    if (convRunning || convCascade.state.busy) return;
+    ++convUploadGeneration;
+    $('convUploadStatus').textContent = '';
     convFile = null; $('convFileInput').value = '';
+    globalThis.resonantiaWorkflow?.resetPitchEdits();
+    $('resultSection').style.display = 'none';
     $('convFileInfo').style.display = 'none'; convArea.style.display = 'block';
     $('convOrigAudition').style.display = 'none';
     convCascade.state.ready = false; convCascade.setBusy(false);
     $('btnConvert').disabled = true;
+    globalThis.resonantiaStudio?.conversion('empty');
 });
 // Upload the input as a work-set (session) so the cascade + audition can operate.
-async function ensureConvMaterial() {
-    if (!convFile) return;
-    const fd = new FormData(); fd.append('name', CONV_SESSION); fd.append('files', convFile, convFile.name);
-    try {
-        const r = await apiFetch(`${API}/material`, { method: 'POST', body: fd });
-        if (!r.ok) throw new Error(await errText(r));
-        setConn(true);
-        convCascade.enable();
-        await auditionSnapshot(CONV_SESSION, $('convOrigAudio')); $('convOrigAudition').style.display = 'flex';
-        $('btnConvert').disabled = false;
-    } catch (e) { setConn(false); alert('上传失败: ' + e.message); }
+function ensureConvMaterial() {
+    if (!convFile || convRunning || convCascade.state.busy) return;
+    const file = convFile, generation = ++convUploadGeneration;
+    const current = () => generation === convUploadGeneration;
+    invalidateMaterial(convCascade, 'convOrigAudition'); $('btnConvert').disabled = true;
+    $('convUploadStatus').textContent = '正在上传并准备音频，请稍候…';
+    globalThis.resonantiaStudio?.conversion('uploading');
+    convUploadQueue = convUploadQueue.catch(() => {}).then(async () => {
+        if (!current()) return;
+        const fd = new FormData(); fd.append('name', CONV_SESSION); fd.append('files', file, file.name);
+        fd.append('preserve_stereo', '1');
+        try {
+            const r = await apiFetch(`${API}/material`, { method: 'POST', body: fd });
+            setConn(true);
+            if (!r.ok) throw new Error(await errText(r));
+            if (!current()) return;
+            const preview = await auditionSnapshot(CONV_SESSION, $('convOrigAudio'), current);
+            if (!current()) return;
+            setConn(true); convCascade.enable();
+            $('convOrigAudition').style.display = preview ? 'flex' : 'none';
+            $('convUploadStatus').textContent = preview ? '上传完成，可试听或开始转换。' : '上传完成，预览暂不可用。';
+            $('btnConvert').disabled = convRunning;
+            globalThis.resonantiaStudio?.conversion('ready');
+        } catch (e) {
+            if (!current()) return;
+            if (e instanceof TypeError) setConn(false);
+            $('convUploadStatus').textContent = '上传失败: ' + e.message;
+            globalThis.resonantiaStudio?.conversion('upload-error');
+        }
+    });
+    return convUploadQueue;
 }
 $('convResetPre').onclick = () => ensureConvMaterial();
 
@@ -442,11 +665,24 @@ bind('protect', 'protectValue', (v) => (v / 100).toFixed(2));
 bind('filterRadius', 'filterRadiusValue', (v) => v);
 
 $('btnConvert').addEventListener('click', async () => {
+    if (convRunning || convCascade.state.busy) return;
     if (!convCascade.state.ready) { alert('请先上传待转换音频'); return; }
-    if (!$('voiceSelect').value) { alert('请先在①训练声线创建目标声线'); return; }
+    if (!$('voiceSelect').value && !globalThis.resonantiaWorkflow?.hasCandidate()) { alert('请先选择已发布声线或训练候选'); return; }
+    try { globalThis.resonantiaWorkflow?.validate(); }
+    catch (error) {
+        if (globalThis.resonantiaStudio) globalThis.resonantiaStudio.validationError(error.message);
+        else alert(error.message);
+        return;
+    }
+    const inputName = convFile.name;
+    const generation = convUploadGeneration;
+    convRunning = true;
+    convCascade.setBusy(true);
+    globalThis.resonantiaWorkflow?.lock(true);
     $('btnConvert').disabled = true;
     $('convProgress').style.display = 'block';
     $('resultSection').style.display = 'none';
+    globalThis.resonantiaStudio?.conversion('running');
     // Single blocking request -> honest indeterminate bar + elapsed time (no fake %).
     $('convFill').classList.add('indeterminate');
     const t0 = Date.now();
@@ -460,10 +696,13 @@ $('btnConvert').addEventListener('click', async () => {
         fd.append('rms_mix_rate', $('rmsMixRate').value / 100);
         fd.append('protect', $('protect').value / 100);
         fd.append('filter_radius', $('filterRadius').value);
+        globalThis.resonantiaWorkflow?.append(fd);
         const r = await apiFetch(`${API}/convert`, { method: 'POST', body: fd });
+        setConn(true);
         clearInterval(iv);
         if (!r.ok) throw new Error(await errText(r));
         const blob = await r.blob();
+        if (generation !== convUploadGeneration) throw new Error('输入已变化，请重新转换');
         if (convUrl) URL.revokeObjectURL(convUrl);
         convUrl = URL.createObjectURL(blob);
         $('convFill').classList.remove('indeterminate'); $('convFill').style.width = '100%'; $('convInfo').textContent = '完成！';
@@ -471,17 +710,26 @@ $('btnConvert').addEventListener('click', async () => {
             $('convProgress').style.display = 'none';
             $('resultSection').style.display = 'block';
             $('resultAudio').src = convUrl;
-            $('btnDownload').onclick = () => { const a = document.createElement('a'); a.href = convUrl; a.download = 'converted_' + convFile.name.replace(/\.[^.]+$/, '.wav'); a.click(); };
-            $('btnConvert').disabled = false;
+            $('btnDownload').onclick = () => { const a = document.createElement('a'); a.href = convUrl; a.download = 'converted_' + inputName.replace(/\.[^.]+$/, '.wav'); a.click(); };
+            convRunning = false;
+            convCascade.setBusy(false);
+            globalThis.resonantiaWorkflow?.lock(false);
+            $('btnConvert').disabled = !convCascade.state.ready;
+            globalThis.resonantiaStudio?.conversion('done');
         }, 600);
     } catch (err) {
         clearInterval(iv);
         $('convFill').classList.remove('indeterminate'); $('convFill').style.width = '0%';
         $('convInfo').textContent = '转换失败: ' + err.message;
-        $('btnConvert').disabled = false;
+        convRunning = false;
+        convCascade.setBusy(false);
+        globalThis.resonantiaWorkflow?.lock(false);
+        $('btnConvert').disabled = !convCascade.state.ready;
+        globalThis.resonantiaStudio?.conversion('error');
     }
 });
 
 // initial
 loadPresets();
 loadVoices();
+restoreActiveTraining();

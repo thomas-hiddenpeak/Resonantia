@@ -36,6 +36,20 @@ int main(int argc,char** argv){
   };
   std::vector<std::string> args={"vc_train","--hubert","h","--rmvpe","r","--pretrained","p","--target","t","--out","o"};
   VcTrainOptions defaults;require(parse(args,defaults)==ParseStatus::kRun && defaults.cancel_file.empty() && defaults.steps==300,"default parsing changed");
+  auto joint=args;joint.insert(joint.end(),{"--gan","--gan-profile","joint"});
+  VcTrainOptions jo;
+  require(parse(joint,jo)==ParseStatus::kRun,"joint profile parsing failed");
+  require(jo.steps==50 && jo.segment_frames==32 && jo.epochs==0 && jo.learning_rate==1e-4f &&
+          jo.learning_rate_decay==1.f && jo.synthesis_mode==voxmutatio::SynthesisMode::kSampled,
+          "joint bounded defaults do not match qualified recipe");
+  for(const auto& extra:std::vector<std::vector<std::string>>{{"--steps","51"},{"--epochs","1"},
+      {"--seg","40"},{"--synthesis-mode","mean"},{"--lr-decay","0.9"},
+      {"--gan-profile","joint"}}) {
+    auto invalid=joint;invalid.insert(invalid.end(),extra.begin(),extra.end());VcTrainOptions rejected;
+    require(parse(invalid,rejected)==ParseStatus::kExitFailure,"unsupported joint combination accepted");
+  }
+  auto without_gan=args;without_gan.insert(without_gan.end(),{"--gan-profile","joint"});VcTrainOptions no_gan;
+  require(parse(without_gan,no_gan)==ParseStatus::kExitFailure,"joint profile without GAN accepted");
   auto with=args;with.insert(with.end(),{"--cancel-file",token.string()});VcTrainOptions valid;
   require(parse(with,valid)==ParseStatus::kRun && valid.cancel_file==token.string(),"optional token parse failed");
   with.insert(with.end(),{"--cancel-file",token.string()});VcTrainOptions twice;
@@ -49,6 +63,32 @@ int main(int argc,char** argv){
   require(result.termination==ProcessTermination::kExited && result.exit_code==2 && result.io_error==0,"pre-cancel CLI must normally exit 2 before CUDA/model initialization");
   require(read(output)=="old-model","pre-cancel replaced old output");
   require(read(spec.log_path).find("Device:")==std::string::npos && read(spec.log_path).find("CUDA init")==std::string::npos,"pre-cancel touched CUDA initialization");
+  auto joint_spec=spec;
+  joint_spec.argv.insert(joint_spec.argv.end(),{"--gan","--gan-profile","joint"});
+  const auto joint_result=PosixProcessRunner{}.run(joint_spec);
+  require(joint_result.termination==ProcessTermination::kExited && joint_result.exit_code==2,
+          "pre-cancel joint CLI must exit 2 before loading data/models");
+  require(read(output)=="old-model","pre-cancel joint CLI replaced output");
+  auto full=args;full.insert(full.end(),{"--gan","--gan-profile","joint-full","--cache-dir","cache","--checkpoint-dir","state"});
+  VcTrainOptions fo;
+  require(parse(full,fo)==ParseStatus::kRun,"joint-full parsing failed");
+  require(fo.epochs==200 && fo.segment_frames==32 && fo.learning_rate==1e-4f && fo.learning_rate_decay==.999875f,
+          "joint-full defaults differ from approved recipe");
+  for(const auto& extra:std::vector<std::vector<std::string>>{{"--steps","50"},{"--epochs","0"},
+      {"--seg","40"},{"--synthesis-mode","mean"},{"--resume",""},{"--cache-dir","cache2"}}) {
+    auto invalid=full;invalid.insert(invalid.end(),extra.begin(),extra.end());VcTrainOptions rejected;
+    require(parse(invalid,rejected)==ParseStatus::kExitFailure,"invalid full training options accepted");
+  }
+  for(const auto& extra:std::vector<std::vector<std::string>>{{"--resume","checkpoint"},
+      {"--cache-dir","cache"},{"--checkpoint-dir","state"}}) {
+    auto invalid=joint;invalid.insert(invalid.end(),extra.begin(),extra.end());VcTrainOptions rejected;
+    require(parse(invalid,rejected)==ParseStatus::kExitFailure,"full-only option accepted in pilot");
+  }
+  auto full_spec=spec;
+  full_spec.argv.insert(full_spec.argv.end(),{"--gan","--gan-profile","joint-full","--cache-dir","cache","--checkpoint-dir","state"});
+  const auto full_result=PosixProcessRunner{}.run(full_spec);
+  require(full_result.termination==ProcessTermination::kExited && full_result.exit_code==2,
+          "pre-cancel full CLI must exit 2 before loading data/models");
   spec.argv.back()=(dir/"invalid").string();
   const auto bad=PosixProcessRunner{}.run(spec);
   require(bad.termination==ProcessTermination::kExited && bad.exit_code==1 && bad.io_error==0,"bad token exit is not error");

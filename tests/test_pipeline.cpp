@@ -396,6 +396,9 @@ TEST_CASE("Synthesizer fail-closes checkpoint and public numerical boundaries",
         CHECK_FALSE(invalid.initialized());
     };
     auto rejected = config;
+    rejected.synthesis_mode = static_cast<voxmutatio::SynthesisMode>(255);
+    require_config_rejected(rejected);
+    rejected = config;
     rejected.half_precision = true;
     require_config_rejected(rejected);
     rejected = config;
@@ -441,6 +444,17 @@ TEST_CASE("Synthesizer fail-closes checkpoint and public numerical boundaries",
     std::vector<float> features(static_cast<std::size_t>(synth.feature_dim()), 0.0f);
     float pitch = 1.0f;
     float f0 = 110.0f;
+    // Finite checkpoint values can still overflow exp(log-scale). The public
+    // sampled paths must return failure, never a successful NaN waveform.
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.enc_p.proj.bias", 192, 1000.0f));
+    REQUIRE(synth.init(config));
+    CHECK(synth.infer(features.data(), 1, &pitch, &f0, 0).data.empty());
+    const int pitch_coarse = 1;
+    CHECK(synth.debug_flow(features.data(), 1, &pitch_coarse, 0).empty());
+    REQUIRE(checkpoint.write_value(
+        checkpoint_path.path(), "model.enc_p.proj.bias", 192, 0.0f));
+    REQUIRE(synth.init(config));
     const auto valid = synth.infer(features.data(), 1, &pitch, &f0, 0);
     REQUIRE(valid.data.size() == 400);
     CHECK(std::all_of(valid.data.begin(), valid.data.end(),
@@ -473,6 +487,8 @@ TEST_CASE("Synthesizer fail-closes checkpoint and public numerical boundaries",
     // single-value sentinel is therefore safe for a rejected oversized frame
     // count in both the full and legacy windowed public entry points.
     float sentinel = 0.0f;
+    CHECK(synth.infer(&sentinel, 1, &sentinel, &sentinel, 0,
+                     std::numeric_limits<std::uint64_t>::max()).data.empty());
     constexpr int kOverflowingAttentionFrames = 40'000;
     CHECK(synth.infer(&sentinel, kOverflowingAttentionFrames, &sentinel,
                       &sentinel, 0).data.empty());

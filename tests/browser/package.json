@@ -1,0 +1,13 @@
+{
+  "name": "resonantia-browser-contracts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Test-only browser and accessibility dependencies; not part of the Web runtime.",
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "axe-core": "4.11.0",
+    "playwright-core": "1.64.1"
+  }
+}

@@ -7,6 +7,7 @@
 #include <string>
 
 #include "tools/app_support/command.h"
+#include "voxmutatio/core/types.h"
 
 namespace voxmutatio::app_support {
 
@@ -26,6 +27,11 @@ struct VcTrainOptions {
     float learning_rate = 2e-4f;
     float learning_rate_decay = 0.999875f;
     bool gan_mode = false;
+    std::string gan_profile = "legacy";
+    std::string cache_dir;       // joint-full only; immutable frozen frontends.
+    std::string checkpoint_dir;  // joint-full only; retained across cancellation.
+    std::string resume_path;     // Full state, never an inference model.
+    SynthesisMode synthesis_mode = SynthesisMode::kSampled;
 };
 
 [[nodiscard]] ParseStatus parse_vc_train_options(

@@ -1,6 +1,6 @@
 # Data Model: Voice Conversion Engine
 
-**Date**: 2026-08-09
+**Date**: 2026-10-24
 **Status**: As-built CUDA FP32 / WAV contract
 
 ## 1. Core Audio Types
@@ -44,6 +44,11 @@ enum class ContentEncoder : std::uint8_t {
     kHubert, // default
     kWavlm,  // optional; v2 and matching synthesizer required
 };
+
+enum class SynthesisMode : std::uint8_t {
+    kSampled, // default: prior and NSF Gaussian sampling
+    kMean,    // legacy zero-noise control
+};
 ```
 
 枚举值可被源码表达不代表均已支持。特别是 `kPm` 是兼容/未来预留值，当前
@@ -53,6 +58,7 @@ pipeline 必须拒绝。
 
 ```cpp
 struct VCConfig {
+    std::vector<PitchEdit> pitch_edits; // optional bounded-file manual corrections
     std::string hubert_model_path;
     std::string synthesizer_model_path;
     std::string index_path;
@@ -70,7 +76,9 @@ struct VCConfig {
     int filter_radius = 0;
     double edge_pad_sec = 0.5;
     bool apply_highpass = true;
-    bool interp_unvoiced = true;
+    SynthesisMode synthesis_mode = SynthesisMode::kSampled;
+    std::uint64_t synthesis_seed = 0;
+    bool interp_unvoiced = false;
 
     double max_chunk_sec = 30.0;
     double chunk_pad_sec = 2.0;
@@ -103,6 +111,8 @@ struct VCConfig {
 | `f0_up_key` | [-48, 48] |
 | `index_rate`, `rms_mix_rate`, `protect` | finite [0, 1] |
 | `filter_radius` | 0, or odd [3, 31] |
+| `synthesis_mode` | `kSampled` or `kMean`; invalid enum values rejected |
+| `synthesis_seed` | full uint64 range; fixed draws at each frame origin |
 | `edge_pad_sec` | finite [0, 2] |
 | `max_chunk_sec` | finite [1, 30] |
 | `chunk_pad_sec` | finite [0, 5] |
@@ -120,6 +130,12 @@ Encoder/model coupling:
   conversion failure rather than an implicit no-index fallback.
 
 `target_sample_rate` is a compatibility field, not an independent resampling request.
+Sampling defaults and migration are defined in [Spec §2.4](spec.md#24-采样合成恢复与兼容2026-10-24).
+`SynthesizerConfig` carries the same mode/seed. No model file layout changes or
+cross-call RNG state are introduced. The original five-argument `infer` uses origin 0; an overload accepts an absolute
+sampling frame origin to align chunk draws, rejecting derived-index overflow.
+`interp_unvoiced=false` preserves the raw
+unvoiced mask by default; explicit `true` retains the prior gap-filling behavior.
 
 ## 4. Result Type
 
@@ -159,6 +175,9 @@ Input WAV (supported PCM/float encoding, any accepted sample rate/channels)
 ```
 
 HuBERT file callers 使用 bounded path：稳定 16 kHz spool、quiet core、windowed F0、逐块
+RMS语义：mix0完全跟随源包络，mix1旁路；1秒居中补零窗口、半秒hop、固定分母和half-pixel
+插值。2026-10-26修正旧时间对齐，不新增窗口参数；短窗预览未通过听审，不属于当前能力。
+
 HuBERT/Index/VITS、全局 RMS 与 incremental atomic writer 不在内存保留全段音频。F0 单次
 输入硬上界为 `128000+2F`；content 上界使用 `Ceff/Qeff/Peff`，详见 Spec 001 migration。
 WavLM caller 与旧 `convert_file`/`convert_buffer` 保留 legacy whole-clip F0/owning result，
@@ -191,3 +210,11 @@ working set 仍随时长增长。两者都不定义流式协议。
   返回 false/empty。
 - VITS checkpoint 以 256 MiB cap 复制到共享 read-only anonymous snapshot；Flat Index 使用
   private unlinked filesystem snapshot。两者的容量与 resident-memory 取舍不同，不能混称。
+
+### 2026-10-29 additive cleanup/correction types
+
+`io::StereoAudioBuffer` owns interleaved L/R float32 and sample rate; it is separate from
+`AudioBuffer`, whose mono contract is unchanged. Stereo I/O is bounded to600 seconds/128MiB input.
+`PitchEdit{mode,start,end,semitones}` uses input seconds; the default-empty `VCConfig::pitch_edits`
+list is valid only for bounded file conversion. Exact validation/UV/endpoint rules are in Spec001's
+2026-10-29 correction section. No serialized model/index format changes.

@@ -768,11 +768,14 @@ bool compute_rms_records(bounded_io::RawFloatSpool& audio,
         return fail(error, "failed to initialize RMS record spool");
     }
     const std::uint64_t frames =
-        std::max<std::uint64_t>(1, (audio.sample_count() + hop - 1) / hop);
+        audio.sample_count() / hop + 1;
     std::vector<float> samples;
     for (std::uint64_t index = 0; index < frames; ++index) {
-        const std::uint64_t start = index * hop;
-        const std::uint64_t end = std::min(audio.sample_count(), start + frame);
+        const std::uint64_t center = index * hop;
+        const std::uint64_t left = frame / 2;
+        const std::uint64_t start = center >= left ? center - left : 0;
+        const std::uint64_t end = center +
+            std::min(frame - left, audio.sample_count() - center);
         if (end <= start) return fail(error, "invalid RMS record range");
         std::size_t count = 0;
         if (!narrow_size(end - start, count) || !audio.read(start, count, samples)) {
@@ -780,7 +783,7 @@ bool compute_rms_records(bounded_io::RawFloatSpool& audio,
         }
         double sum = 0.0;
         for (const float value : samples) sum += static_cast<double>(value) * value;
-        const float rms = static_cast<float>(std::sqrt(sum / samples.size()));
+        const float rms = static_cast<float>(std::sqrt(sum / static_cast<double>(frame)));
         if (!std::isfinite(rms) ||
             !records.append(std::span<const float>(&rms, 1))) {
             return fail(error, "RMS record append failed");
@@ -802,9 +805,12 @@ public:
         if (record_count == 0 || output_index >= output_samples_) {
             return fail(error, "invalid RMS envelope lookup");
         }
-        const double position =
-            static_cast<double>(output_index) * static_cast<double>(record_count - 1) /
-            static_cast<double>(std::max<std::uint64_t>(1, output_samples_ - 1));
+        // PyTorch linear interpolation with align_corners=false. RMS records
+        // are centered with zero padding, so neither end is shifted forward.
+        const double position = std::clamp(
+            (static_cast<double>(output_index) + 0.5) *
+                static_cast<double>(record_count) / static_cast<double>(output_samples_) - 0.5,
+            0.0, static_cast<double>(record_count - 1));
         const std::uint64_t first = static_cast<std::uint64_t>(position);
         if (first != cached_first_) {
             const std::size_t count = first + 1 < record_count ? 2 : 1;
@@ -917,6 +923,49 @@ bool detail::plan_first_quiet_core(
     QuietCorePlanner planner(source, source_samples, chunk_samples,
                              query_samples, hard_core_samples);
     return planner.next(core_start, core_end, done, error);
+}
+
+bool detail::process_f0(
+        bounded_io::RawFloatSpool& raw,
+        const std::filesystem::path& spool_directory,
+        const VCConfig& config,
+        bounded_io::RawFloatSpool& processed,
+        std::string& error, double pad_seconds, double duration_seconds) {
+    if (!valid_pitch_edits(config.pitch_edits)) return fail(error, "invalid pitch edits");
+    if (!build_processed_f0(raw, spool_directory, config.interp_unvoiced,
+                              config.filter_radius, config.f0_up_key,
+                              processed, error)) return false;
+    if (config.pitch_edits.empty()) return true;
+    // The opt-in correction path has a fixed 600s ceiling; two 61k-frame host
+    // arrays do not change the duration-independent waveform working set.
+    if (!std::isfinite(duration_seconds) || duration_seconds <= 0 || duration_seconds > 600 ||
+        !std::isfinite(pad_seconds) || pad_seconds < 0 || pad_seconds > 5 ||
+        raw.sample_count() > 61100) return fail(error, "pitch edits require input <=600 seconds");
+    std::vector<float> values, original;
+    if (!processed.read(0, processed.sample_count(), values) ||
+        !raw.read(0, raw.sample_count(), original)) return fail(error, "pitch edit read failed");
+    for (const auto& edit : config.pitch_edits) {
+        if (edit.end > duration_seconds) return fail(error, "pitch edit exceeds input duration");
+        const auto first = static_cast<std::size_t>(std::llround((edit.start + pad_seconds) * 100));
+        const auto last = static_cast<std::size_t>(std::llround((edit.end + pad_seconds) * 100));
+        if (last >= values.size() || last <= first) return fail(error, "pitch edit outside F0 timeline");
+        if (edit.mode == PitchEditMode::kSmooth) {
+            for (auto i = first; i <= last; ++i)
+                if (original[i] <= 0 || values[i] <= 0)
+                    return fail(error, "smooth pitch edit crosses unvoiced audio; narrow the interval");
+            const double a = std::log(values[first]), b = std::log(values[last]);
+            for (auto i = first + 1; i < last; ++i)
+                values[i] = std::exp(a + (b-a) * static_cast<double>(i-first)/(last-first));
+        } else {
+            const float factor = std::pow(2.0f, edit.semitones / 12.0);
+            for (auto i = first; i < last; ++i) if (original[i] > 0) values[i] *= factor;
+        }
+    }
+    bounded_io::RawFloatSpool corrected;
+    if (!corrected.create(spool_directory) || !corrected.append(values))
+        return fail(error, "pitch edit write failed or nonfinite result");
+    processed = std::move(corrected);
+    return true;
 }
 
 bool detail::write_global_rms_output(
@@ -1067,9 +1116,9 @@ VCResult VoiceConversionPipeline::convert_file_bounded(
         return finish_failure("bounded F0 extraction failed");
     }
     bounded_io::RawFloatSpool processed_f0;
-    if (!build_processed_f0(raw_f0, spool_directory, config_.interp_unvoiced,
-                            config_.filter_radius, config_.f0_up_key,
-                            processed_f0, result.error_message)) {
+    if (!detail::process_f0(raw_f0, spool_directory, config_,
+                            processed_f0, result.error_message,
+                            static_cast<double>(pad)/16000, static_cast<double>(source_samples)/16000)) {
         return finish_failure("bounded F0 post-processing failed");
     }
     result.f0_ms = std::chrono::duration<double, std::milli>(
@@ -1157,7 +1206,7 @@ VCResult VoiceConversionPipeline::convert_file_bounded(
 
         auto piece = synth_segment(segment.data(), segment_count,
                                    f0.data(), uv.data(), f0_count,
-                                   speaker_id, result);
+                                   speaker_id, result, first_f0);
         if (piece.data.empty()) {
             return finish_failure("bounded chunk synthesis failed");
         }

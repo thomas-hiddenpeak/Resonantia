@@ -1,0 +1,31 @@
+{
+  "source": "tools/probe_joint_decoder_gradient.py",
+  "purpose": "Six real decoder layers fixed-input kernel derivatives; does not waive the independent whole-step gate",
+  "fixture_origin": "runs/CyberTom_Joint_20261025/experiment/cpp-step-v5",
+  "files": {
+    "resblocks.11.convs2.2.safetensors": {
+      "bytes": 6645016,
+      "sha256": "42ce5418d7d3d58be8226138f360027b4c12e114bb636ba274189671ff8493a9"
+    },
+    "resblocks.8.convs1.2.safetensors": {
+      "bytes": 6915856,
+      "sha256": "9d353206ffc119f607e62aac7f744d343833bbda5bd317029397f77098f7377d"
+    },
+    "ups.0.safetensors": {
+      "bytes": 17570576,
+      "sha256": "dac6ba85d7bcecb7d3b500d3d802a8449085ff80a865569b541d794e49f173ba"
+    },
+    "ups.1.safetensors": {
+      "bytes": 8130328,
+      "sha256": "4c32fda6fb973bd2f33cce5cf37dd0569802603503404952857aae83ab58c930"
+    },
+    "ups.2.safetensors": {
+      "bytes": 6818072,
+      "sha256": "f43c8663d5b415a18364126f7c036e27331c18dbd944475460cc5e24c0945399"
+    },
+    "ups.3.safetensors": {
+      "bytes": 6620688,
+      "sha256": "1367da08911ed0db05e8548f5c5e3e067b0c23b2ed6ad48fe0bbba9988a5a3c0"
+    }
+  }
+}

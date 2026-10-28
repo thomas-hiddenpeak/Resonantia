@@ -50,6 +50,9 @@ struct SynthesizerConfig {
     ModelVersion version = ModelVersion::kV1;
     bool has_f0 = true;
     bool half_precision = false;
+
+    SynthesisMode synthesis_mode = SynthesisMode::kSampled;
+    std::uint64_t synthesis_seed = 0;  // same inputs/seed reproduce the same draws
 };
 
 /// VITS voice synthesizer with NSF (Harmonic + Noisy) vocoder.
@@ -80,10 +83,17 @@ public:
     /// empty AudioBuffer at the current model sample rate, consistent with
     /// invalid inputs and internal execution failures.
     /// speaker_id: speaker embedding index
+    /// Sampled mode restores prior/NSF Gaussian inputs; mean mode disables both.
+    /// sampling_frame_offset: 100 Hz frame origin in the padded clip, for
+    /// consistent draws across chunks. Default 0; overflowing indices fail
+    /// before reading input. This does not preserve harmonic phase across calls.
     /// Returns synthesized audio at model's native sample rate
     AudioBuffer infer(const float* features, int frames,
                       const float* pitch, const float* pitchf,
                       int speaker_id);
+    AudioBuffer infer(const float* features, int frames,
+                      const float* pitch, const float* pitchf,
+                      int speaker_id, std::uint64_t sampling_frame_offset);
 
     /// Legacy windowed helper: runs full inference, then crops the result using
     /// 100 Hz frame windows. It retains no cross-call state and is not a
@@ -119,12 +129,12 @@ public:
     std::vector<float> debug_text_encoder(const float* features, int frames,
                                           const int* pitch_coarse);
 
-    /// Test hook: run TextEncoder + Flow, return z [inter_channels, T].
+    /// Test hook: run TextEncoder + configured sampling + Flow, return z [inter_channels, T].
     /// Invalid inputs or internal failures return an empty vector.
     std::vector<float> debug_flow(const float* features, int frames,
                                   const int* pitch_coarse, int speaker_id);
 
-    /// Test hook: sine source har [T*upp].
+    /// Test hook: sine source har [T*upp], with configured NSF sampling.
     /// Invalid inputs or internal failures return an empty vector.
     std::vector<float> debug_har(const float* f0, int frames);
 

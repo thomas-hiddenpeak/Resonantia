@@ -1,0 +1,96 @@
+{
+  "command": [
+    "tools/gen_rmvpe_htk_reference.py"
+  ],
+  "torch": "2.13.0+cu130",
+  "librosa": "0.11.0",
+  "source": "/home/rm01/Resonantia/tests/fixtures/speech_librispeech.wav",
+  "source_sha256": "799f78ed4beb4de7ceae3a809262d4ce242394342ccd1d58cef7d49dbc2def46",
+  "weights_sha256": "820e94253031f7709724372dc7990576a444c486645120fbd93b01954d1ec704",
+  "generator_sha256": "8792f5dc13bcbf8a5bf0a0890823ec0d5e5cb1102374a3f3a30bf59cf680a2da",
+  "upstream": "https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI/blob/main/infer/rmvpe.py",
+  "upstream_file_sha256": "074171aec63e4b68f04d8691c62af50a1d99b9bc6dc56c4d6749fad4ba64853a",
+  "upstream_synthesizer_sha256": "769615b8dbed4775c8083881663a79c0e5ec0b662dd5f0c0a1bc3ccdd9827e99",
+  "frontend": {
+    "scale": "HTK",
+    "normalization": "Slaney area",
+    "n_fft": 1024,
+    "hop": 160,
+    "mel_bands": 128,
+    "fmin": 30,
+    "fmax": 8000,
+    "center": true,
+    "padding": "reflect",
+    "clamp": 1e-05
+  },
+  "device": "cpu",
+  "dtype": "float32",
+  "threshold": 0.03,
+  "outputs": {
+    "rmvpe_htk_mel.bin": {
+      "shape": [
+        128,
+        586
+      ],
+      "sha256": "96aba3b27aebee77c5c4424c537e6c1761d8184801c630d948edeede85a9b35b"
+    },
+    "rmvpe_htk_salience.bin": {
+      "shape": [
+        586,
+        360
+      ],
+      "sha256": "ed041c269433d50340384bebbb1b2ac9184fa8f68c9f42325b2e8c3818d39f54"
+    },
+    "rmvpe_htk_f0.bin": {
+      "shape": [
+        586
+      ],
+      "sha256": "1afe674667a24f429221207edf299e060408844408d83cb9e68ade5bef9e467f"
+    },
+    "rmvpe_htk_basis.bin": {
+      "shape": [
+        128,
+        513
+      ],
+      "sha256": "839ba238fd1b04fb2ec68d33414ceafe65fb85f46f670a2fe4ea48d0bcbdba44"
+    },
+    "e2e_htk_audio.bin": {
+      "shape": [
+        233600
+      ],
+      "sha256": "559c5187c165ee1b91f18604fa078ff740452c6d2314b71d58c6ca470d61abfd"
+    },
+    "e2e_htk_nsff0.bin": {
+      "shape": [
+        584
+      ],
+      "sha256": "d2c6e6037161be766bc0f4787c6aa73409fe1f69e524f3f638d0cbc97da3b68d"
+    },
+    "e2e_htk_pitch.bin": {
+      "shape": [
+        584
+      ],
+      "sha256": "38cb6f513f63b5a95d432a0069ce1d76c370e403cb2f7aa74084a603d81a575d"
+    }
+  },
+  "historical_slaney_comparison": {
+    "joint_voiced": 358,
+    "voicing_agreement": 0.9744027303754266,
+    "median_abs_cents": 558.9447021484375,
+    "htk_voiced": 366,
+    "slaney_voiced": 365
+  },
+  "hubert_features_sha256": "6854d85186163978a3952f471fca4f184131e8b9d91172775dae83419a8d9e0d",
+  "e2e": {
+    "frames": 584,
+    "seconds": 5.84,
+    "nsf_noise": false,
+    "prior_noise": false,
+    "speaker": 0,
+    "highpass": false,
+    "edge_pad": 0,
+    "index": 0,
+    "rms_mix": 1,
+    "limitation": "Numerical alignment, not CyberTom or human quality acceptance"
+  }
+}

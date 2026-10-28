@@ -175,17 +175,19 @@ void change_rms_envelope(const std::vector<float>& src, int src_sr,
     if (L == 0) return;
     auto rms_env = [](const std::vector<float>& y, int sr, int out_len) {
         int hop = std::max(1, sr / 2), frame = hop * 2;  // ~1s window, 0.5s hop
-        int nf = std::max(1, (static_cast<int>(y.size()) + hop - 1) / hop);
+        int nf = static_cast<int>(y.size()) / hop + 1;
         std::vector<float> e(nf);
         for (int f = 0; f < nf; ++f) {
-            long s = static_cast<long>(f) * hop, en = std::min<long>(y.size(), s + frame);
-            double acc = 0; long c = 0;
-            for (long k = s; k < en; ++k) { acc += static_cast<double>(y[k]) * y[k]; ++c; }
-            e[f] = static_cast<float>(std::sqrt(acc / std::max(1L, c)));
+            const long center = static_cast<long>(f) * hop;
+            const long s = std::max(0L, center - frame / 2);
+            const long en = std::min<long>(y.size(), center + frame / 2);
+            double acc = 0;
+            for (long k = s; k < en; ++k) acc += static_cast<double>(y[k]) * y[k];
+            e[f] = static_cast<float>(std::sqrt(acc / frame));
         }
         std::vector<float> r(out_len);
         for (int i = 0; i < out_len; ++i) {
-            double pos = static_cast<double>(i) * (nf - 1) / std::max(1, out_len - 1);
+            double pos = std::clamp((static_cast<double>(i) + 0.5) * nf / out_len - 0.5, 0.0, static_cast<double>(nf - 1));
             int i0 = static_cast<int>(pos); float fr = static_cast<float>(pos - i0);
             float v0 = e[std::min(i0, nf - 1)], v1 = e[std::min(i0 + 1, nf - 1)];
             r[i] = v0 + (v1 - v0) * fr;
@@ -251,7 +253,9 @@ bool VoiceConversionPipeline::init_in_place(const VCConfig& config) {
     wavlm_loaded_ = false;
     fcpe_loaded_ = false;
     config_ = config;
-    if (!supported_version(config.version) ||
+    if ((config.synthesis_mode != SynthesisMode::kSampled &&
+         config.synthesis_mode != SynthesisMode::kMean) ||
+        !supported_version(config.version) ||
         !supported_content_encoder(config.content_encoder) ||
         !supported_f0_method(config.f0_method)) {
         return false;
@@ -261,7 +265,7 @@ bool VoiceConversionPipeline::init_in_place(const VCConfig& config) {
     const bool invalid_filter = config.filter_radius != 0 &&
                                 (config.filter_radius < 3 || config.filter_radius > 31 ||
                                  config.filter_radius % 2 == 0);
-    const bool invalid_runtime_range =
+    const bool invalid_runtime_range = !valid_pitch_edits(config.pitch_edits) ||
         config.f0_up_key < -48 || config.f0_up_key > 48 ||
         !std::isfinite(config.index_rate) || config.index_rate < 0.0 || config.index_rate > 1.0 ||
         !std::isfinite(config.rms_mix_rate) || config.rms_mix_rate < 0.0 || config.rms_mix_rate > 1.0 ||
@@ -319,6 +323,8 @@ bool VoiceConversionPipeline::init_in_place(const VCConfig& config) {
         if (!f0_extractor_.init(f0_cfg_)) return false;
     }
 
+    synth_cfg_.synthesis_mode = config.synthesis_mode;
+    synth_cfg_.synthesis_seed = config.synthesis_seed;
     synth_cfg_.model_path = config.synthesizer_model_path;
     synth_cfg_.version = config.version;
     synth_cfg_.has_f0 = config.has_f0;
@@ -358,7 +364,7 @@ std::vector<float> VoiceConversionPipeline::extract_content(const float* audio, 
 AudioBuffer VoiceConversionPipeline::synth_segment(
         const float* seg16k, int segn,
         const float* f0_slice, const std::uint8_t* uv_slice, int f0_len,
-        int speaker_id, VCResult& timing) {
+        int speaker_id, VCResult& timing, std::uint64_t sampling_frame_offset) {
     using clock = std::chrono::high_resolution_clock;
 
     // Content features [T, feature_dim_]
@@ -425,7 +431,8 @@ AudioBuffer VoiceConversionPipeline::synth_segment(
     // VITS synthesis
     t0 = clock::now();
     auto synth_audio = synth_.infer(feats_up.data(), p_len,
-                                    pitch_coarse.data(), f0.data(), speaker_id);
+                                    pitch_coarse.data(), f0.data(), speaker_id,
+                                    sampling_frame_offset);
     timing.synth_ms += std::chrono::duration<double, std::milli>(clock::now() - t0).count();
     return synth_audio;
 }
@@ -506,7 +513,7 @@ VCResult VoiceConversionPipeline::convert_long(std::vector<float>& audio16k, int
         int f0_len = fe - fs;
         if (segn <= 0 || f0_len <= 0) continue;
         auto piece = synth_segment(apad.data() + a, segn, f0.data() + fs, uv.data() + fs,
-                                   f0_len, speaker_id, result);
+                                   f0_len, speaker_id, result, static_cast<std::uint64_t>(fs));
         if (piece.data.empty()) {
             if (result.error_message.empty()) {
                 result.error_message = "chunk synthesis failed";
@@ -552,6 +559,11 @@ VCResult VoiceConversionPipeline::convert_buffer(const AudioBuffer& input,
     using clock = std::chrono::high_resolution_clock;
     VCResult result;
     auto t_start = clock::now();
+
+    if (!config_.pitch_edits.empty()) {
+        result.error_message = "manual pitch edits require bounded file conversion";
+        return result;
+    }
 
     if (!initialized_) {
         result.error_message = "pipeline not initialized";

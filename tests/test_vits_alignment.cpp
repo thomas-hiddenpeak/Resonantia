@@ -7,6 +7,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -78,6 +79,7 @@ TEST_CASE("VITS TextEncoder alignment (m_p)", "[vits][alignment][encp]") {
     SynthesizerConfig cfg;
     cfg.model_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
     cfg.version = voxmutatio::ModelVersion::kV2;
+    cfg.synthesis_mode = voxmutatio::SynthesisMode::kMean;
     Synthesizer synth;
     REQUIRE(synth.init(cfg));
 
@@ -103,6 +105,7 @@ TEST_CASE("VITS Flow alignment (z)", "[vits][alignment][flow]") {
     SynthesizerConfig cfg;
     cfg.model_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
     cfg.version = voxmutatio::ModelVersion::kV2;
+    cfg.synthesis_mode = voxmutatio::SynthesisMode::kMean;
     Synthesizer synth;
     REQUIRE(synth.init(cfg));
 
@@ -127,11 +130,14 @@ TEST_CASE("VITS full inference alignment (audio, SC-003)", "[vits][alignment][au
     SynthesizerConfig cfg;
     cfg.model_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
     cfg.version = voxmutatio::ModelVersion::kV2;
+    cfg.synthesis_mode = voxmutatio::SynthesisMode::kMean;
     Synthesizer synth;
     REQUIRE(synth.init(cfg));
 
     auto out = synth.infer(phone.data.data(), T, pitch.data.data(), nsff0.data.data(), 0);
     std::cout << "C++ audio: " << out.data.size() << " (ref " << audio_ref.data.size() << ")" << std::endl;
+    REQUIRE(out.data.size() == audio_ref.data.size());
+    REQUIRE_FALSE(out.data.empty());
 
     double corr = srcc_pearson(out.data, audio_ref.data);
     double e = rms(out.data, audio_ref.data);
@@ -139,4 +145,63 @@ TEST_CASE("VITS full inference alignment (audio, SC-003)", "[vits][alignment][au
 
     // SC-003: high waveform correlation
     CHECK(corr > 0.999);
+    // Correlation alone missed using slope 0.1 instead of the reference's
+    // default 0.01 immediately before conv_post (about 4% relative L2 error).
+    double reference_energy = 0.0;
+    for (float value : audio_ref.data) reference_energy += double(value) * value;
+    REQUIRE(reference_energy > 0.0);
+    const double relative_l2 = e / std::sqrt(reference_energy / audio_ref.data.size());
+    std::cout << "audio relative L2: " << relative_l2 << std::endl;
+    CHECK(relative_l2 < 1e-3);
+}
+
+TEST_CASE("VITS default sampled inference matches upstream supplied Gaussian draws",
+          "[vits][alignment][sampled]") {
+    using namespace voxmutatio::synthesizer;
+    const auto phone = load_ref("../tests/fixtures/vits_ref_phone.bin");
+    const auto pitch = load_ref("../tests/fixtures/e2e_htk_pitch.bin");
+    const auto f0 = load_ref("../tests/fixtures/e2e_htk_nsff0.bin");
+    const auto reference = load_ref("../tests/fixtures/vits_sampled_audio.bin");
+    REQUIRE(phone.ok); REQUIRE(pitch.ok); REQUIRE(f0.ok); REQUIRE(reference.ok);
+    const int frames = phone.shape[0];
+    REQUIRE(pitch.data.size() == static_cast<std::size_t>(frames));
+    REQUIRE(f0.data.size() == static_cast<std::size_t>(frames));
+    SynthesizerConfig config;
+    config.model_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
+    config.version = voxmutatio::ModelVersion::kV2;
+    Synthesizer synth;
+    REQUIRE(synth.init(config));
+    const auto output = synth.infer(phone.data.data(), frames, pitch.data.data(), f0.data.data(), 0);
+    REQUIRE(output.data.size() == reference.data.size());
+    double energy = 0.0;
+    for (float value : reference.data) energy += double(value) * value;
+    REQUIRE(energy > 0.0);
+    const double corr = srcc_pearson(output.data, reference.data);
+    const double relative_l2 = rms(output.data, reference.data) /
+        std::sqrt(energy / reference.data.size());
+    std::cout << "sampled correlation=" << corr << " relative_l2=" << relative_l2 << '\n';
+    CHECK(corr > 0.999);
+    CHECK(relative_l2 < 1e-3);
+    // Repeatable samples at fixed seed; another seed changes the realized audio.
+    constexpr int short_frames = 40;
+    const auto first = synth.infer(phone.data.data(), short_frames, pitch.data.data(), f0.data.data(), 0);
+    const auto repeated = synth.infer(phone.data.data(), short_frames, pitch.data.data(), f0.data.data(), 0);
+    REQUIRE(first.data.size() == short_frames * 400);
+    CHECK(first.data == repeated.data);
+    config.synthesis_seed = 1;
+    REQUIRE(synth.init(config));
+    const auto changed = synth.infer(phone.data.data(), short_frames, pitch.data.data(), f0.data.data(), 0);
+    REQUIRE(changed.data.size() == first.data.size());
+    CHECK(changed.data != first.data);
+    // UV samples must contain NSF excitation, while legacy mean mode has none.
+    const std::vector<float> unvoiced(40, 0.0f);
+    const auto excited = synth.debug_har(unvoiced.data(), 40);
+    config.synthesis_mode = voxmutatio::SynthesisMode::kMean;
+    REQUIRE(synth.init(config));
+    const auto quiet = synth.debug_har(unvoiced.data(), 40);
+    REQUIRE(excited.size() == 16000);
+    REQUIRE(quiet.size() == excited.size());
+    CHECK(excited != quiet);
+    CHECK(*std::max_element(quiet.begin(), quiet.end()) == *std::min_element(quiet.begin(), quiet.end()));
+
 }

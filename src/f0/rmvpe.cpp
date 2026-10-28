@@ -6,6 +6,7 @@
 // [T, 360] -> F0 contour via local weighted-average decoding.
 
 #include "voxmutatio/f0/rmvpe.h"
+#include "rmvpe_frontend.h"
 #include "voxmutatio/f0/rmvpe_ops.h"
 #include "voxmutatio/content/cuda/kernels.h"
 #include "voxmutatio/io/safetensors.h"
@@ -36,65 +37,12 @@ constexpr int kNMels = 128;
 constexpr int kNFFT = 1024;
 constexpr int kHop = 160;
 constexpr int kWin = 1024;
-constexpr float kFmin = 30.0f;
-constexpr float kFmax = 8000.0f;
 constexpr int kSampleRate = 16000;
 constexpr float kMelClamp = 1e-5f;
 constexpr int kNClass = 360;
 constexpr int kEncDeLayers = 5;
 constexpr int kInterLayers = 4;
 constexpr int kNBlocks = 4;
-
-// ---- Slaney mel scale (matches librosa) ----
-float hz_to_mel_slaney(float hz) {
-    const float f_sp = 200.0f / 3.0f;
-    float mel = hz / f_sp;
-    const float min_log_hz = 1000.0f;
-    const float min_log_mel = min_log_hz / f_sp;  // 15
-    const float logstep = std::log(6.4f) / 27.0f;
-    if (hz >= min_log_hz) mel = min_log_mel + std::log(hz / min_log_hz) / logstep;
-    return mel;
-}
-
-float mel_to_hz_slaney(float mel) {
-    const float f_sp = 200.0f / 3.0f;
-    float hz = f_sp * mel;
-    const float min_log_hz = 1000.0f;
-    const float min_log_mel = min_log_hz / f_sp;  // 15
-    const float logstep = std::log(6.4f) / 27.0f;
-    if (mel >= min_log_mel) hz = min_log_hz * std::exp(logstep * (mel - min_log_mel));
-    return hz;
-}
-
-// Build librosa Slaney mel filterbank [n_mels, n_freqs]
-std::vector<float> build_mel_basis() {
-    int n_freqs = kNFFT / 2 + 1;  // 513
-    std::vector<float> fftfreqs(n_freqs);
-    for (int i = 0; i < n_freqs; ++i)
-        fftfreqs[i] = 0.5f * kSampleRate * i / (n_freqs - 1);
-
-    float mel_min = hz_to_mel_slaney(kFmin);
-    float mel_max = hz_to_mel_slaney(kFmax);
-    std::vector<float> freqs(kNMels + 2);
-    for (int i = 0; i < kNMels + 2; ++i) {
-        float mel = mel_min + (mel_max - mel_min) * i / (kNMels + 1);
-        freqs[i] = mel_to_hz_slaney(mel);
-    }
-
-    std::vector<float> weights(kNMels * n_freqs, 0.0f);
-    for (int m = 0; m < kNMels; ++m) {
-        float fdiff_lower = freqs[m + 1] - freqs[m];
-        float fdiff_upper = freqs[m + 2] - freqs[m + 1];
-        float enorm = 2.0f / (freqs[m + 2] - freqs[m]);
-        for (int f = 0; f < n_freqs; ++f) {
-            float lower = (fftfreqs[f] - freqs[m]) / fdiff_lower;
-            float upper = (freqs[m + 2] - fftfreqs[f]) / fdiff_upper;
-            float w = std::max(0.0f, std::min(lower, upper));
-            weights[m * n_freqs + f] = w * enorm;
-        }
-    }
-    return weights;
-}
 
 // Periodic Hann window (matches torch.hann_window default)
 std::vector<float> hann_window(int n) {
@@ -135,7 +83,7 @@ void fft_radix2(std::vector<float>& re, std::vector<float>& im) {
 
 // Mel spectrogram: audio -> [n_mels, T] log-mel (matches RMVPE MelSpectrogram)
 std::vector<float> mel_spectrogram(const float* audio, int num_samples, int& out_T) {
-    static std::vector<float> mel_basis = build_mel_basis();
+    static const std::vector<float> mel_basis = detail::rmvpe_mel_basis();
     static std::vector<float> window = hann_window(kWin);
 
     // center=True: reflect-pad by n_fft/2 on both sides

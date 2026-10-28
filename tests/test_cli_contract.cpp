@@ -162,6 +162,29 @@ void append(std::vector<std::string>& destination,
     destination.insert(destination.end(), values.begin(), values.end());
 }
 
+void expect_joint_preflight(const std::string& executable,const fs::path& root) {
+    const auto input=root/"joint-input.wav",output=root/"joint-old.safetensors";
+    for(const auto& config:std::vector<std::pair<unsigned,unsigned>>{
+            {40000,240001},{16000,16000},{40000,100}}) {
+        const auto [rate,frames]=config;std::ofstream wav(input,std::ios::binary);
+        const auto u16=[&](unsigned v){wav.put(char(v));wav.put(char(v>>8));};
+        const auto u32=[&](unsigned v){for(int i=0;i<4;++i)wav.put(char(v>>(8*i)));};
+        wav<<"RIFF";u32(36+2*frames);wav<<"WAVEfmt ";u32(16);u16(1);u16(1);
+        u32(rate);u32(rate*2);u16(2);u16(16);wav<<"data";u32(2*frames);
+        const std::string silence(frames*2,'\0');wav.write(silence.data(),silence.size());wav.close();
+        std::ofstream(output)<<"existing-model";
+        const std::vector<std::string> args{"--hubert","missing-hubert","--rmvpe","missing-rmvpe",
+            "--pretrained","missing-model","--target",input.string(),"--out",output.string(),
+            "--gan","--gan-profile","joint","--steps","1"};
+        const auto result=run_process(executable,args);
+        std::ifstream f(output);const std::string bytes((std::istreambuf_iterator<char>(f)),{});
+        if(result.exit_code!=1 || result.output.find("joint input requires 40 kHz WAV clips") == std::string::npos ||
+           result.output.find("Device:")!=std::string::npos || bytes!="existing-model") {
+            ++failures;std::cerr<<"FAIL bounded joint preflight before CUDA: "<<result.output<<'\n';
+        }
+    }
+}
+
 void expect_batch_collision_rejected(const std::string& executable, const fs::path& root) {
     const auto input = root / "collision-input";
     const auto output = root / "collision-output";
@@ -274,14 +297,14 @@ int main(int argc, char** argv) {
 
     expect_success_contains(
         "vc_convert help lists the supported model contract", convert, {"--help"},
-        {"--filter-radius", "--version", "--speakers", "--sr", "40 kHz",
+        {"--synthesis-mode", "--synthesis-seed", "--filter-radius", "--version", "--speakers", "--sr", "40 kHz",
          "--rmvpe", "--fcpe", "required when f0-method=rmvpe",
          "required when f0-method=fcpe", "required when index-rate > 0",
          "required when content-encoder=hubert",
          "required when content-encoder=wavlm", "safetensors path"});
     expect_success_contains(
         "vc_batch help lists the supported model contract", batch, {"--help"},
-        {"--filter-radius", "--version", "--speakers", "--sr", "40 kHz",
+        {"--synthesis-mode", "--synthesis-seed", "--filter-radius", "--version", "--speakers", "--sr", "40 kHz",
          "--rmvpe", "--fcpe", "required when f0-method=rmvpe",
          "required when f0-method=fcpe", "required when index-rate > 0",
          "required when content-encoder=hubert",
@@ -308,6 +331,48 @@ int main(int argc, char** argv) {
                     {"--bogus"}, "Unknown argument: --bogus");
     expect_rejected("build_index missing option value", build_index,
                     {"--hubert"}, "error: missing value for --hubert");
+
+    for (const auto& tool : {convert, batch}) {
+        expect_rejected("bad synthesis mode", tool,
+                        {"--synthesis-mode", "invalid"},
+                        "error: --synthesis-mode must be sampled or mean");
+        for (const auto& seed : {"-1", "18446744073709551616", "NaN", "1x"}) {
+            expect_rejected("bad synthesis seed", tool,
+                            {"--synthesis-seed", seed},
+                            "error: invalid value for --synthesis-seed");
+        }
+    }
+    expect_rejected("bad training synthesis mode", train,
+                    {"--synthesis-mode", "invalid"},
+                    "error: --synthesis-mode must be sampled or mean");
+
+    for (const auto& edits : {"smooth:nan:1", "smooth:1:0", "shift:0:1:25",
+                             "smooth:0:1;smooth:0.5:1.5", "smooth:0:3"}) {
+        expect_rejected("invalid manual pitch interval", convert, {"--pitch-edits", edits},
+                        "error: invalid --pitch-edits");
+    }
+    {
+        TempDir stereo_temp;
+        auto args = preprocess_required(stereo_temp.path());
+        append(args, {"--preserve-stereo", "--no-slice", "--sr", "40000"});
+        expect_rejected("stereo cleanup rate mismatch", preprocess, args,
+                        "--preserve-stereo requires --no-slice --sr 44100");
+    }
+
+    for (const auto& mode : {"sampled", "mean"}) {
+        for (const auto& seed : {"0", "18446744073709551615"}) {
+            // Valid mode and seed must reach dependency validation, before any
+            // model loading or output I/O. Cover both uint64 endpoints.
+            expect_dependency_contracts("sampled convert options", convert,
+                {"--model", "missing-model", "--input", "missing-input.wav",
+                 "--output", "missing-output.wav", "--synthesis-mode", mode,
+                 "--synthesis-seed", seed});
+            expect_dependency_contracts("sampled batch options", batch,
+                {"--model", "missing-model", "--input-dir", "missing-input",
+                 "--output-dir", "missing-output", "--synthesis-mode", mode,
+                 "--synthesis-seed", seed});
+        }
+    }
 
     expect_dependency_contracts(
         "vc_convert", convert,
@@ -459,6 +524,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     expect_batch_collision_rejected(batch, temp.path());
+    expect_joint_preflight(train,temp.path());
     {
         auto args = preprocess_required(temp.path());
         append(args, {"--sr", "forty-k"});

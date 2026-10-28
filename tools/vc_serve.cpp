@@ -24,6 +24,7 @@ struct StartupConfig {
     std::string webroot = "webui";
     std::string repo;
     std::string auth_token;
+    std::string ffmpeg = "/usr/bin/ffmpeg";
 };
 
 bool parse_startup_config(int argc, char** argv, StartupConfig& config, int& exit_code) {
@@ -31,12 +32,12 @@ bool parse_startup_config(int argc, char** argv, StartupConfig& config, int& exi
         const std::string argument = argv[index];
         if (argument == "--help" || argument == "-h") {
             std::printf("Usage: vc_serve [--host IPv4] [--port 8080] [--webroot webui] "
-                        "[--repo PATH] [--auth-token TOKEN]\n");
+                        "[--repo PATH] [--auth-token TOKEN] [--ffmpeg /absolute/path]\n");
             exit_code = 0;
             return false;
         }
         if (argument != "--host" && argument != "--port" && argument != "--webroot" &&
-            argument != "--repo" && argument != "--auth-token") {
+            argument != "--repo" && argument != "--auth-token" && argument != "--ffmpeg") {
             std::fprintf(stderr, "Unknown argument: %s\n", argument.c_str());
             exit_code = 1;
             return false;
@@ -59,6 +60,12 @@ bool parse_startup_config(int argc, char** argv, StartupConfig& config, int& exi
             config.webroot = value;
         } else if (argument == "--repo") {
             config.repo = value;
+        } else if (argument == "--ffmpeg") {
+            if (!fs::path(value).is_absolute()) {
+                std::fprintf(stderr, "FFmpeg path must be absolute\n");
+                exit_code = 1; return false;
+            }
+            config.ffmpeg = value;
         } else {
             config.auth_token = value;
         }
@@ -85,6 +92,7 @@ bool resolve_paths(const StartupConfig& config, resonantia::web::Paths& paths) {
     }
 
     paths.webroot = canonical_webroot.string();
+    paths.ffmpeg = config.ffmpeg;
     paths.repo = config.repo.empty() ? canonical_webroot.parent_path().string()
                                      : fs::absolute(config.repo).string();
     paths.models = paths.repo + "/models";

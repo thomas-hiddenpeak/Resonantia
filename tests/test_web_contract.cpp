@@ -694,6 +694,11 @@ if [ -f "$RESONANTIA_TEST_ROOT/convert-cli-fail.trigger" ]; then
     exit 61
 fi
 echo "conversion done"
+echo "Done (12 ms)"
+echo "  HuBERT:  3 ms"
+echo "  F0:      4 ms"
+echo "  Index:   2 ms"
+echo "  Synth:   3 ms"
 )SH");
     if (chmod(convert.c_str(), 0700) != 0)
         throw std::runtime_error("chmod fake vc_convert failed");
@@ -1837,6 +1842,10 @@ void run_open_server_contracts(Checks& checks, const fs::path& server,
             known_arguments.find("--index-rate 0.750000") != std::string::npos,
         "an installed custom voice must pass its model, index and positive index "
         "rate to conversion");
+    const std::string conversion_log = read_file(root / "server.log");
+    checks.expect(conversion_log.find("HuBERT:  3 ms") != std::string::npos &&
+                      conversion_log.find("Synth:   3 ms") != std::string::npos,
+                  "successful conversion stage timings must survive temporary cleanup in the service log");
 
     write_file(root / "convert-cli-fail.trigger", "1");
     const HttpResponse convert_failure = request(

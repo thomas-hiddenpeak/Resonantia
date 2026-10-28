@@ -41,7 +41,7 @@ rows 上限、backend 和 fallback trigger 必须由 target evidence 决定，�
 |---|---|---|
 | 设备 | CUDA | CPU 推理 |
 | 精度 | FP32 | FP16 |
-| 音频文件 | WAV | FLAC、MP3 |
+| 核心音频文件接口 | WAV；Web另有FFmpeg上传归一化边界 | 核心直接读取FLAC、MP3 |
 | RVC 模型 | F0 v1（256D）、F0 v2（768D） | non-F0 |
 | 内容编码 | HuBERT（默认）、WavLM（需匹配合成器） | 不兼容特征空间的模型组合 |
 | F0 提取 | RMVPE（默认）、FCPE（可选） | PM 等未实现方法 |
@@ -75,6 +75,10 @@ snapshot。音频 API 目前不提供 FLAC/MP3 解码器。
 - RMVPE：推理主链默认使用；初始化会完整校验运行时使用的 tensor，并持久共享只读、
   已验证的 checkpoint 映射。失败重初始化会清空旧状态；算子层的临时 device buffer 由
   `core::CudaBuffer` 持有，CUDA copy/计算抛错时沿栈释放。
+  RMVPE mel前端必须使用HTK频率刻度与Slaney面积归一化（两者不同），
+  128带、30–8000 Hz、16 kHz/FFT1024/hop160。2026-10-24发现旧C++与自写
+  Python参考共同错用Slaney刻度；新的真实语音参考直接调用上游RMVPE，见
+  `tools/gen_rmvpe_htk_reference.py`与`tests/fixtures/README.md`。
 - FCPE：有独立实现、可选 pipeline/CLI 分发和本地对拍测试；初始化完整校验 tensor，
   事务式物化 weight-norm 输出投影，失败重初始化会清空旧状态。R0 已固定
   `torchfcpe==0.0.4` package/checkpoint provenance、locked tool project 与 same-filesystem
@@ -93,7 +97,40 @@ replacement/truncate/overwrite 不会改变 active bytes 或触发 SIGBUS。`bui
 standalone R0 probe 的 persistent-GPU exact retrieval 仍只用于诊断/对拍，不是产品 backend，
 也不定义 qualified rows/rate/batch 上限。
 
+离线 exact search 对 query 使用最多 4 个 CPU 工作线程，每个线程只持有一份 `O(rows)`
+距离/索引 scratch；不足 4 个 query 或不足 256 行时走单线程。每个 query 的 float 累加
+次序和 partial-sort tie 行为保持不变，线程异常使整次搜索失败，不发布部分检索结果。
+
 ### `synthesizer/`
+
+默认`SynthesisMode::kSampled`恢复prior的`exp(log_std)*N(0,1)*0.66666`及NSF有声
+0.003/无声0.1÷3的噪声幅度；`kMean`保留两处均关闭的旧对照。`VCConfig`和
+`SynthesizerConfig`传递固定64位seed（默认0），私有`sampling.h`用无状态SplitMix64
+counter hash与Box-Muller生成分流高斯值。`infer`保留原五参数入口（offset=0），新增带`sampling_frame_offset`的重载，
+标识反射补边音频中的100 Hz起始帧；pipeline按该绝对位置对齐分段抽样，
+并在访问输入前拒绝派生索引溢出。没有跨调用RNG状态或完整额外噪声数组，shape变化
+不重排抽样。
+prior的非有限输入/指数溢出返回失败；非法mode在初始化拒绝。debug Flow/source/decode
+遵循配置，encoder stats保持原定义。训练CLI前处理缓存使用相同规则，仍不逐step刷新。
+独立上游网络以显式相同高斯输入生成`vits_sampled_*`，并与旧mean fixture分别门控。
+不同chunk按绝对帧位置抽样；现有NSF phase reset与非实时语义保持，长音频误差/资源
+门限不放宽。迁移、CLI回滚和旧权重听审边界见
+[Spec 001 §2.4](../specs/001-voice-conversion-engine/spec.md#24-采样合成恢复与兼容2026-10-24)。
+
+NSF生成器的最后一个LeakyReLU（`conv_post`前）使用负半轴系数`0.01`，其余
+upsampling/residual激活为`0.1`；`GeneratorTrainer::decode`使用相同结构和对应梯度。
+这是参考数值对齐要求。2026-10-24修正两处原先共用`0.1`的错误；独立真实音频参考
+在相关性之外检查相对L2，不能只用train/infer相互一致证明正确。
+
+离线性能优化（2026-10-24）：TextEncoder 的相对位置 attention 使用 FP32 cuBLAS
+QK/AV 和 CUDA relative-softmax/relative-value，逐 head 复用一个 `T*T` 工作区。
+大通道 conv1d 使用分组、时间分块 im2col + SGEMM；transpose convolution 先计算
+channel/kernel columns，再按输出位置 gather，避免零插入与 atomic scatter。
+卷积额外 columns 工作区每次调用最多 16 MiB，跨 tiles/groups 复用；小通道或工作区
+无法容纳的形状保留原 kernel。cuBLAS handle 为调用局部 RAII，FP32 pedantic math。
+权重与中间 activation 仍有 host/device 往返，这不是常驻 GPU 推理架构。
+`test_synth_ops` 验证位置编码、groups/dilation/stride/tile 边界；真实模型对齐和私有
+CUDA 失败注入仍是独立门禁。
 
 实现 F0 VITS v1/v2 的 TextEncoder、Flow、NSF/HiFi-GAN 生成器。初始化逐项校验所有运行时
 已用 tensor 的 F32 dtype、精确 shape/nbytes、可读对齐和有限值；weight-norm 的 `g/v` 还要求
@@ -123,6 +160,17 @@ allocation、model/I/O、CUDA、标准及未知内部异常并返回既定空/fa
 仅接受 CUDA FP32/F0/40 kHz 契约。`index_rate > 0` 时，Index 缺失、feature width 不匹配或
 lookup failure 均显式失败，不静默旁路检索。
 
+RMS包络使用1秒居中窗口、0.5秒hop、边界补零及固定完整窗口分母，记录数为
+`floor(N/hop)+1`；插值坐标为`(i+0.5)*records/output_size-0.5`并钳制边界。
+2026-10-26修正旧前向窗口、尾窗变动分母及端点插值，bounded与buffer路径一致。
+`rms_mix_rate=0`跟随源包络，1完全旁路；中间值仍按原幂次混合。独立上游算子常量
+及真实Tom/翻唱波形均验证，不能仅以“与旧实现一致”为证据。窗口、内存界、模型不变。
+100ms全频增益的离线预览虽恢复短时强弱，但Tom样本被反馈音色变差/齿音，未接入运行时。
+
+F0默认保留无声帧（`interp_unvoiced=false`），避免训练使用零F0而推理自动填成
+连续有声音高；显式`true`保留旧gap filling。median filter仍是独立的可选平滑。
+bounded生产入口与DSP门禁共用private `detail::process_f0`，不增加公共API或缓冲上界。
+
 `convert_file_bounded` 是同步 seekable-WAV file-to-file API：稳定 16 kHz source spool、全局
 double forward/reverse high-pass、一次一个 quiet core、独立 F0 windows、raw synth/RMS spool
 和 incremental atomic writer 都不在内存保留全段音频。对 checked 16 kHz samples `C/Q/P` 与
@@ -147,12 +195,87 @@ profile，因此没有把未直接执行的另外两个 Cartesian pairing 伪称
 可恢复的 model/I/O/CUDA/runtime 异常以 `VCResult` 失败返回；持续 `std::bad_alloc` 在连结果
 都无法构造时可传播。同一 pipeline instance 不是 thread-safe。
 
-focused Orin/CC 8.7 Release resource gate 对 17.565/35.130 秒真实语音记录 peak RSS
+历史Orin/CC 8.7 Release resource gate 对 17.565/35.130 秒真实语音记录 peak RSS
 `1342624`/`1354844 KiB` 与 device growth `892334080`/`851812352` bytes；这是两个时长点，
 必须与 hard bounds 联合解释。临时磁盘仍为 `O(duration)`，且当前没有独立冻结的
 click/transient 边界指标；这些限制不能被 `>0.98` phase-invariant spectrum gate 掩盖。
+2026-10-25复验曾超出原资源阈值；诊断和当前测试结果见PROJECT_STATE，不能沿用历史
+通过记录掩盖失败。VITS现在在残差分支前释放已消费的latent、上一层激活、上采样结果
+与噪声投影，避免无用大数组同时存活；算术、随机输入、文件事务及资源阈值保持不变。
 
 ### `training/`
+
+2026-10-26维护者批准完整训练能力补齐与200轮计划，迁移见
+[ADR-0009](adr/0009-resumable-joint-training.md)。库内新增完整状态API与AdamW事务恢复：
+单safetensors保存训练G/D、全部一/二阶矩、计数/LR、mt19937、原始enc_q/非目标speaker值，
+以及最多64KiB应用状态。文件仅含F32，文本字节编码为精确的[0,255]浮点整数，保持
+既有loader dtype拒绝边界；版本/固定manifest/shape/有限值/负二阶矩在GPU恢复前校验。
+使用最多2GiB稳定snapshot、逐tensorhost中转与暂存trainer，失败保留原trainer及应用状态；
+写出采用同目录唯一临时文件+fsync+rename。它与推理导出明确区分。库内真实下一步恢复
+门禁已经通过；CLI/Web完整作业接线及真实CLI同一状态的下一步恢复/取消验证已通过，
+当前完整回归与实际Web部署状态见项目状态，不能外推长期质量保证。
+精确测试证据与后续状态见PROJECT_STATE；原50步profile与严格数值参考保持。
+
+新`joint-full`私有应用编排位于`tools/app_support/joint_full_training.cpp`；
+`joint_run_state.h`保存有界数据排列、epoch位置和裁剪RNG，并用流式SHA-256绑定文件与配方。
+epoch按完整clip遍历定义，batch1，LR逐轮衰减；准备阶段释放冻结前端后再分配训练图。
+`joint_feature_cache.h`使用原F32 safetensors格式和原子writer，单缓存8MiB上限，
+验证完整manifest、身份、范围及payload摘要，逐clip读取；不缓存训练prior或随机激励。
+完整checkpoint最近两份滚动保留，阶段推理候选独立保存，进程间目录锁避免状态混写。
+
+Web `joint-full`将固定clips/cache/checkpoints放入`<voice>/full_training/`，
+一次性staging退出不会删除它们。`resume=1`复用固定片段与最新完整状态，
+`prepared=1`可接受已审核的有界40k切片而不重切；两者互斥且不允许附加清理。
+完整结果事务提交到`full_training/result`供听审，不写voice根目录，旧模型不受影响。
+UI能力发现、恢复选项与进度日志区别完整候选和已发布声线；具体API边界见Spec 003。
+页面载入时还会按服务端当前job_id重新跟踪活动训练，刷新无需重新上传；只恢复观察和
+取消控制，不改变服务端作业，也不覆盖页面内已经提交的新作业。
+完整训练的UI按最新日志阶段区分身份核验、Cache段数与实际step/epoch；阶段条不是墙钟
+剩余时间预测。进程恢复后较新的缓存阶段优先于旧日志中的step。
+
+已批准且正在验证的下一阶段见[ADR-0008](adr/0008-joint-voice-training-alignment.md)：可训练
+prior/说话人条件、完整有界clip编码后裁decoder、独立训练对齐与扩展G导出。
+该ADR为Accepted；库内`JointTrainer`提供显式embedding、原始g/v weight norm和有界完整clip图，
+新增RVC Mel配置保留旧默认。0步导出/前向/已测六层梯度与6秒输入的32帧crop资源检查通过，
+严格整图梯度/更新门禁已在当前库内实现通过，CLI/Web显式joint profile已接入；
+不能将批准视为数值或音质验收，迁移/回滚见Spec 002。
+后续离线诊断已把主要梯度差异定位到近零Leaky ReLU的分支分歧，并确认极小梯度
+经AdamW后可放大为参数更新差异。同梯度optimizer及反向符号重放只用于归因；生产
+路径没有参考符号注入、微小梯度清零或epsilon变更，原独立整步门禁仍适用。
+
+FP32训练算子现在显式保留冻结参考的关键运算顺序：weight norm与Softmax采用
+四路累加及确定的合并顺序，Softmax先求分母倒数再相乘；weight norm反向保留
+`a*dw-b*v`的分项舍入。固定参考为CPU/aarch64、2线程；单组1D卷积及period判别器
+的宽度1卷积在输入元素数大于20480时按kernel tap、输入通道顺序FMA累加，以bias
+起始；大输入转置卷积倒序访问有效tap。小输入普通卷积将im2col归约分为连续640项，
+块内FMA、块间单独相加，以bias起始；小输入转置卷积先通道归约、再叠加重叠tap、
+最后加入bias。分组卷积仍在乘积归约后加bias。说话人条件的单向量点积使用四路FMA
+及相邻两路先合并。上述顺序由独立算子与真实层回归固定，不依赖运行时CPU后端。
+CUDA共享内存tile复用输入/权重，转置columns为`Cout*K*L`个float，分配前检查索引
+上界，经现有RAII池立即回收，不由反向图持有。NSF host相位、幅度与噪声乘积显式
+物化为FP32，阻止编译器跨张量运算边界合并FMA；不改变随机分布。训练矩阵计算仍在
+CUDA执行，不引入参考框架运行依赖。顺序固定带来单步耗时增加，资源实测见PROJECT_STATE。
+这些算子回归通过不等于整步梯度、音质或声线相似度验收，结果见PROJECT_STATE。
+
+联合CLI先以流式WAV reader校验全部片段元信息，仅接受40k、0.32..6秒，再初始化CUDA
+和冻结前端。每步重算当前clip的HuBERT/RMVPE、共有有效帧及训练频谱；只保留当前clip，
+不建立整个数据集的audio/spec/prior缓存。私有`joint_features.h`使用FFT2048/hop400、
+padding824及power floor `2e-7`，由真实冻结频谱及边界测试约束。joint仅允许最多50步、
+crop32、epochs0、sampled和LR decay1；保持原完整D/G迭代取消及原子导出。
+Web的`mode=joint`经同一CLI和三产物暂存发布，能力响应`training_profiles`使旧服务器
+隐藏新选项，选择joint时UI限制步数并固定crop/epochs。此显式选项不表示生产音质已通过。
+
+训练性能优化（2026-10-24）：GAN 前处理只计算一次 enc_p prior，不再初始化未使用的
+decoder-only trainer 或计算/缓存 unused inverse-Flow latent。CLI 的固定长度 host
+segment vectors 跨 step 复用，并打印 feature 各阶段和 GAN step 总耗时。
+梯度范数改为 256-thread block reduction，每个 parameter 最多 4096 次全局 atomic
+累加，避免逐元素 atomic 的串行热点及大量小贡献丢失。
+autograd 内部仅缓存已释放图的 data/grad buffers；每个 host thread/device 的缓存最多
+256 MiB、4096 个 buffer，按精确元素数复用，图边/closures 不进入缓存。新图梯度保持
+缺省，首次 backward 才取得并清零 grad buffer，避免误触发无梯度参数的 weight decay。
+缓存所有者由 graph deleter 共享并在退出时 RAII 清理；只适用于当前 legacy default
+CUDA stream，不扩展为多 stream/多 GPU 训练契约。上限不包含 live graph、参数、optimizer
+或原有 im2col ScratchPool，不能解释为训练总显存上限。
 
 GAN 推理导出把 trained Flow 与 decoder 的权重合并到同一个 safetensors staging，再一次
 rename 发布；WaveNet/decoder 扣除初始化时折叠的 speaker condition，fused weight norm
@@ -174,6 +297,18 @@ rename 发布；WaveNet/decoder 扣除初始化时折叠的 speaker condition，
 每个 CUDA 中间 activation 做全设备扫描，也不构成生产音质保证。
 
 ### WebUI / `vc_serve`
+
+Web上传新增格式边界见 [ADR-0007](adr/0007-web-audio-upload-decoding.md) 和
+[Spec 003 FR-012](../specs/003-webui/spec.md#multi-format-upload-web-fr-012)。
+`normalize_uploads`在request staging中串行解码MP3/M4A/AAC/FLAC/OGG/Opus/WMA/AIFF，
+WAV继续原样写入；四个HTTP入口共享校验，归一化重名整批拒绝。FFmpeg只选首个音轨，
+固定PCM16/44.1kHz/mono，限制demuxer/file协议并关闭MOV外部引用。argv直接启动，
+`timeout`/`prlimit`提供120秒（TERM后2秒KILL）、2GiB地址空间和文件大小上限；
+超限截断不得成功，每文件64MiB、每批解码总量128MiB。实例内独立decoder mutex提供409，
+不改变GPU/训练取消生命周期。失败不会移动已发布raw/work/marker或启动模型。
+UI按入口序列化上传，等待/失败/过期响应时保持操作按钮禁用；metadata-only时长估算
+避免浏览器将长压缩音频全部展开为PCM。服务器WAV预览不依赖浏览器原格式支持。
+部署备份vc_serve和静态UI，在无活动任务时同时切换；模型、Index、已有素材不需迁移。
 
 浏览器认证只共享尚未完成的 token 提示 Promise，结束后清除；首次输错/取消或服务端
 token 轮换后可再次输入。token 仍限于 tab 的 sessionStorage/内存；默认开放模式不提示。
@@ -314,14 +449,16 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
 模型权重和数值参考 fixture 体积较大且被 `.gitignore` 排除。由此形成两层测试：
 
 1. 根构建的默认 `contract`：不依赖这些本地资产；除低层契约外还包含真实 CLI
-   子进程与真实 HTTP socket 测试。自动 CI 执行独立的 10 项 host 子集，完整设备入口需手动授权。
+   子进程与真实 HTTP socket 测试。自动 CI 执行独立的 11 项 host 子集，完整设备入口需手动授权。
 2. 可选 `integration`：配置 `VOXMUTATIO_ENABLE_MODEL_TESTS=ON`；只有所需资产存在的用例才进入 CTest。
 
 测试内部“找不到文件就 return”不是可信的通过证据，因此 CMake 在注册前检查资产；WavLM
 还在运行时检查完整参考 shape/payload、双方有限值及全元素 RMSE `<1e-4`。
-Node.js 18+ 可用、slow=OFF 时默认29项、资产齐全53 distinct（30 contract-labelled、24
-integration-labelled、1 overlap）；slow=ON 加1项真实 body deadline，共54项。缺 Node
-时 UI 认证/取消两项明确不注册，数量减2；Node 只用于测试，不是 WebUI 构建/运行依赖。
+Node.js 18+ 可用、slow=OFF 时默认32项asset-free contract；模型资产齐全时56 distinct
+（33 contract-labelled、24 integration-labelled、1 overlap）。额外开启
+`RESONANTIA_ENABLE_AUDIO_CODEC_TESTS=ON`且FFmpeg/真实speech fixture存在时增1项codec
+integration，共57项；slow=ON另加1项真实body deadline。缺Node时UI认证/取消/上传
+三项不注册；Node仅用于测试。codec测试单独可选，不作为默认asset-free的FFmpeg依赖。
 当前执行结果见 `specs/PROJECT_STATE.md`。2026-08-12 的 fresh Release/SM87
 build `/tmp/resonantia-nonrt-final.a8O1Ay` 已实际执行并通过 39/39（0 失败，
 `Total Test time (real) = 1297.94 sec`）。加固前 Release/SM87 30/30（11 contract +
@@ -339,7 +476,7 @@ pre-launch、observable synchronization，以及 Synthesizer public fail-closed 
 - CMake 3.24+，C++20/CUDA20。
 - `VOXMUTATIO_CUDA_ARCHITECTURES` 决定目标架构，默认 87；不再额外硬编码一份冲突的 `-gencode`。
 - Catch2 优先使用系统包，否则下载带 SHA-256 校验的固定源码归档。
-- CI 的 push/PR 自动运行 GitHub 托管仓库检查与独立 10 项 host 子集。设备作业仅在 main 手动 opt-in、就绪变量为 true 且专属 OrinNX 标签匹配时执行。
+- CI 的 push/PR 自动运行 GitHub 托管仓库检查与独立 11 项 host 子集。设备作业仅在 main 手动 opt-in、就绪变量为 true 且专属 OrinNX 标签匹配时执行。
 
 运行时源码使用显式清单，按 core、I/O、CUDA ops、content、F0、Index、synthesizer、
 separation、autograd、training、pipeline 和 deprecated legacy WebUI compatibility surface
@@ -446,7 +583,7 @@ terminate、真实GPU取消仍未验证；当时未覆盖的最终三产物发�
 
 ### CI自动host检查与手动设备边界（2026-10-10）
 
-`cmake/host-tests`是独立Linux C++20测试入口，复用Web/CLI/IO实现，现有10项host门禁，不启用
+`cmake/host-tests`是独立Linux C++20测试入口，复用Web/CLI/IO实现，现有11项host门禁，不启用
 CUDA、不链接`voxmutatio`，Catch2与根构建共享已有版本/归档哈希策略。host支持库分别复用HTTP/
 registry/token、workflow和Web service源码；ownership及material-commit的宏仍只在私有
 测试目标生效。既有完整测试注册保留在根CMake，host子集不声明模型/GPU或完整套件通过。
@@ -464,3 +601,33 @@ hostname/device-tree检查是调度后的辅助保护。自动与手动并发组
 验证control及late-cancel两种路径：发布中取消409/状态不变、槽位不提前释放，结束后完整产物/
 清理/重试。两秒gate及15秒CTest界限，不涉及rename拦截；生产宏关闭代码保持一致。
 这补齐确定性host发布截止点，原文所述真实GPU、OS故障和崩溃原子性边界仍保留。
+
+## 2026-10-29 Web正式声线与立体声翻唱
+
+沿用现有单GPU串行编排；模型仍由原生CLI加载执行。`workflow=song`创建请求临时目录，
+依次调用分离与去和声CLI；各阶段保留44.1k立体声，之后形成mono40k主唱快照再转换。
+Web混音只做声道加减与单一防削波增益，无新模型算法或新运行时依赖。三份宿主音频
+受600秒/128MiB输入上限约束；HTTP响应仍限64MiB。失败在返回音频前传播，临时文件由RAII清理。
+
+`io::StereoAudioBuffer`拥有交错L/R float；单声道复制，>2声道拒绝。新增读写沿用WAV
+块校验/原子文件提交；`read_audio`及旧预处理默认mono语义不变。立体声清理禁止trim/VAD，
+避免改变歌曲时间轴。可选择的人工F0校正在bounded文件路径实施，默认为空，细则见Spec001。
+
+训练候选发现只枚举规范命名的非空常规文件。试听使用原转换接口指定run与candidate，
+发布要求显式听审，并复用已有clips/model/index事务；发布记录在clips/release.json中随事务移动。
+目标已有任一发布产物就拒绝，原训练结果、恢复状态、旧声线均不改动。
+浏览器以独立session固定上传内容，step轮询校验job_id；转换期间锁定输入，刷新不重置手动参数。
+完整接口、迁移/回滚与数值证据见Spec003及docs/WEBUI_RELEASE_20261029.md。
+
+本机正式声线的发布目录为`runs/Tom_Cybersinger`，界面显示`Tom Cybersinger`。
+原`runs/CyberTom_Full_20261026/full_training`作为训练来源保留，发布marker仍指向该run。
+改名只迁移发布产物，模型/Index校验值与听审参数不变；按维护者明确要求清理了8个旧声线
+及其目录内的候选模型副本。模型发现仍扫描实际发布文件，不增加名称隐藏或固定白名单。
+
+### 工作室前端交互
+
+`webui/studio.js`在现有`app.js`的请求/作业所有权和`workflows.js`的处理选择之上呈现
+任务概览、三个业务入口、训练启动确认与结果对照；不持有新的服务端会话或模型任务。
+页面以真实输入状态禁用动作，失败重试复用原输入，候选仍经原接口和听审确认发布。
+静态资源无第三方运行依赖；`tests/browser`的锁定Playwright/axe仅用于测试，独立host
+浏览器门禁使用可控HTTP与PCM播放fixture，不启动模型，不证明声音质量。

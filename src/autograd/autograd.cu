@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -14,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace voxmutatio::autograd {
@@ -167,15 +169,95 @@ void require_flat_size(const Tensor& t, int64_t expected, const char* name) {
     throw std::invalid_argument(std::string(name) + " size does not match declared dimensions");
 }
 
+// Cache only dead graph buffers, never graph edges or closures. Operations use
+// the legacy default CUDA stream, so reuse on that stream preserves queued work
+// order without cudaFree's device synchronization. Each host thread/device cache
+// retains at most 256 MiB and 4096 buffers; live tensors are not included in this cap.
+class NodeBufferCache {
+ public:
+  explicit NodeBufferCache(int device) : device_(device) {}
+  ~NodeBufferCache() {
+    int previous = device_;
+    const bool restore = cleanup_status(cudaGetDevice(&previous));
+    cleanup_status(cudaSetDevice(device_));
+    for (auto& entry : entries_) entry = {};
+    if (restore) cleanup_status(cudaSetDevice(previous));
+  }
+  core::CudaBuffer acquire(std::size_t n) {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (auto& entry : entries_) {
+      if (entry.size() == n) {
+        bytes_ -= entry.size() * sizeof(float);
+        return std::move(entry);
+      }
+    }
+    return {};
+  }
+  void release(core::CudaBuffer buffer) noexcept {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      const auto size = buffer.size() * sizeof(float);
+      if (size && size <= kLimit - bytes_) {
+        for (auto& entry : entries_) {
+          if (entry.empty()) {
+            entry = std::move(buffer);
+            bytes_ += size;
+            return;
+          }
+        }
+      }
+    }
+    // A tensor can be destroyed on another host thread/device. Free on the
+    // owning device and restore the caller's selection when the cache is full.
+    int previous = device_;
+    const bool restore = cleanup_status(cudaGetDevice(&previous));
+    cleanup_status(cudaSetDevice(device_));
+    buffer = {};
+    if (restore) cleanup_status(cudaSetDevice(previous));
+  }
+ private:
+  static bool cleanup_status(cudaError_t status) noexcept {
+    if (status == cudaSuccess) return true;
+    std::fprintf(stderr, "Autograd cache cleanup: %s\n", cudaGetErrorString(status));
+    return false;
+  }
+  static constexpr std::size_t kLimit = 256 * 1024 * 1024;
+  int device_;
+  std::size_t bytes_ = 0;
+  std::mutex mu_;
+  std::array<core::CudaBuffer, 4096> entries_;
+};
+
+std::shared_ptr<NodeBufferCache> node_cache() {
+  int device = 0;
+  CK(cudaGetDevice(&device));
+  static thread_local std::unordered_map<int, std::shared_ptr<NodeBufferCache>> caches;
+  auto& cache = caches[device];
+  if (!cache) cache = std::make_shared<NodeBufferCache>(device);
+  return cache;
+}
+
 std::shared_ptr<Node> make_node(std::vector<int> shape, bool requires_grad) {
   if (shape.empty()) throw std::invalid_argument("tensor shape cannot be empty");
-  auto nd = std::make_shared<Node>();
-  nd->shape = std::move(shape);
-  nd->requires_grad = requires_grad;
-  const int64_t n = nd->numel();
+  Node staged;
+  staged.shape = std::move(shape);
+  const int64_t n = staged.numel();
   if (n > std::numeric_limits<int>::max())
     throw std::length_error("tensor exceeds CUDA kernel index range");
-  nd->data.allocate(static_cast<std::size_t>(n));
+  auto cache = node_cache();
+  auto nd = std::shared_ptr<Node>(new Node, [owner = cache](Node* node) noexcept {
+    std::unique_ptr<Node> owned(node);
+    // Drop graph ownership outside the cache lock: parents may release buffers.
+    owned->backward_fn = {};
+    owned->parents.clear();
+    owner->release(std::move(owned->data));
+    owner->release(std::move(owned->grad));
+  });
+  nd->shape = std::move(staged.shape);
+  nd->requires_grad = requires_grad;
+  nd->data = cache->acquire(static_cast<std::size_t>(n));
+  nd->data.resize(static_cast<std::size_t>(n));
+  // Keep grad absent until backward: optimizers distinguish absent from zero.
   return nd;
 }
 
@@ -306,6 +388,20 @@ __global__ void k_colsum_acc(float* db, const float* dy, int R, int C) {
     db[c] += s;
   }
 }
+__global__ void k_linear_single_row(const float* x, const float* w, float* out,
+                                    int outputs, int inner) {
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;
+  if(row>=outputs)return;
+  const float* weight=w+row*inner;
+  float a=0.f,b=0.f,c=0.f,d=0.f;
+  for(int j=0;j<inner;j+=4) {
+    a=__fmaf_rn(x[j],weight[j],a);
+    b=__fmaf_rn(x[j+1],weight[j+1],b);
+    c=__fmaf_rn(x[j+2],weight[j+2],c);
+    d=__fmaf_rn(x[j+3],weight[j+3],d);
+  }
+  out[row]=__fadd_rn(__fadd_rn(a,b),__fadd_rn(c,d));
+}
 __global__ void k_relu_f(const float* x, float* o, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) o[i] = fmaxf(0.0f, x[i]);
@@ -320,7 +416,7 @@ __global__ void k_leaky_f(const float* x, float* o, float s, int n) {
 }
 __global__ void k_leaky_b(float* dx, const float* dy, const float* x, float s, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) dx[i] += dy[i] * ((x[i] >= 0.0f) ? 1.0f : s);
+  if (i < n) dx[i] += dy[i] * ((x[i] > 0.0f) ? 1.0f : s);
 }
 __global__ void k_gelu_f(const float* x, float* o, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -351,6 +447,15 @@ __global__ void k_sig_b(float* dx, const float* dy, const float* y, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) dx[i] += dy[i] * y[i] * (1.0f - y[i]);
 }
+__device__ float finish_fp32_lanes(const float* lanes, int count) {
+  if (count < 4) {
+    float sum = lanes[0];
+    for (int i = 1; i < count; ++i) sum = __fadd_rn(sum, lanes[i]);
+    return sum;
+  }
+  return __fadd_rn(__fadd_rn(lanes[0], lanes[2]),
+                   __fadd_rn(lanes[1], lanes[3]));
+}
 __global__ void k_softmax_f(const float* x, float* o, int R, int C) {
   int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= R) return;
@@ -358,9 +463,16 @@ __global__ void k_softmax_f(const float* x, float* o, int R, int C) {
   float* orow = o + r * C;
   float mx = xr[0];
   for (int c = 1; c < C; ++c) mx = fmaxf(mx, xr[c]);
-  float sum = 0.0f;
-  for (int c = 0; c < C; ++c) { orow[c] = expf(xr[c] - mx); sum += orow[c]; }
-  for (int c = 0; c < C; ++c) orow[c] /= sum;
+  float lanes[4]{};
+  #pragma unroll
+  for (int lane = 0; lane < 4; ++lane) {
+    for (int c = lane; c < C; c += 4) {
+      orow[c] = expf(xr[c] - mx);
+      lanes[lane] = __fadd_rn(lanes[lane], orow[c]);
+    }
+  }
+  const float reciprocal = 1.0f / finish_fp32_lanes(lanes, C);
+  for (int c = 0; c < C; ++c) orow[c] *= reciprocal;
 }
 __global__ void k_softmax_b(float* dx, const float* dy, const float* y, int R, int C) {
   int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -368,8 +480,12 @@ __global__ void k_softmax_b(float* dx, const float* dy, const float* y, int R, i
   const float* dyr = dy + r * C;
   const float* yr = y + r * C;
   float* dxr = dx + r * C;
-  float s = 0.0f;
-  for (int c = 0; c < C; ++c) s += dyr[c] * yr[c];
+  float lanes[4]{};
+  #pragma unroll
+  for (int lane = 0; lane < 4; ++lane)
+    for (int c = lane; c < C; c += 4)
+      lanes[lane] = __fadd_rn(lanes[lane], __fmul_rn(dyr[c], yr[c]));
+  const float s = finish_fp32_lanes(lanes, C);
   for (int c = 0; c < C; ++c) dxr[c] += yr[c] * (dyr[c] - s);
 }
 __global__ void k_ln_f(const float* x, const float* w, const float* b, float* o,
@@ -447,7 +563,13 @@ Tensor linear(const Tensor& x, const Tensor& w, const Tensor& b) {
   bool rg = any_requires_grad({&x, &w}) ||
             (has_b && (b.n->requires_grad || !b.n->parents.empty()));
   auto out = make_node({M, N}, rg);
-  gemm_rm(false, true, M, N, K, 1.0f, x.n->data.data(), w.n->data.data(), 0.0f, out->data.data());
+  if (M==1 && K>=16 && K%4==0) {
+    // Match the frozen single-vector conditioning reduction, including FMA.
+    k_linear_single_row<<<grid(N),256>>>(x.n->data.data(),w.n->data.data(),out->data.data(),N,K);
+    check_launch("linear single-row reduction");
+  } else {
+    gemm_rm(false, true, M, N, K, 1.0f, x.n->data.data(), w.n->data.data(), 0.0f, out->data.data());
+  }
   if (has_b) {
     k_add_bias<<<grid(M * N), 256>>>(out->data.data(), b.n->data.data(), out->data.data(), M, N);
     check_launch("linear_bias");
@@ -554,7 +676,7 @@ __global__ void k_conv1d_f(const float* x, const float* w, const float* b, float
   int ot = blockIdx.x * blockDim.x + threadIdx.x, co = blockIdx.y;
   if (ot >= Lout || co >= Cout) return;
   int ipg = Cin / groups, opg = Cout / groups, g = co / opg, cin0 = g * ipg;
-  float s = b ? b[co] : 0.0f;
+  float s = 0.0f;
   for (int cl = 0; cl < ipg; ++cl) {
     const float* xc = x + (cin0 + cl) * L;
     const float* wc = w + (co * ipg + cl) * K;
@@ -563,7 +685,7 @@ __global__ void k_conv1d_f(const float* x, const float* w, const float* b, float
       if (t >= 0 && t < L) s += xc[t] * wc[k];
     }
   }
-  o[co * Lout + ot] = s;
+  o[co * Lout + ot] = b ? s + b[co] : s;
 }
 __global__ void k_conv1d_dx(float* dx, const float* dout, const float* w,
     int Cin, int L, int Cout, int K, int stride, int pad, int dil, int groups, int Lout) {
@@ -626,19 +748,46 @@ __global__ void k_bias_rows(float* o, const float* b, int C, int N) {
   if (i < C * N) o[i] += b[i / N];
 }
 
-__global__ void k_convt_f(const float* x, const float* w, const float* b, float* o,
-    int Cin, int L, int Cout, int K, int stride, int pad, int Lout) {
+// Accumulate input channels in ascending order with one FP32 FMA per channel.
+// A GEMM-selected reduction tree changes near-zero decoder activations enough to
+// choose different Leaky-ReLU derivatives. Tiles reuse weights/input on device.
+__global__ void k_convt_columns(const float* x, const float* w, float* columns,
+                                int Cin, int L, int rows, int time_tiles) {
+  __shared__ float weights[16][17];
+  __shared__ float input[16][16];
+  const int tx = threadIdx.x, ty = threadIdx.y;
+  const int row_start = (blockIdx.x / time_tiles) * 16;
+  const int time_start = (blockIdx.x % time_tiles) * 16;
+  const int row = row_start + ty, t = time_start + tx;
+  float sum = 0.0f;
+  for (int64_t base = 0; base < Cin; base += 16) {
+    const int64_t channel = base + ty;
+    const int weight_row = row_start + tx;
+    weights[tx][ty] = channel < Cin && weight_row < rows
+        ? w[channel * rows + weight_row] : 0.0f;
+    input[ty][tx] = channel < Cin && t < L ? x[channel * L + t] : 0.0f;
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < 16; ++k)
+      sum = __fmaf_rn(weights[ty][k], input[k][tx], sum);
+    __syncthreads();
+  }
+  if (row < rows && t < L) columns[row * L + t] = sum;
+}
+
+__global__ void k_convt_from_columns(const float* columns, const float* b, float* o,
+    int L, int Cout, int K, int stride, int pad, int Lout) {
   int ot = blockIdx.x * blockDim.x + threadIdx.x, co = blockIdx.y;
   if (ot >= Lout || co >= Cout) return;
-  float s = b ? b[co] : 0.0f;
+  float s = 0.0f;
   for (int k = 0; k < K; ++k) {
     int num = ot + pad - k;
     if (num % stride != 0) continue;
     int t = num / stride;
     if (t < 0 || t >= L) continue;
-    for (int ci = 0; ci < Cin; ++ci) s += x[ci * L + t] * w[(ci * Cout + co) * K + k];
+    s += columns[(co*K+k)*L+t];
   }
-  o[co * Lout + ot] = s;
+  o[co * Lout + ot] = b ? s + b[co] : s;
 }
 __global__ void k_convt_dx(float* dx, const float* dout, const float* w,
     int Cin, int L, int Cout, int K, int stride, int pad, int Lout) {
@@ -665,6 +814,95 @@ __global__ void k_convt_dw(float* dw, const float* dout, const float* x,
   dw[idx] += s;
 }
 
+// The frozen two-thread CPU reference selects its channels-last convolution
+// path above 20480 input elements (batch=1). Its dot product visits kernel taps
+// before input channels and starts from bias. Reproduce that arithmetic on CUDA
+// so backend-dependent reduction trees cannot change near-zero activation signs.
+// Transposed convolutions visit reversed taps, with one output phase per block;
+// this avoids multiplying the inserted stride zeros while preserving FMA order.
+template <bool Transposed>
+__global__ void k_conv1d_channels_last(const float* x, const float* w,
+    const float* b, float* out, int Cin, int L, int Cout, int K, int stride,
+    int pad, int dilation, int Lout, int time_tiles, int phases) {
+  __shared__ float weights[16][16];
+  __shared__ float input[16][16];
+  const int tx=threadIdx.x, ty=threadIdx.y;
+  const int tile=blockIdx.x % time_tiles;
+  const int phase=(blockIdx.x / time_tiles) % phases;
+  const int co=(blockIdx.x / (time_tiles*phases))*16+ty;
+  const int64_t ot=Transposed ? (static_cast<int64_t>(tile)*16+tx)*stride+phase
+                              : (static_cast<int64_t>(tile)*16+tx)*phases+phase;
+  float acc=co<Cout && b ? b[co] : 0.f;
+  const int residue=Transposed ? (static_cast<int64_t>(phase)+pad)%stride : 0;
+  const int taps=Transposed ? (residue<K ? (K-1-residue)/stride+1 : 0) : K;
+  for(int tap=0;tap<taps;++tap) {
+    const int k=Transposed ? residue+(taps-1-tap)*stride : tap;
+    const int64_t source=Transposed ? (ot+pad-k)/stride :
+        ((ot/phases)*stride-pad+static_cast<int64_t>(k)*dilation)*phases+phase;
+    for(int64_t base=0;base<Cin;base+=16) {
+      const int64_t wc=base+tx, xc=base+ty;
+      weights[ty][tx]=co<Cout && wc<Cin
+          ? w[Transposed ? (wc*Cout+co)*K+k : (static_cast<int64_t>(co)*Cin+wc)*K+k] : 0.f;
+      input[ty][tx]=xc<Cin && ot<Lout && source>=0 && source<L ? x[xc*L+source] : 0.f;
+      __syncthreads();
+      #pragma unroll
+      for(int c=0;c<16;++c)
+        if(base+c<Cin)acc=__fmaf_rn(weights[ty][c],input[c][tx],acc);
+      __syncthreads();
+    }
+  }
+  if(co<Cout && ot<Lout)out[static_cast<int64_t>(co)*Lout+ot]=acc;
+}
+
+template <bool Transposed>
+void conv1d_channels_last(const float* x, const float* w, const float* b,
+    float* out, int Cin, int L, int Cout, int K, int stride, int pad,
+    int dilation, int Lout, int plane_width=1) {
+  const int phases=Transposed ? std::min(stride,Lout) : plane_width;
+  const int time_tiles=Transposed ? ((Lout-1)/stride)/16+1 : (Lout/plane_width-1)/16+1;
+  const int rows=(Cout-1)/16+1;
+  k_conv1d_channels_last<Transposed><<<rows*time_tiles*phases,dim3(16,16)>>>(
+      x,w,b,out,Cin,L,Cout,K,stride,pad,dilation,Lout,time_tiles,phases);
+  check_launch("conv1d channels-last accumulation");
+}
+
+// The frozen aarch64 small-convolution reference combines consecutive FP32
+// dot products in blocks of 640. Keep both the within-block FMA order and the
+// separately rounded block sum; bias is the initial accumulated value. This
+// tiled implementation reuses the existing im2col workspace on the GPU.
+__global__ void k_conv_columns_blocked(const float* w, const float* columns,
+    const float* bias, float* out, int M, int N, int K, int column_tiles) {
+  __shared__ float weights[16][16];
+  __shared__ float input[16][16];
+  const int tx=threadIdx.x, ty=threadIdx.y;
+  const int row=(blockIdx.x/column_tiles)*16+ty;
+  const int col=(blockIdx.x%column_tiles)*16+tx;
+  float total=row<M && bias ? bias[row] : 0.f;
+  for(int64_t chunk=0;chunk<K;chunk+=640) {
+    float partial=0.f;
+    const int64_t end=min(chunk+640,static_cast<int64_t>(K));
+    for(int64_t base=chunk;base<end;base+=16) {
+      weights[ty][tx]=row<M && base+tx<K ? w[static_cast<int64_t>(row)*K+base+tx] : 0.f;
+      input[ty][tx]=col<N && base+ty<K ? columns[(base+ty)*N+col] : 0.f;
+      __syncthreads();
+      #pragma unroll
+      for(int k=0;k<16;++k)
+        if(base+k<end)partial=__fmaf_rn(weights[ty][k],input[k][tx],partial);
+      __syncthreads();
+    }
+    total=__fadd_rn(total,partial);
+  }
+  if(row<M && col<N)out[static_cast<int64_t>(row)*N+col]=total;
+}
+
+void conv_columns_blocked(const float* w, const float* columns,
+    const float* bias, float* out, int M, int N, int K) {
+  const int column_tiles=(N-1)/16+1;
+  k_conv_columns_blocked<<<((M-1)/16+1)*column_tiles,dim3(16,16)>>>(
+      w,columns,bias,out,M,N,K,column_tiles);
+  check_launch("convolution blocked accumulation");
+}
+
 Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
               int Cin, int L, int Cout, int K, int stride, int pad,
               int dilation, int groups) {
@@ -689,14 +927,19 @@ Tensor conv1d(const Tensor& x, const Tensor& w, const Tensor& b,
   Node* pb = has_b ? b.n.get() : nullptr;
 
   if (groups == 1) {
-    // im2col + cuBLAS GEMM: out[Cout,Lout] = W[Cout, Cin*K] @ col[Cin*K, Lout].
+    // Reference-ordered FP32 convolution; backward retains cuBLAS GEMM.
     const int rows = Cin * K;
-    auto col = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * Lout);
-    k_im2col_1d<<<grid(rows * Lout), 256>>>(px->data.data(), col->data(), Cin, L, K,
-                                            stride, pad, dilation, Lout);
-    gemm_rm(false, false, Cout, Lout, rows, 1.0f, pw->data.data(), col->data(), 0.0f, o->data.data());
-    if (has_b) k_bias_rows<<<grid(Cout * Lout), 256>>>(o->data.data(), pb->data.data(), Cout, Lout);
-    check_launch("conv1d_im2col");
+    if (static_cast<int64_t>(Cin)*L > 20480) {
+      conv1d_channels_last<false>(px->data.data(),pw->data.data(),
+          has_b?pb->data.data():nullptr,o->data.data(),Cin,L,Cout,K,stride,pad,dilation,Lout);
+    } else {
+      auto col = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * Lout);
+      k_im2col_1d<<<grid(rows * Lout), 256>>>(px->data.data(), col->data(), Cin, L, K,
+                                              stride, pad, dilation, Lout);
+      conv_columns_blocked(pw->data.data(),col->data(),has_b?pb->data.data():nullptr,
+          o->data.data(),Cout,Lout,rows);
+      check_launch("conv1d_im2col");
+    }
     if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
     out->backward_fn = [o, px, pw, pb, Cin, L, Cout, K, stride, pad, dilation, Lout, rows] {
       // Recompute im2col during backward rather than retaining every convolution's
@@ -749,13 +992,28 @@ Tensor conv_transpose1d(const Tensor& x, const Tensor& w, const Tensor& b,
   if (lout64 <= 0 || lout64 > std::numeric_limits<int>::max())
     throw std::length_error("conv_transpose1d output length is invalid");
   int Lout = static_cast<int>(lout64);
+  const int64_t column_count = static_cast<int64_t>(Cout) * K * L;
+  if (column_count > std::numeric_limits<int>::max())
+    throw std::length_error("conv_transpose1d workspace exceeds CUDA index range");
   bool rg = any_requires_grad({&x, &w}) ||
             (has_b && (b.n->requires_grad || !b.n->parents.empty()));
   auto out = make_node({Cout, Lout}, rg);
   dim3 gf(grid(Lout), Cout);
-  k_convt_f<<<gf, 256>>>(x.n->data.data(), w.n->data.data(),
-                         has_b ? b.n->data.data() : nullptr, out->data.data(),
-                         Cin, L, Cout, K, stride, pad, Lout);
+  if (static_cast<int64_t>(Cin)*L > 20480) {
+    conv1d_channels_last<true>(x.n->data.data(),w.n->data.data(),
+        has_b?b.n->data.data():nullptr,out->data.data(),Cin,L,Cout,K,stride,pad,1,Lout);
+  } else {
+    // The small-input reference uses channel reduction, overlap-add, then bias.
+    // The workspace is returned immediately; backward does not retain it.
+    auto columns=ScratchPool::get().acquire(static_cast<std::size_t>(column_count));
+    const int time_tiles = (L - 1) / 16 + 1;
+    const int row_tiles = (Cout * K - 1) / 16 + 1;
+    k_convt_columns<<<time_tiles * row_tiles, dim3(16, 16)>>>(
+        x.n->data.data(), w.n->data.data(), columns->data(), Cin, L, Cout*K, time_tiles);
+    check_launch("conv_transpose1d channel reduction");
+    k_convt_from_columns<<<gf,256>>>(columns->data(),
+        has_b?b.n->data.data():nullptr,out->data.data(),L,Cout,K,stride,pad,Lout);
+  }
   check_launch("conv_transpose1d");
   if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
   Node* o = out.get(); Node* px = x.n.get(); Node* pw = w.n.get();
@@ -917,7 +1175,7 @@ __global__ void k_abs_f(const float* x, float* o, int n) {
 }
 __global__ void k_abs_b(float* dx, const float* dy, const float* x, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) dx[i] += dy[i] * ((x[i] >= 0.0f) ? 1.0f : -1.0f);
+  if (i < n) dx[i] += dy[i] * ((x[i] > 0.0f) ? 1.0f : (x[i] < 0.0f ? -1.0f : 0.0f));
 }
 __global__ void k_frame_f(const float* x, float* o, int T, int nfft, int hop) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1157,15 +1415,28 @@ Tensor conv2d(const Tensor& x, const Tensor& w, const Tensor& b,
   Node* o = out.get(); Node* pxn = x.n.get(); Node* pwn = w.n.get();
   Node* pbn = has_b ? b.n.get() : nullptr;
 
-  // im2col + cuBLAS GEMM: out[Cout, Hout*Wout] = W[Cout, Cin*kh*kw] @ col.
+  // Period discriminators convolve height independently at each period column.
+  // Preserve the same reference accumulation as 1D without flattening columns
+  // into adjacent time samples. Other 2D shapes retain the general GEMM path.
   const int rows = Cin * kh * kw;
   const int cols = Hout * Wout;
-  auto col = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * cols);
-  k_im2col_2d<<<grid(rows * cols), 256>>>(pxn->data.data(), col->data(), Cin, H, W,
-                                          kh, kw, sh, sw, ph, pw, Hout, Wout);
-  gemm_rm(false, false, Cout, cols, rows, 1.0f, pwn->data.data(), col->data(), 0.0f, o->data.data());
-  if (has_b) k_bias_rows<<<grid(Cout * cols), 256>>>(o->data.data(), pbn->data.data(), Cout, cols);
-  check_launch("conv2d_im2col");
+  const bool period_conv=kw==1 && sw==1 && pw==0;
+  if(period_conv && static_cast<int64_t>(Cin)*H*W>20480) {
+    conv1d_channels_last<false>(pxn->data.data(),pwn->data.data(),
+        has_b?pbn->data.data():nullptr,o->data.data(),Cin,H*W,Cout,kh,sh,ph,1,cols,W);
+  } else {
+    auto col = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * cols);
+    k_im2col_2d<<<grid(rows * cols), 256>>>(pxn->data.data(), col->data(), Cin, H, W,
+                                            kh, kw, sh, sw, ph, pw, Hout, Wout);
+    if(period_conv) {
+      conv_columns_blocked(pwn->data.data(),col->data(),has_b?pbn->data.data():nullptr,
+          o->data.data(),Cout,cols,rows);
+    } else {
+      gemm_rm(false, false, Cout, cols, rows, 1.0f, pwn->data.data(), col->data(), 0.0f, o->data.data());
+      if (has_b) k_bias_rows<<<grid(Cout * cols), 256>>>(o->data.data(), pbn->data.data(), Cout, cols);
+    }
+    check_launch("conv2d_im2col");
+  }
   if (has_b) out->parents = {x.n, w.n, b.n}; else out->parents = {x.n, w.n};
   out->backward_fn = [o, pxn, pwn, pbn, Cin, H, W, Cout, kh, kw, sh, sw, ph, pw, Hout, Wout, rows, cols] {
     auto col = ScratchPool::get().acquire(static_cast<std::size_t>(rows) * cols);
@@ -1197,7 +1468,11 @@ void backward(const Tensor& loss) {
       };
   dfs(loss.n);
 
-  for (Node* nd : topo) nd->ensure_grad();
+  auto cache = node_cache();
+  for (Node* nd : topo) {
+    if (nd->grad.empty()) nd->grad = cache->acquire(static_cast<std::size_t>(nd->numel()));
+    nd->ensure_grad();
+  }
 
   // Seed loss grad = 1.
   std::vector<float> ones(static_cast<std::size_t>(loss.numel()), 1.0f);
@@ -1226,8 +1501,24 @@ __global__ void k_adamw(float* p, const float* g, float* m, float* v, float lr,
 }
 
 __global__ void k_grad_sq_acc(const float* grad, float* total, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) atomicAdd(total, grad[i] * grad[i]);
+  // Reduce locally before contending on the scalar. Besides eliminating one
+  // global atomic per element, this keeps small contributions from being lost
+  // after the running FP32 total grows beyond their unit precision.
+  __shared__ float partial[256];
+  float sum = 0.0f;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < static_cast<std::size_t>(n); i += stride) {
+    const float value = grad[i];
+    sum += value * value;
+  }
+  partial[threadIdx.x] = sum;
+  __syncthreads();
+  for (int offset = 128; offset > 0; offset /= 2) {
+    if (threadIdx.x < offset) partial[threadIdx.x] += partial[threadIdx.x + offset];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) atomicAdd(total, partial[0]);
 }
 
 __global__ void k_scale_grad(float* grad, float scale, int n) {
@@ -1265,6 +1556,26 @@ void AdamW::set_lr(float lr) {
   lr_ = lr;
 }
 
+void AdamW::restore_state(int steps, float lr,
+    const std::function<std::vector<float>(std::size_t, bool)>& read_moment) {
+  if(steps<0 || steps==std::numeric_limits<int>::max() ||
+      !std::isfinite(lr) || lr<=0 || !read_moment)
+    throw std::invalid_argument("invalid AdamW restore metadata");
+  std::vector<core::CudaBuffer> first(params_.size()),second(params_.size());
+  for(std::size_t i=0;i<params_.size();++i) {
+    for(bool v:{false,true}) {
+      auto values=read_moment(i,v);
+      if(values.size()!=static_cast<std::size_t>(params_[i].numel()))
+        throw std::invalid_argument("AdamW restore moment shape mismatch");
+      for(float value:values)
+        if(!std::isfinite(value) || (v && value<0))
+          throw std::invalid_argument("invalid AdamW restore moment");
+      (v?second[i]:first[i]).copy_from_host(values.data(),values.size());
+    }
+  }
+  m_.swap(first);v_.swap(second);t_=steps;lr_=lr;
+}
+
 float AdamW::clip_grad_norm(float max_norm) {
   if (!std::isfinite(max_norm) || max_norm <= 0.0f)
     throw std::invalid_argument("gradient max_norm must be finite and positive");
@@ -1273,7 +1584,8 @@ float AdamW::clip_grad_norm(float max_norm) {
   for (auto& param : params_) {
     const int n = checked_numel_int(param, "optimizer parameter");
     if (param.n->grad.size() < static_cast<std::size_t>(n)) continue;
-    k_grad_sq_acc<<<grid(n), 256>>>(param.n->grad.data(), sum_sq.data(), n);
+    const int blocks = std::min(4096, 1 + (n - 1) / 256);
+    k_grad_sq_acc<<<blocks, 256>>>(param.n->grad.data(), sum_sq.data(), n);
     check_launch("gradient norm");
   }
   float host_sum = 0.0f;
@@ -1293,6 +1605,8 @@ float AdamW::clip_grad_norm(float max_norm) {
 }
 
 void AdamW::step() {
+  if(t_==std::numeric_limits<int>::max())
+    throw std::overflow_error("AdamW step counter overflow");
   ++t_;
   float bc1 = 1.0f - std::pow(beta1_, t_);
   float bc2 = 1.0f - std::pow(beta2_, t_);
@@ -1304,6 +1618,113 @@ void AdamW::step() {
                               eps_, wd_, bc1, bc2, n);
   }
   CK(cudaDeviceSynchronize());
+}
+
+// Joint training keeps the upstream weight-norm parameterization differentiable.
+__global__ void k_clamp_lower(const float* x, float* y, int n, float lower) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = x[i] < lower ? lower : x[i];
+}
+__global__ void k_clamp_lower_backward(const float* x, const float* dy, float* dx,
+                                      int n, float lower) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && x[i] >= lower) dx[i] += dy[i];
+}
+// Keep the frozen FP32 reference's four-lane reduction, including scalar tails.
+// Mixed double/FP32 reductions can move near-zero downstream activations across
+// a Leaky-ReLU branch even when normalized weights differ by only a few ULPs.
+__device__ float row_dot_fp32(const float* a, const float* b, int inner,
+                              float* partial) {
+  const int tid=threadIdx.x;
+  if(tid<4) {
+    float value=0;
+    for(int j=tid;j<inner;j+=4)
+      value=__fadd_rn(value,__fmul_rn(a[j],b[j]));
+    partial[tid]=value;
+  }
+  __syncthreads();
+  return finish_fp32_lanes(partial, inner);
+}
+__global__ void k_weight_norm_forward(const float* v, const float* g, float* w,
+                                      float* norms, int inner) {
+  __shared__ float partial[4];
+  const int row = blockIdx.x, tid = threadIdx.x;
+  const float norm = sqrtf(row_dot_fp32(v+row*inner,v+row*inner,inner,partial));
+  if (tid == 0) norms[row] = isfinite(g[row]) ? norm : NAN;
+  const float scale = g[row]/norm;
+  for (int j = tid; j < inner; j += 256) w[row*inner+j] = v[row*inner+j]*scale;
+}
+__global__ void k_weight_norm_backward(const float* v, const float* g,
+    const float* norm, const float* dw, float* dv, float* dg, int inner) {
+  __shared__ float partial[4];
+  const int row = blockIdx.x, tid = threadIdx.x;
+  const float n = norm[row], d = row_dot_fp32(dw+row*inner,v+row*inner,inner,partial);
+  if (tid == 0) dg[row] += d/n;
+  const float a=g[row]/n;
+  const float b=__fmul_rn(a,d/n)/n;
+  for (int j = tid; j < inner; j += 256) {
+    const int i = row*inner+j;
+    dv[i] += __fsub_rn(__fmul_rn(a,dw[i]),__fmul_rn(b,v[i]));
+  }
+}
+
+Tensor reshape(const Tensor& x, std::vector<int> shape) {
+  const int n = checked_numel_int(x, "reshape input");
+  int64_t count = 1;
+  if (shape.empty()) throw std::invalid_argument("reshape needs positive dimensions");
+  for (int d : shape) {
+    if (d <= 0 || count > std::numeric_limits<int>::max()/d)
+      throw std::invalid_argument("invalid reshape dimensions");
+    count *= d;
+  }
+  if (count != n) throw std::invalid_argument("reshape changes element count");
+  auto out = make_node(std::move(shape), x.requires_grad());
+  CK(cudaMemcpy(out->data.data(), x.n->data.data(), n*sizeof(float), cudaMemcpyDeviceToDevice));
+  out->parents = {x.n}; Node* o = out.get(); Node* px = x.n.get();
+  out->backward_fn = [o, px, n] {
+    k_acc<<<grid(n),256>>>(px->grad.data(), o->grad.data(), n); check_launch("reshape backward");
+  };
+  return Tensor(out);
+}
+Tensor clamp_min(const Tensor& x, float lower) {
+  const int n = checked_numel_int(x, "clamp input");
+  if (!std::isfinite(lower)) throw std::invalid_argument("clamp lower must be finite");
+  auto out = make_node(x.shape(), x.requires_grad());
+  k_clamp_lower<<<grid(n),256>>>(x.n->data.data(), out->data.data(), n, lower);
+  check_launch("clamp_min");
+  out->parents = {x.n}; Node* o = out.get(); Node* px = x.n.get();
+  out->backward_fn = [o,px,n,lower] {
+    k_clamp_lower_backward<<<grid(n),256>>>(px->data.data(), o->grad.data(), px->grad.data(), n, lower);
+    check_launch("clamp_min backward");
+  };
+  return Tensor(out);
+}
+Tensor weight_norm(const Tensor& v, const Tensor& g) {
+  const int count = checked_numel_int(v, "weight_norm value");
+  if (v.shape().size() < 2 || checked_numel_int(g, "weight_norm scale") != v.shape()[0])
+    throw std::invalid_argument("weight_norm needs one scale per first-axis row");
+  const int rows = v.shape()[0], inner = count/rows;
+  auto norms = std::make_shared<core::CudaBuffer>(rows);
+  auto out = make_node(v.shape(), any_requires_grad({&v,&g}));
+  k_weight_norm_forward<<<rows,256>>>(v.n->data.data(), g.n->data.data(), out->data.data(), norms->data(), inner);
+  check_launch("weight_norm");
+  std::vector<float> host(rows); norms->copy_to_host(host.data(), rows);
+  for (float norm : host) if (!(norm > 0) || !std::isfinite(norm))
+    throw std::invalid_argument("weight_norm has a zero/nonfinite norm or scale");
+  out->parents = {v.n,g.n}; Node* o = out.get(); Node* pv = v.n.get(); Node* pg = g.n.get();
+  out->backward_fn = [o,pv,pg,norms,rows,inner] {
+    k_weight_norm_backward<<<rows,256>>>(pv->data.data(),pg->data.data(),norms->data(),o->grad.data(),pv->grad.data(),pg->grad.data(),inner);
+    check_launch("weight_norm backward");
+  };
+  return Tensor(out);
+}
+std::vector<float> AdamW::first_moment(std::size_t index) const {
+  const auto& buffer = m_.at(index); std::vector<float> values(buffer.size());
+  buffer.copy_to_host(values.data(), values.size()); return values;
+}
+std::vector<float> AdamW::second_moment(std::size_t index) const {
+  const auto& buffer = v_.at(index); std::vector<float> values(buffer.size());
+  buffer.copy_to_host(values.data(), values.size()); return values;
 }
 
 }  // namespace voxmutatio::autograd

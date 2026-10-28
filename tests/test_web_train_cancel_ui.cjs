@@ -53,7 +53,7 @@ function harness() {
     await stale.poll(terminal('job-a',{stage:'cancelled',cancelled:true}));await stale.start('job-b');
     const calls=stale.calls.length;oldTimer();await tick();assert.equal(stale.calls.length,calls);
     late.resolve(response({job_id:'job-a',cancelled:true}));await cancelLate;
-    assert.equal(stale.$('trainStage').textContent,'training');assert.equal(stale.$('btnCancelTrain').disabled,false);
+    assert.equal(stale.$('trainStage').textContent,'训练中');assert.equal(stale.$('btnCancelTrain').disabled,false);
 
     const mismatch=harness();await mismatch.start();await mismatch.poll(running('other-job'));
     assert.match(mismatch.$('trainStage').textContent,/作业已变化/);assert.equal(mismatch.$('btnCancelTrain').disabled,true);assert.equal(mismatch.voices,0);
@@ -66,5 +66,47 @@ function harness() {
     const network=harness();await network.start();network.replies.push(()=>{throw new Error('offline');});network.timers.shift()();await tick();
     assert.match(network.$('trainStage').textContent,/无法确认/);assert.equal(network.$('btnTrain').disabled,true);assert.equal(network.$('btnCancelTrain').disabled,true);
     await network.poll(terminal('job-a',{cancelled:true}));assert.equal(network.voices,0);
+    const full=harness();full.$('trainMode').value='joint-full';full.$('trainEpochs').value='200';
+    full.$('trainResume').checked=true;full.$('recVad').checked=true;
+    full.context.trainCascade.state.ready=false;vm.runInContext('updateTrainBtn()',full.context);
+    assert.equal(full.$('btnTrain').disabled,false,'resume should not require reupload');
+    await full.start();const form=full.calls[0].options.body;
+    assert.equal(form.get('resume'),'1');assert.equal(form.get('epochs'),'200');assert.equal(form.get('vad'),'0');assert.equal(form.has('steps'),false);
+    await full.poll(running('job-a',{log:'Preparing model/data identity on CPU before CUDA feature extraction'}));
+    assert.match(full.$('trainStage').textContent,/核验/);assert.equal(full.$('trainFill').style.width,'0%');
+    await full.poll(running('job-a',{log:'Cache 200/406 frames=320 hits=0'}));
+    assert.match(full.$('trainStage').textContent,/准备训练特征：200\/406/);assert.equal(full.$('trainFill').style.width,'49%');
+    await full.poll(running('job-a',{log:'joint-full step=20/100 epoch=2 clip=0/10 lr=0.0001'}));
+    assert.match(full.$('trainStage').textContent,/20\/100/);assert.equal(full.$('trainFill').style.width,'20%');
+    await full.poll(running('job-a',{log:'joint-full step=20/100 epoch=2\nPreparing model/data identity on CPU before CUDA feature extraction\nCache 1/10 frames=200 hits=1'}));
+    assert.match(full.$('trainStage').textContent,/准备训练特征：1\/10/);assert.equal(full.$('trainFill').style.width,'10%');
+    await full.poll(terminal('job-a',{review_required:true}));
+    assert.match(full.$('trainStage').textContent,/等待听审/);assert.equal(full.voices,0);
+    const restored=harness();restored.context.trainCascade.state.ready=false;
+    restored.replies.push(response(running('external-job',{name:'CyberTom_Full_20261026'})),
+        response(running('external-job',{name:'CyberTom_Full_20261026',log:'joint-full step=406/81200 epoch=1'})));
+    await vm.runInContext('restoreActiveTraining()',restored.context);await tick();
+    assert.equal(restored.$('trainProgress').style.display,'block');
+    assert.equal(restored.$('btnTrain').disabled,true);assert.equal(restored.$('btnCancelTrain').disabled,false);
+    assert.match(restored.$('trainStage').textContent,/406\/81200/);
+    assert.match(restored.calls[1].url,/name=CyberTom_Full_20261026/);
+    assert.equal(restored.$('voiceName').value,'voice','do not replace user input');
+    restored.replies.push(response({job_id:'external-job'},202));await restored.click('btnCancelTrain');
+    assert.equal(restored.calls.at(-1).options.body.get('job_id'),'external-job');
+    for(const status of [terminal(),running('step-job',{kind:'step'}),running('',{name:'x'})]) {
+        const idle=harness();idle.replies.push(response(status));
+        await vm.runInContext('restoreActiveTraining()',idle.context);await tick();
+        assert.equal(idle.calls.length,1);assert.equal(idle.timers.length,0);
+        assert.equal(vm.runInContext('activeTrain',idle.context),null);
+    }
+    const restoreRace=harness(), lateStatus=deferred();restoreRace.replies.push(lateStatus.promise);
+    const restoring=vm.runInContext('restoreActiveTraining()',restoreRace.context);
+    await restoreRace.start('new-job');
+    lateStatus.resolve(response(running('old-job',{name:'old'})));await restoring;await tick();
+    assert.equal(vm.runInContext('activeTrain.id',restoreRace.context),'new-job');
+    assert.equal(restoreRace.calls.length,3,'late restore must not start another poll');
+    const reconnect=harness();reconnect.replies.push(()=>{throw new Error('offline');});
+    await vm.runInContext('restoreActiveTraining()',reconnect.context);
+    assert.equal(vm.runInContext('activeTrain',reconnect.context),null);
     console.log('UI controls passed: syntax, exact job ID, pending vs stopped, stale poll/ack, mismatch, error, publication conflict, retry after network loss; mocked DOM/fetch only.');
 })().catch(e=>{console.error(e);process.exitCode=1;});

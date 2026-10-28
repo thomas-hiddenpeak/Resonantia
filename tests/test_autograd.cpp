@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -18,6 +19,63 @@
 
 using voxmutatio::autograd::Tensor;
 namespace ag = voxmutatio::autograd;
+
+TEST_CASE("Loss and activation match reference subgradients at zero", "[autograd][joint][boundary]") {
+  auto x = Tensor::from_host({-2.f, 0.f, 3.f}, {3}, true);
+  ag::backward(ag::sum(ag::abs_op(x)));
+  CHECK(x.grad_to_host() == std::vector<float>{-1.f, 0.f, 1.f});
+  ag::backward(ag::sum(ag::leaky_relu(x, 0.1f)));
+  CHECK(x.grad_to_host() == std::vector<float>{0.1f, 0.1f, 1.f});
+}
+
+TEST_CASE("Joint training reshape and clamp preserve boundary gradients", "[autograd][joint]") {
+  auto x = Tensor::from_host({-1, 2, 3, 4}, {2, 2}, true);
+  auto y = ag::clamp_min(ag::reshape(x, {4}), 2.0f);
+  CHECK(y.to_host() == std::vector<float>{2, 2, 3, 4});
+  ag::backward(ag::sum(y));
+  CHECK(x.grad_to_host() == std::vector<float>{0, 1, 1, 1});
+  CHECK_THROWS_AS(ag::reshape(x, {3}), std::invalid_argument);
+  CHECK_THROWS_AS(ag::reshape(x, {0, 4}), std::invalid_argument);
+  CHECK_THROWS_AS(ag::clamp_min(x, std::numeric_limits<float>::infinity()), std::invalid_argument);
+}
+
+TEST_CASE("Joint weight norm differentiates original g and v parameters", "[autograd][joint]") {
+  auto v = Tensor::from_host({3, 4, 0, 5}, {2, 2}, true);
+  auto g = Tensor::from_host({2, 3}, {2, 1}, true);
+  auto w = ag::weight_norm(v, g);
+  auto expected = std::vector<float>{1.2f, 1.6f, 0, 3};
+  auto actual = w.to_host();
+  for (int i = 0; i < 4; ++i) CHECK(std::abs(actual[i]-expected[i]) < 1e-6f);
+  ag::backward(ag::sum(w));
+  auto dv = v.grad_to_host(), dg = g.grad_to_host();
+  expected = {0.064f, -0.048f, 0.6f, 0};
+  for (int i = 0; i < 4; ++i) CHECK(std::abs(dv[i]-expected[i]) < 1e-6f);
+  CHECK(std::abs(dg[0]-1.4f) < 1e-6f);
+  CHECK(std::abs(dg[1]-1.0f) < 1e-6f);
+  CHECK_THROWS_AS(ag::weight_norm(Tensor::zeros({2, 2}), g), std::invalid_argument);
+  CHECK_THROWS_AS(ag::weight_norm(v, Tensor::zeros({3})), std::invalid_argument);
+  ag::AdamW opt({g}, 1e-4f, .8f, .99f, 1e-9f, .01f);
+  opt.step();
+  CHECK(std::abs(opt.first_moment(0)[0] - .28f) < 1e-6f);
+  CHECK(std::abs(opt.second_moment(0)[0] - .0196f) < 1e-6f);
+  CHECK_THROWS_AS(opt.first_moment(1), std::out_of_range);
+}
+
+TEST_CASE("Weight norm preserves the frozen FP32 reduction order", "[autograd][joint]") {
+  // Independent torch 2.13 CPU/aarch64 _weight_norm_interface, dim=0.
+  // Dyadic inputs cover differing magnitudes and partial vector tails.
+  const std::vector<int> lengths{3,4,17,1025,4097};
+  const std::vector<float> scales{
+      0x1.92df28p-2f,0x1.918676p-2f,0x1.5a299ap-2f,
+      0x1.049cf8p-4f,0x1.050908p-5f};
+  for (std::size_t row=0;row<lengths.size();++row) {
+    const int n=lengths[row];std::vector<float> values(n);
+    for(int j=0;j<n;++j) values[j]=std::ldexp(float((j*37)%61-30),-(j%12+2));
+    auto result=ag::weight_norm(Tensor::from_host(values,{1,n}),Tensor::from_host({3},{1,1})).to_host();
+    INFO("reduction length="<<n);
+    for(int j=0;j<n;++j) CHECK(result[j]==values[j]*scales[row]);
+  }
+}
 
 TEST_CASE("Clamped log and sqrt have zero plateau gradients", "[autograd][bounds][gradcheck]") {
   auto x = Tensor::from_host({-4.0f, 0.0f, 4.0f}, {3}, true);
@@ -34,6 +92,43 @@ TEST_CASE("Clamped log and sqrt have zero plateau gradients", "[autograd][bounds
   const auto left = ag::log_op(Tensor::from_host({0.9e-13f}, {1})).to_host()[0];
   const auto right = ag::log_op(Tensor::from_host({1.1e-13f}, {1})).to_host()[0];
   CHECK((right - left) / 2e-14f == small.grad_to_host()[2]);
+}
+
+TEST_CASE("Softmax backward preserves FP32 cancellation across vector tails", "[autograd][joint]") {
+  // Independently evaluated with the frozen torch CPU/aarch64 softmax kernel.
+  const std::vector<int> lengths{3,4,17,128,129};
+  const std::vector<float> dot_products{
+      -0x1.48p+1f,-0x1.c4p+0f,-0x1.e910fp-2f,-0x1.a9aep-5f,-0x1.a5d254p-5f};
+  for (std::size_t i=0;i<lengths.size();++i) {
+    const int n=lengths[i];
+    std::vector<float> dy(n);
+    for (int j=0;j<n;++j) dy[j]=std::ldexp(float((j*37)%61-30),-(j%12+2));
+    auto x=Tensor::zeros({1,n},true);
+    auto y=ag::softmax_rows(x,1,n);
+    ag::backward(ag::sum(ag::mul(y,Tensor::from_host(dy,{1,n}))));
+    const auto grad=x.grad_to_host();
+    const float probability=1.f/n;
+    INFO("softmax row length="<<n);
+    for(int j=0;j<n;++j) CHECK(grad[j]==(dy[j]-dot_products[i])*probability);
+  }
+}
+
+TEST_CASE("Single-row conditioning preserves reference FP32 dot products", "[autograd][joint]") {
+  // Independently evaluated CPU/aarch64 Conv1d(g, W, bias), as used by RVC.
+  // A canonical 2D torch linear input can select a different BLAS transpose path.
+  const std::vector<int> sizes{256};
+  const std::vector<std::vector<float>> expected{
+      {-0x1.a29b5p-6f,-0x1.96816cp-3f,0x1.4b2fe4p-4f,0x1.039cd8p-3f,
+       0x1.20f1ecp-4f,-0x1.493a08p-3f,0x1.6879bp-2f}};
+  for(std::size_t i=0;i<sizes.size();++i) {
+    const int n=sizes[i];std::vector<float> x(n),w(7*n),bias(7);
+    for(int j=0;j<n;++j)x[j]=float((j*13)%29-14)/37.f;
+    for(int j=0;j<7*n;++j)w[j]=float((j*37)%61-30)/113.f;
+    for(int j=0;j<7;++j)bias[j]=float(j-3)/17.f;
+    const auto out=ag::linear(Tensor::from_host(x,{1,n}),
+        Tensor::from_host(w,{7,n}),Tensor::from_host(bias,{7})).to_host();
+    for(int j=0;j<7;++j)CHECK(out[j]==expected[i][j]);
+  }
 }
 
 TEST_CASE("AdamW rejects non-finite betas and invalid learning-rate updates", "[autograd][bounds]") {
@@ -53,6 +148,41 @@ TEST_CASE("AdamW rejects non-finite betas and invalid learning-rate updates", "[
   ag::backward(ag::sum(parameter));
   optimizer.step();
   CHECK(std::abs(parameter.to_host()[0] - 0.98f) < 1e-6f);
+}
+
+TEST_CASE("AdamW gradient norm retains contributions beyond float unit precision",
+          "[autograd][optim][reduction]") {
+  // A single float atomic accumulator loses every +1 after 2^24. This size
+  // also exercises a reduction tail; the total is exactly representable.
+  constexpr int n = (1 << 24) + 4096;
+  auto parameter = Tensor::zeros({n}, true);
+  parameter.n->ensure_grad();
+  std::vector<float> gradient(n, 1.0f);
+  parameter.n->grad.copy_from_host(gradient.data(), gradient.size());
+  ag::AdamW optimizer({parameter}, 0.01f);
+  const float expected = std::sqrt(static_cast<float>(n));
+  const float norm = optimizer.clip_grad_norm(expected * 0.5f);
+  CHECK(std::abs(norm / expected - 1.0f) < 1e-6f);
+  const auto clipped = parameter.grad_to_host();
+  REQUIRE(clipped.size() == static_cast<std::size_t>(n));
+  CHECK(std::all_of(clipped.begin(), clipped.end(),
+                    [](float value) { return std::abs(value - 0.5f) < 1e-6f; }));
+}
+
+TEST_CASE("AdamW gradient norm rejects non-finite values and handles empty gradients",
+          "[autograd][optim][reduction]") {
+  auto parameter = Tensor::zeros({257}, true);
+  ag::AdamW optimizer({parameter}, 0.01f);
+  CHECK(optimizer.clip_grad_norm(1.0f) == 0.0f);
+  parameter.n->ensure_grad();
+  CHECK(optimizer.clip_grad_norm(1.0f) == 0.0f);
+  for (float value : {std::numeric_limits<float>::quiet_NaN(),
+                      std::numeric_limits<float>::infinity()}) {
+    std::vector<float> gradient(257, 0.0f);
+    gradient.back() = value;
+    parameter.n->grad.copy_from_host(gradient.data(), gradient.size());
+    CHECK_THROWS_AS(optimizer.clip_grad_norm(1.0f), std::runtime_error);
+  }
 }
 
 namespace {
@@ -277,6 +407,41 @@ TEST_CASE("Autograd A1: conv1d", "[autograd][gradcheck][a1][conv]") {
   run(4, 6, 4, 3, 1, 1, 1, 2, "grouped");
 }
 
+TEST_CASE("Convolutions add bias after the product reduction", "[autograd][conv]") {
+  const float large=0x1p24f;
+  auto x=Tensor::from_host({1,1},{2,1});
+  auto w=Tensor::from_host({large,-large},{2,1,1});
+  auto b=Tensor::from_host({1},{1});
+  CHECK(ag::conv_transpose1d(x,w,b,2,1,1,1,1,0).to_host()==std::vector<float>{1});
+  x=Tensor::from_host({1,1,1,1},{2,2});
+  w=Tensor::from_host({large,-large,large,-large},{2,1,2});
+  b=Tensor::from_host({1,-1},{2});
+  CHECK(ag::conv1d(x,w,b,2,2,2,2,1,0,1,2).to_host()==std::vector<float>{1,-1});
+  // Individually small tensors must not overflow the columns workspace index.
+  CHECK_THROWS_AS(ag::conv_transpose1d(Tensor::zeros({1,50000}),
+      Tensor::zeros({1,1,50000}),{},1,50000,1,50000,1,0),std::length_error);
+}
+
+TEST_CASE("Small-input convolution preserves blocked FP32 accumulation", "[autograd][joint][conv]") {
+  // Frozen CPU/aarch64 Conv1d: reductions span two and three 640-element blocks.
+  const std::vector<int> channels{96,192},indices{0,1,15,31,32,64,127,383};
+  const std::vector<std::vector<float>> expected{
+      {-0x1.584f9p-2f,-0x1.7625ccp-3f,0x1.936c28p-2f,-0x1.0e19c8p-2f,
+       -0x1.2ba464p-1f,0x1.81c27p-2f,-0x1.de919p-3f,0x1.d2c15p-1f},
+      {-0x1.86fd3cp-1f,0x1.e8af2p-8f,0x1.bf81eep-2f,0x1.97b73ep-4f,
+       -0x1.e4e0f8p-3f,-0x1.3b706ep-2f,-0x1.54eceap-3f,-0x1.b9c578p-5f}};
+  for(std::size_t i=0;i<channels.size();++i) {
+    const int cin=channels[i];std::vector<float> x(cin*32),w(12*cin*7),b(12);
+    for(int j=0;j<int(x.size());++j)x[j]=float((j*13)%29-14)/37.f;
+    for(int j=0;j<int(w.size());++j)w[j]=float((j*37)%61-30)/113.f;
+    for(int j=0;j<12;++j)b[j]=float(j-3)/17.f;
+    const auto out=ag::conv1d(Tensor::from_host(x,{cin,32}),
+        Tensor::from_host(w,{12,cin,7}),Tensor::from_host(b,{12}),
+        cin,32,12,7,1,3,1,1).to_host();
+    for(std::size_t j=0;j<indices.size();++j)CHECK(out[indices[j]]==expected[i][j]);
+  }
+}
+
 TEST_CASE("Autograd A1: conv_transpose1d", "[autograd][gradcheck][a1][conv]") {
   std::mt19937 rng(19);
   auto run = [&](int Cin, int L, int Cout, int K, int stride, int pad,
@@ -293,6 +458,57 @@ TEST_CASE("Autograd A1: conv_transpose1d", "[autograd][gradcheck][a1][conv]") {
   };
   run(3, 4, 2, 4, 2, 1, "up2_k4");   // generator-style upsampling
   run(2, 5, 3, 3, 1, 1, "same");
+}
+
+TEST_CASE("Transposed convolution preserves reference channel accumulation", "[autograd][joint][conv]") {
+  // Frozen torch CPU/aarch64 conv_transpose1d; includes overlapping output taps.
+  std::vector<float> x(17*3),w(17*2*4);
+  for(int j=0;j<int(x.size());++j)x[j]=std::ldexp(float((j*13)%29-14),-(j%7+2));
+  for(int j=0;j<int(w.size());++j)w[j]=std::ldexp(float((j*37)%61-30),-(j%12+2));
+  const std::vector<float> expected{
+      -0x1.b19a1p+1f,0x1.54b198p+2f,-0x1.917bap-1f,-0x1.fd4c5p+2f,
+      0x1.7f5358p+1f,-0x1.1aab8p+1f,0x1.1e69p+1f,-0x1.6ee7e4p+4f,
+      0x1.1e488p-2f,-0x1.05bc3ap+3f,0x1.6477ap+1f,0x1.4b02ep+1f};
+  auto actual=ag::conv_transpose1d(Tensor::from_host(x,{17,3}),
+      Tensor::from_host(w,{17,2,4}),Tensor::from_host({.75f,-.125f},{2}),
+      17,3,2,4,2,1).to_host();
+  REQUIRE(actual.size()==expected.size());
+  for(std::size_t j=0;j<expected.size();++j)CHECK(actual[j]==expected[j]);
+  x.resize(512*32);w.resize(512*16*4);
+  for(int j=0;j<int(x.size());++j)x[j]=float((j*13)%29-14)/37.f;
+  for(int j=0;j<int(w.size());++j)w[j]=float((j*37)%61-30)/113.f;
+  actual=ag::conv_transpose1d(Tensor::from_host(x,{512,32}),
+      Tensor::from_host(w,{512,16,4}),{},512,32,16,4,2,1).to_host();
+  const std::vector<int> indices{0,1,2,15,31,32,63,64,127,255,511,1023};
+  const std::vector<float> wide_expected{
+      -0x1.4406a6p-2f,-0x1.02a208p-1f,-0x1.27dc44p-2f,-0x1.3de71cp-1f,
+      0x1.6189d4p-1f,0x1.0dd674p+0f,-0x1.767a8ap-1f,0x1.9941c2p-2f,
+      0x1.a7d468p-1f,0x1.17f0d4p-1f,0x1.83b458p-2f,-0x1.c86734p-1f};
+  REQUIRE(actual.size()==1024);
+  for(std::size_t j=0;j<indices.size();++j)CHECK(actual[indices[j]]==wide_expected[j]);
+}
+
+TEST_CASE("Period convolution preserves reference FP32 accumulation", "[autograd][joint][conv]") {
+  // Independent CPU/aarch64 Conv2d; includes both sides of the backend cutoff,
+  // non-aligned heights and two period widths. Values are exact FP32 outputs.
+  struct Case {int channels,height,period; std::vector<float> expected;};
+  const std::vector<Case> cases{
+      {1,256,5,{-0x1.3968700000000p-3f,-0x1.3fc69a0000000p-3f,-0x1.6773d20000000p-3f,-0x1.d79fe80000000p-3f,-0x1.e266a80000000p-3f,-0x1.1512de0000000p-4f,-0x1.2cac180000000p-3f,0x1.794d760000000p-2f}},
+      {32,256,5,{-0x1.4c8e080000000p-2f,0x1.f62ace0000000p-3f,-0x1.f96c5e0000000p-3f,-0x1.201fb20000000p-1f,0x1.66a5400000000p-3f,0x1.e711700000000p-4f,0x1.da817a0000000p-5f,0x1.318aac0000000p-2f}},
+      {128,64,5,{0x1.16662e0000000p-4f,0x1.4a8de20000000p-7f,-0x1.bf21fe0000000p-3f,-0x1.26cb660000000p-3f,-0x1.d4dce20000000p-7f,-0x1.1e497c0000000p-1f,0x1.8add5a0000000p-3f,0x1.65d6dc0000000p-3f}},
+      {32,257,3,{-0x1.c195020000000p-3f,-0x1.5bb24e0000000p-3f,-0x1.b9beb00000000p-3f,-0x1.4579480000000p-1f,-0x1.752ae20000000p-3f,-0x1.b9beb00000000p-3f,-0x1.7720820000000p-3f,0x1.6c13b40000000p-2f}}};
+  for(const auto& c:cases) {
+    std::vector<float> x(c.channels*c.height*c.period),w(12*c.channels*5),b(12);
+    for(int j=0;j<int(x.size());++j)x[j]=float((j*13)%29-14)/37.f;
+    for(int j=0;j<int(w.size());++j)w[j]=float((j*37)%61-30)/113.f;
+    for(int j=0;j<12;++j)b[j]=float(j-3)/17.f;
+    auto out=ag::conv2d(Tensor::from_host(x,{c.channels,c.height,c.period}),
+        Tensor::from_host(w,{12,c.channels,5,1}),Tensor::from_host(b,{12}),
+        c.channels,c.height,c.period,12,5,1,3,1,2,0).to_host();
+    const std::vector<int> indices{0,1,15,31,32,64,127,int(out.size())-1};
+    INFO("channels="<<c.channels<<" height="<<c.height<<" period="<<c.period);
+    for(std::size_t j=0;j<indices.size();++j)CHECK(out[indices[j]]==c.expected[j]);
+  }
 }
 
 TEST_CASE("Autograd GAN: exp + conv2d", "[autograd][gradcheck][gan]") {
@@ -464,4 +680,67 @@ TEST_CASE("Autograd rejects invalid public shapes and indices", "[autograd][boun
   auto table = Tensor::from_host(std::vector<float>(6, 0.0f), {3, 2}, false);
   REQUIRE_THROWS_AS(ag::embedding(table, {-1}, 2), std::out_of_range);
   REQUIRE_THROWS_AS(ag::embedding(table, {3}, 2), std::out_of_range);
+}
+
+TEST_CASE("Recycled graph storage cannot retain values gradients or parents", "[autograd][reuse]") {
+  std::weak_ptr<ag::Node> previous;
+  for (int step=0;step<12;++step) {
+    CHECK(previous.expired());
+    const int size=step%2 ? 257 : 31;
+    const float value=0.25f*(step+1);
+    auto x=Tensor::from_host(std::vector<float>(size,value),{size},true);
+    previous=x.n;
+    CHECK(x.n->parents.empty());
+    CHECK_FALSE(static_cast<bool>(x.n->backward_fn));
+    for(float gradient:x.grad_to_host()) CHECK(gradient==0.0f);
+    auto square=ag::mul(x,x);
+    auto zero=Tensor::zeros({size});
+    for(float item:zero.to_host()) CHECK(item==0.0f);
+    ag::backward(ag::sum(square));
+    for(float gradient:x.grad_to_host()) CHECK(gradient==2*value);
+    for(float item:x.to_host()) CHECK(item==value);
+  }
+  CHECK(previous.expired());
+}
+
+TEST_CASE("Recycled parameters still have no gradient before backward", "[autograd][reuse][missing-gradient]") {
+  {
+    auto old=Tensor::from_host(std::vector<float>(113,1.0f),{113},true);
+    ag::backward(ag::sum(ag::mul(old,old)));
+  }
+  auto parameter=Tensor::from_host(std::vector<float>(113,2.0f),{113},true);
+  CHECK(parameter.n->grad.empty());
+  ag::AdamW optimizer({parameter},0.1f,0.9f,0.999f,1e-8f,0.1f);
+  optimizer.step();
+  for(float value:parameter.to_host()) CHECK(value==2.0f);
+}
+
+TEST_CASE("AdamW restore preserves the next update and rejects partial invalid state", "[autograd][optim][resume]") {
+  auto x=Tensor::from_host({1.f,-2.f,3.f},{3},true);
+  ag::AdamW original({x},1e-4f,.8f,.99f,1e-9f,.01f);
+  ag::backward(ag::sum(ag::mul(x,x)));original.step();original.set_lr(9e-5f);
+  const auto first=original.first_moment(0),second=original.second_moment(0);
+  auto y=Tensor::from_host(x.to_host(),{3},true);
+  ag::AdamW restored({y},1e-4f,.8f,.99f,1e-9f,.01f);
+  restored.restore_state(original.step_count(),original.lr(),[&](std::size_t i,bool v){
+    REQUIRE(i==0);return v?second:first;
+  });
+  REQUIRE(restored.step_count()==original.step_count());REQUIRE(restored.lr()==original.lr());
+  for(int mode=0;mode<5;++mode) {
+    CHECK_THROWS(restored.restore_state(mode==0?-1:1,mode==1?0.f:1e-4f,
+      [&](std::size_t,bool v){
+        auto values=v?second:first;
+        if(mode==2 && v)values.pop_back();
+        if(mode==3 && v)values[0]=-1;
+        if(mode==4 && v)values[0]=std::numeric_limits<float>::infinity();
+        return values;
+      }));
+    CHECK(restored.step_count()==1);CHECK(restored.lr()==original.lr());
+    CHECK(restored.first_moment(0)==first);CHECK(restored.second_moment(0)==second);
+  }
+  ag::backward(ag::sum(ag::mul(x,x)));original.step();
+  ag::backward(ag::sum(ag::mul(y,y)));restored.step();
+  CHECK(y.to_host()==x.to_host());
+  CHECK(restored.first_moment(0)==original.first_moment(0));
+  CHECK(restored.second_moment(0)==original.second_moment(0));
 }

@@ -1,32 +1,84 @@
 {
   "inference": [
-    { "id": "safe", "name": "最稳 · 通用",
-      "desc": "中庸档:中等检索 + 保留源动态。任何首次尝试都稳。",
-      "f0method": "rmvpe", "index_rate": 0.66, "protect": 0.33, "rms_mix_rate": 1.0, "filter_radius": 3, "f0_up_key": 0 },
-    { "id": "balanced", "name": "平衡 · 推荐",
-      "desc": "检索偏强但留余地 + 默认保护 + 弱化原唱动态。日常翻唱首选。",
-      "f0method": "rmvpe", "index_rate": 0.75, "protect": 0.33, "rms_mix_rate": 0.4, "filter_radius": 3, "f0_up_key": 0 },
-    { "id": "timbre", "name": "最贴音色",
-      "desc": "检索拉满 + 保护放松 + 弱化原唱动态。最像目标声线,代价:训练没覆盖的元音可能糊。",
-      "f0method": "rmvpe", "index_rate": 1.0, "protect": 0.25, "rms_mix_rate": 0.4, "filter_radius": 3, "f0_up_key": 0 },
-    { "id": "sing", "name": "唱歌 · 高音顺滑",
-      "desc": "更强的 F0 平滑 + 弱化原唱动态,长音/滑音更顺,减少哑音跳变。适合歌声翻唱。",
-      "f0method": "rmvpe", "index_rate": 0.75, "protect": 0.33, "rms_mix_rate": 0.35, "filter_radius": 5, "f0_up_key": 0 }
+    {
+      "id": "safe",
+      "name": "通用起点",
+      "desc": "中等检索，保留模型自身音量，不跟随原唱的强弱变化。",
+      "f0method": "rmvpe",
+      "index_rate": 0.66,
+      "protect": 0.33,
+      "rms_mix_rate": 1,
+      "filter_radius": 3,
+      "f0_up_key": 0
+    },
+    {
+      "id": "balanced",
+      "name": "均衡混合",
+      "desc": "较强检索，混合原唱与合成音量，可作为试听起点。",
+      "f0method": "rmvpe",
+      "index_rate": 0.75,
+      "protect": 0.33,
+      "rms_mix_rate": 0.4,
+      "filter_radius": 3,
+      "f0_up_key": 0
+    },
+    {
+      "id": "timbre",
+      "name": "强调音色检索",
+      "desc": "最高检索强度，混合原唱与合成音量；未覆盖的发音可能变模糊，需要试听。",
+      "f0method": "rmvpe",
+      "index_rate": 1,
+      "protect": 0.25,
+      "rms_mix_rate": 0.4,
+      "filter_radius": 3,
+      "f0_up_key": 0
+    },
+    {
+      "id": "sing",
+      "name": "增强音高平滑",
+      "desc": "较强的音高平滑，较多跟随原唱音量；长音和滑音的效果需要试听确认。",
+      "f0method": "rmvpe",
+      "index_rate": 0.75,
+      "protect": 0.33,
+      "rms_mix_rate": 0.35,
+      "filter_radius": 5,
+      "f0_up_key": 0
+    },
+    {
+      "id": "tom_cybersinger",
+      "name": "Tom Cybersinger 正式版 · 听审通过",
+      "voice": "Tom_Cybersinger",
+      "desc": "正式联合训练 200 轮；检索 0.35，跟随原唱动态。完整歌曲建议先分离人声、再去和声。",
+      "f0method": "rmvpe",
+      "index_rate": 0.35,
+      "protect": 0.5,
+      "rms_mix_rate": 0,
+      "filter_radius": 3,
+      "f0_up_key": 0
+    }
   ],
   "training": [
-    { "id": "fast", "name": "快速试听",
-      "desc": "解码器 mel 微调,约数百步最快出结果,验证流程/听个大概(单卡约十几分钟)。",
-      "mode": "decoder", "steps": 800, "seg": 32 },
-    { "id": "standard", "name": "标准 · 推荐",
-      "desc": "完整 GAN(enc_q+flow+判别器),约上千步,音质与耗时平衡(单卡数小时)。",
-      "mode": "gan", "steps": 1200, "seg": 32 },
-    { "id": "hq", "name": "高音质",
-      "desc": "完整 GAN 长训(~2800 步,参考 RVC 实践),音质最好耗时最长;建议数据 ≥ 10 分钟。",
-      "mode": "gan", "steps": 2800, "seg": 40 }
+    {
+      "id": "pilot",
+      "name": "短试听 · 最多 50 步",
+      "desc": "联合训练的小规模检查，用于确认素材与流程；不代表正式训练完成。",
+      "mode": "joint",
+      "steps": 50,
+      "seg": 32,
+      "epochs": 0
+    },
+    {
+      "id": "full",
+      "name": "完整联合训练 · 推荐",
+      "desc": "默认 200 轮，遍历所有片段，保存可恢复进度及阶段候选。实际步数随片段数变化；用真实速度判断耗时，结束后听审再发布。",
+      "mode": "joint-full",
+      "steps": 50,
+      "seg": 32,
+      "epochs": 200
+    }
   ],
   "notes": {
-    "epochs": "高级里可填「训练轮数」——1 轮=遍历所有片段一次,步数随数据量自适应(参考 RVC epoch,好数据约 200 轮);填了轮数覆盖步数。GAN 每步较慢,轮数酌情。",
-    "f0method": "目前 F0 统一用 RMVPE(音质最佳);crepe/fcpe 为后续。"
+    "epochs": "完整联合训练按每轮遍历所有片段定义轮次，默认 200 轮；旧版 GAN 使用自己的片段采样规则。轮数不能单独保证音质。",
+    "f0method": "Web 使用已验证的 RMVPE 音高提取；其他前端未在此界面开放。"
   }
 }
-

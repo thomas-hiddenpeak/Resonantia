@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -83,6 +84,7 @@ public:
         failing_program_ = std::move(failing_program);
         result_ = result;
         calls_.clear();
+        training_arguments_.clear();
         outputs_.clear();
         sync_directories_.clear();
     }
@@ -101,6 +103,7 @@ public:
             output = argument(spec, "--output");
             bytes = kWav;
         } else if (program == "vc_train") {
+            training_arguments_=spec.argv;
             output = argument(spec, "--out");
             bytes = "new-model";
             if (cooperative_) {
@@ -147,6 +150,9 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         return calls_;
     }
+    std::vector<std::string> training_arguments() const {
+        std::lock_guard<std::mutex> lock(mu_);return training_arguments_;
+    }
     void require_cleanup() const {
         std::lock_guard<std::mutex> lock(mu_);
         for (const auto& path : outputs_)
@@ -166,6 +172,7 @@ private:
     std::string failing_program_;
     ProcessResult result_;
     mutable std::vector<std::string> calls_;
+    mutable std::vector<std::string> training_arguments_;
     mutable std::vector<fs::path> outputs_, sync_directories_;
 };
 
@@ -347,6 +354,108 @@ void queued_case(const fs::path& root) {
     require(request(f,train).status==200,"retry after queued cancellation failed");require_terminal(f,false,"done");
     f.require_clean();std::cout<<"queued: prompt cancellation while GPU holder runs; stale id/retry/cleanup passed\n";
 }
+void joint_profile_case(const fs::path& root) {
+    const auto joint_request=[](Request& r,int steps=1,int segment=32,int epochs=0) {
+        r.method="POST";r.path="/api/train";
+        r.content_type="multipart/form-data; boundary=result-boundary";
+        for(const auto& [key,value]:std::vector<std::pair<std::string,std::string>>{
+            {"name","voice"},{"mode","joint"},{"steps",std::to_string(steps)},
+            {"seg",std::to_string(segment)},{"epochs",std::to_string(epochs)}})
+            r.body+="--result-boundary\r\nContent-Disposition: form-data; name=\""+key+"\"\r\n\r\n"+value+"\r\n";
+        r.body+="--result-boundary--\r\n";
+    };
+    {
+        Fixture f(root/"joint-invalid");Request v;v.method="GET";v.path="/api/voices";
+        require(request(f,v).body.find("\"training_profiles\":[\"decoder\",\"gan\",\"joint\",\"joint-full\"]")!=std::string::npos,
+                "joint capability not advertised");
+        for(const auto& config:std::vector<std::vector<int>>{{51,32,0},{1,40,0},{1,32,1}}) {
+            Request req;joint_request(req,config[0],config[1],config[2]);
+            require(request(f,req).status==400,"unqualified joint configuration accepted");
+        }
+        require(f.runner->calls().empty(),"invalid joint request launched a CLI");f.require_old();f.require_clean();
+    }
+    for(const std::string outcome:{"success","error","cancel"}) {
+        Fixture f(root/("joint-"+outcome));
+        if(outcome=="error")f.runner->reset("vc_train",{ProcessTermination::kExited,1,0,0,0});
+        if(outcome=="cancel") {f.runner->cooperative(true);f.runner->gate_on("vc_train");}
+        Request req;joint_request(req);const auto accepted=request(f,req);
+        require(accepted.status==200,"joint training request rejected");
+        if(outcome=="cancel") {
+            require(f.runner->await_gate(),"joint CLI not reached");
+            require(cancel(f,job_id(accepted)).status==202,"joint cancellation rejected");
+            f.runner->release_gate();cancelled(f);
+        } else require_terminal(f,outcome=="error",outcome=="error"?"error":"done");
+        ProcessSpec call;call.argv=f.runner->training_arguments();
+        require(std::find(call.argv.begin(),call.argv.end(),"--gan")!=call.argv.end() &&
+                argument(call,"--gan-profile")=="joint" && argument(call,"--seg")=="32" &&
+                argument(call,"--steps")=="1","joint CLI route/recipe changed");
+        if(outcome=="success") {
+            require(read(f.voice/"model.safetensors")=="new-model" && read(f.voice/"model.index")=="new-index" &&
+                    read(f.voice/"clips/result.wav")==kWav,"joint artifacts were not published together");
+        } else {
+            f.require_old();require(f.runner->calls()==std::vector<std::string>{"vc_preprocess","vc_train"},
+                "failed/cancelled joint job ran indexing");
+        }
+        f.require_clean();
+    }
+    std::cout<<"joint profile: bounded parameters, exact CLI routing, success/error/cancel transaction passed\n";
+}
+
+void full_profile_case(const fs::path& root) {
+    const auto fill=[](Request& r,bool resume=false,bool prepared=false) {
+        r.method="POST";r.path="/api/train";r.content_type="multipart/form-data; boundary=result-boundary";
+        for(const auto& [key,value]:std::vector<std::pair<std::string,std::string>>{
+            {"name","voice"},{"mode","joint-full"},{"epochs","2"},{"seg","32"},
+            {"resume",resume?"1":"0"},{"prepared",prepared?"1":"0"}})
+            r.body+="--result-boundary\r\nContent-Disposition: form-data; name=\""+key+"\"\r\n\r\n"+value+"\r\n";
+        r.body+="--result-boundary--\r\n";
+    };
+    {
+        Fixture f(root/"full-invalid");
+        for(const auto& extra:std::vector<std::pair<std::string,std::string>>{{"steps","1"},{"vad","1"}}) {
+            Request r;fill(r,false,true);const auto pos=r.body.rfind("--result-boundary--");
+            r.body.insert(pos,"--result-boundary\r\nContent-Disposition: form-data; name=\""+extra.first+"\"\r\n\r\n"+extra.second+"\r\n");
+            require(request(f,r).status==400,"invalid full/prepared combination accepted");
+        }
+        Request missing;fill(missing,true);require(request(f,missing).status==400,"resume without fixed clips accepted");
+        require(f.runner->calls().empty(),"invalid full request started a CLI");f.require_old();f.require_clean();
+    }
+    for(const std::string outcome:{"success","error","cancel"}) {
+        Fixture f(root/("full-"+outcome));
+        if(outcome=="error")f.runner->reset("vc_train",{ProcessTermination::kExited,1,0,0,0});
+        if(outcome=="cancel"){f.runner->cooperative(true);f.runner->gate_on("vc_train");}
+        Request r;fill(r);const auto accepted=request(f,r);require(accepted.status==200,"full training rejected");
+        if(outcome=="cancel") {
+            require(f.runner->await_gate(),"full CLI not reached");
+            require(cancel(f,job_id(accepted)).status==202,"full cancellation rejected");f.runner->release_gate();cancelled(f);
+        } else require_terminal(f,outcome=="error",outcome=="error"?"error":"done");
+        ProcessSpec call;call.argv=f.runner->training_arguments();
+        require(argument(call,"--gan-profile")=="joint-full"&&argument(call,"--epochs")=="2"&&
+            argument(call,"--checkpoint-dir")== (f.voice/"full_training/checkpoints").string()&&
+            argument(call,"--cache-dir")== (f.voice/"full_training/cache").string(),"full CLI recipe/retention path incorrect");
+        require(read(f.voice/"full_training/clips/result.wav")==kWav,"fixed clips lost after full job");
+        f.require_old(); // Even success is a candidate, never a silent publication.
+        if(outcome=="success")require(read(f.voice/"full_training/result/model.safetensors")=="new-model","candidate missing");
+        Request status;status.method="GET";status.path="/api/train/status";status.query="name=voice";
+        const auto snapshot=request(f,status).body;
+        require(snapshot.find("\"resumable\":false")!=std::string::npos,"clips without a checkpoint must not promise resume");
+        if(outcome=="success")require(snapshot.find("\"review_required\":true")!=std::string::npos,"candidate review state missing");
+        Request again;fill(again);require(request(f,again).status==409,"full state overwritten by new run");
+        write(f.voice/"full_training/checkpoints/state_step_0000000001.safetensors","retained-state");
+        require(request(f,status).body.find("\"resumable\":true")!=std::string::npos,"checkpoint and clips must enable resume");
+        f.runner->reset("");f.runner->cooperative(false);f.runner->gate_on("");
+        Request resume;fill(resume,true);require(request(f,resume).status==200,"resume rejected");
+        require_terminal(f,false,"done");call.argv=f.runner->training_arguments();
+        require(argument(call,"--resume")== (f.voice/"full_training/checkpoints/state_step_0000000001.safetensors").string(),"wrong resume selection");
+        require(f.runner->calls()==std::vector<std::string>{"vc_train","build_index"},"resume reran preprocessing");
+        f.require_old();f.require_clean();
+    }
+    Fixture f(root/"full-prepared");Request prepared;fill(prepared,false,true);
+    require(request(f,prepared).status==200,"prepared full request rejected");require_terminal(f,false,"done");
+    require(f.runner->calls()==std::vector<std::string>{"vc_train","build_index"},"prepared clips were reprocessed");
+    f.require_old();f.require_clean();
+}
+
 void stage_case(const fs::path& root,const std::string& program,bool upload=false) {
     Fixture f(root/(upload?"uploaded":program));f.runner->gate_on(program);
     Request train;make_request(train,"train-model");
@@ -671,6 +780,8 @@ int main() {
             training_publish_case(path, false);
             training_publish_case(path, true);
 #else
+            joint_profile_case(path);
+            full_profile_case(path);
             queued_case(path);
             for(const std::string program:{"vc_preprocess","vc_train","build_index"})stage_case(path,program);
             stage_case(path,"vc_preprocess",true);

@@ -12,7 +12,7 @@ Resonantia 是面向 Jetson Orin（SM87）的 RVC 风格 C++20/CUDA 声音转换
 |---|---|---|
 | 离线声音转换 | **已实现** | HuBERT CLI/batch 使用有界 file path；WavLM 与 legacy library APIs 仍为 owning/unbounded；CUDA FP32、WAV、40 kHz |
 | Flat Index 检索 | **已实现** | private unlinked filesystem snapshot 上 host mmap exact retrieval；非零 `index_rate` fail-closed |
-| 训练 | **实验性** | `vc_train` 提供 decoder/GAN 工程路径；无 resume、生产稳定性或音色质量保证 |
+| 训练 | **实验性** | decoder/GAN及联合训练；`joint-full`新增完整状态/缓存/轮次恢复，验证状态见PROJECT_STATE；生产稳定性和音色仍需验收 |
 | 声源分离与清理 | **实验性、资产门控** | UMX、MelBand-RoFormer、Silero VAD；权重与 reference 不随 Git 分发 |
 | Web 编排 | **已实现、验收部分** | `vc_serve` 调用 CLI；默认监听 `0.0.0.0` 且默认无认证；非实时、无 TLS |
 | 端到端实时变声 | **未实现** | Spec 006 已批准、R0 证据部分完成；尚无 persistent runtime、session、ALSA CLI |
@@ -88,6 +88,9 @@ scripts/convert_voice.sh \
 
 以进程退出码和库的 `VCResult::success` 判断成功，不能只看旧输出文件是否存在。
 CLI 参数、默认值和错误行为见 [`docs/CLI.md`](docs/CLI.md) 与各命令的 `--help`。
+转换默认恢复prior/NSF采样，固定seed 0可复现；CLI可用
+`--synthesis-mode mean`复现旧的零噪声对照，或用`--synthesis-seed`指定抽样。
+这项数值修正仍需各声线独立听审，不构成目标音色质量保证。
 使用 Index 时，runtime 会建立 private、已 unlink 的 filesystem-backed snapshot；不支持
 `FICLONE` 时需要约一份 Index 的临时 filesystem 容量，空间或权限不足会明确失败而不是
 退化为 no-index。
@@ -104,8 +107,8 @@ cmake --build build-host-ci --parallel 2
 ctest --test-dir build-host-ci --output-on-failure --parallel 1 --no-tests=error
 ```
 
-该入口有10项host门禁：作业初始化、A/B/C所有权、结果消费、训练取消、素材提交中取消、
-最终发布中拒绝取消、取消令牌/完整迭代协议、bounded音频I/O、旧Web API兼容和CLI异常入口。
+该入口有11项host门禁：作业初始化、A/B/C所有权、结果消费、训练取消、素材提交中取消、
+最终发布中拒绝取消、多格式上传与发布/翻唱错误契约、取消令牌/完整迭代协议、bounded音频I/O、旧Web API兼容和CLI异常入口。
 它使用替身和临时文件，没有真实模型或训练，也不代表完整设备套件通过。
 原`test_training_cancel`的纯协议断言已原样移至`test_training_cancel_protocol`；真实CLI预取消
 与参数解析仍由原测试保留。它和`test_cli_contract`需要实际CUDA链接的CLI，留在完整构建路径。
@@ -158,13 +161,37 @@ scripts/train_voice.sh \
   --steps 300
 ```
 
-该脚本编排 `vc_preprocess -> vc_train -> build_index`。训练路径用于工程验证，不承诺
-大数据集稳定性、断点续训、生产资源上限、声音相似度或可商用权利。保留原始录音与
+该脚本编排 `vc_preprocess -> vc_train -> build_index`，保留旧默认路径且不提供resume。
+新`--gan-profile joint-full`按轮次运行，支持磁盘特征缓存和完整状态恢复；参数及边界见
+[CLI说明](docs/CLI.md)，真实验证和当前限制见[项目状态](specs/PROJECT_STATE.md)。
+训练产物仍需音质与声音相似度验收；不承诺大数据集稳定性、生产资源上限或可商用权利。保留原始录音与
 预训练模型，不要把实验输出当作唯一可恢复副本。
 
 ## WebUI
 
 唯一受支持的 Web 服务入口是 `vc_serve`：
+
+上传支持 WAV、MP3、M4A（AAC/ALAC）、AAC、FLAC、OGG（Vorbis/Opus）、Opus、WMA、
+AIFF/AIF，训练可多文件上传。新格式由服务器自动转为 PCM16/44.1 kHz WAV（转换上传保留立体声，训练默认mono），
+结果仍下载为 WAV。WAV 原样保留，模型 CLI 的 WAV 接口不变。
+
+2026-10-29已接入听审通过的正式 **Tom Cybersinger**（原CyberTom正式版），本机旧声线已清理：
+完整歌曲按“分离人声→去和声→转换”处理，
+可合回原伴奏；训练页提供200轮完整训练、断点恢复、候选试听与确认发布。另有默认关闭的
+短区间人工音高校正。使用方法、质量边界和本次验证见[Web交付记录](docs/WEBUI_RELEASE_20261029.md)。
+
+工作室界面按“制作翻唱 / 训练声线 / 声线库”分开日常任务：上传后确认输入类型与声线，
+查看处理概览再生成，结果可与原声同位置对照；训练启动前核对计划，候选听审与发布在
+声线库中完成。交互依据、无障碍/手机验收与自审记录见
+[工作室设计与验收](docs/WEBUI_STUDIO_20261029.md)。
+
+多格式需要带完整音频解码器的 FFmpeg，以及 coreutils `timeout` 和 util-linux `prlimit`。
+默认使用 `/usr/bin/ffmpeg`，可用 `--ffmpeg /absolute/path` 指定。缺依赖时 WAV 仍可用，
+其他格式返回503。本机 NVIDIA 的裁剪版 FFmpeg 缺少 MP3/AAC/WMA，已改用 Ubuntu
+`7:6.1.1-3ubuntu5`；其他机器也应核验实际 codec，不能只检查可执行文件存在。
+新格式解码上限为64 MiB/文件、128 MiB/批（约12.7/25.4分钟单声道音频）；长录音请分段
+并选择合适的素材集合，每次上传替换当前素材。整次HTTP body上限128 MiB；解码超过120秒或损坏会明确报错并保留旧素材。
+只有上传准备完成后才启用预处理、训练或转换。浏览器无法估算部分格式时长不影响上传。
 
 ```bash
 build/vc_serve --repo "$PWD" --webroot webui \

@@ -657,3 +657,34 @@ TEST_CASE("Safetensors loaders promptly reject a no-writer FIFO",
     REQUIRE_FALSE(child.timed_out);
     REQUIRE(child.exited_with(0));
 }
+
+TEST_CASE("Stereo cleanup IO preserves channels and rejects invalid writes", "[audio_io]") {
+    using namespace voxmutatio::io;
+    TempFile file("_stereo.wav");
+    const std::vector<float> input{0.125f, -0.75f, 0.25f, -0.5f, 0.5f, 0.0f};
+    REQUIRE(write_stereo_audio(file.path, input.data(), 3, 44100, true));
+    auto stereo = read_stereo_audio(file.path);
+    REQUIRE(stereo);
+    REQUIRE(stereo->frames() == 3);
+    REQUIRE(stereo->data == input);
+    auto mono = read_audio(file.path, 44100);
+    REQUIRE(mono);
+    REQUIRE(mono->data[0] == Catch::Approx(-0.3125));
+    const auto original = read_binary(file.path);
+    const float bad[]{0, std::numeric_limits<float>::infinity()};
+    REQUIRE_FALSE(write_stereo_audio(file.path, bad, 1, 44100, true));
+    REQUIRE_FALSE(write_stereo_audio(file.path, input.data(), -1, 44100));
+    REQUIRE_FALSE(write_stereo_audio(file.path, nullptr, 1, 44100));
+    REQUIRE_FALSE(write_stereo_audio(file.path, input.data(), 44100 * 601, 44100));
+    REQUIRE(read_binary(file.path) == original);
+    REQUIRE_FALSE(read_stereo_audio(file.path, 0));
+    REQUIRE(write_audio(file.path, input.data(), 3, 44100));
+    stereo = read_stereo_audio(file.path);
+    REQUIRE(stereo);
+    REQUIRE(stereo->data[0] == stereo->data[1]);
+    REQUIRE(stereo->data[2] == stereo->data[3]);
+    REQUIRE(write_stereo_audio(file.path, input.data(), 3, 44100));
+    stereo = read_stereo_audio(file.path);
+    REQUIRE(stereo);
+    REQUIRE(stereo->data[1] == Catch::Approx(-0.75).margin(0.00004));
+}

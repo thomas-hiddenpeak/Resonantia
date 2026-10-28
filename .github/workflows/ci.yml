@@ -69,6 +69,28 @@ jobs:
         shell: bash
         run: ctest --test-dir build-host-ci --output-on-failure --parallel 1 --no-tests=error
 
+  web-studio-browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install locked browser test dependencies
+        run: |
+          node --version
+          npm ci --prefix tests/browser --ignore-scripts --no-audit --no-fund
+          tests/browser/node_modules/.bin/playwright-core install --with-deps chromium
+      - name: Verify existing UI contracts
+        run: |
+          node tests/test_web_auth_ui.cjs
+          node tests/test_web_audio_ui.cjs
+          node tests/test_web_joint_ui.cjs
+          node tests/test_web_train_cancel_ui.cjs
+      - name: Audit studio workflows and accessibility in Chromium
+        run: node tests/run_web_studio_browser.cjs
+
   cuda-build-and-contract-tests:
     # Never scheduled by a push or PR. Readiness stays unset until a maintainer
     # verifies and authorizes a uniquely matching runner; this change sets no

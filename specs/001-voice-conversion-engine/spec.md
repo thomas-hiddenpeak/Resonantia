@@ -3,7 +3,7 @@
 **Feature Branch**: `001-voice-conversion-engine`
 **Created**: 2026-08-05
 **Status**: Offline baseline and bounded HuBERT file path implemented; specification verification partially complete
-**Scope date**: 2026-10-24（离线范围不变；批处理冲突与 WavLM 对齐门禁修复）
+**Scope date**: 2026-10-26（离线范围不变；增加RMS居中窗口与插值对齐修正）
 
 ## 1. Scope
 
@@ -35,10 +35,88 @@ Web 编排见 Spec 003，训练见 Spec 002，声源分离见 Spec 004；它们�
 | RVC 模型 | F0 v1 / 256D；F0 v2 / 768D | non-F0 |
 | F0 | RMVPE（默认）；FCPE（可选） | PM |
 | 输出采样率 | 当前兼容 synthesizer 的原生 40 kHz | 32/48 kHz 等其他模型率；独立 target sample rate |
-| 运行参数 | pitch、index rate、RMS mix、protect、F0 filter | formant shift |
+| 运行参数 | pitch、index rate、RMS mix、protect、F0 filter、synthesis mode/seed | formant shift |
 
 `target_sample_rate=0` 表示使用当前兼容模型的原生 40 kHz；显式值只有等于
 `model_sample_rate=40000` 才合法。这不是一个额外的输出重采样功能。
+
+### 2.1 F0 默认行为修正与兼容（2026-10-24）
+
+`VCConfig::interp_unvoiced`默认改为`false`：不再把辅音、停顿的零F0自动插值为
+持续有声音高，与`vc_train`保留原始无声帧的行为一致。显式选择的median filter
+仍按既有规则平滑局部边界；默认filter=0时原始零F0保持为零。
+已有C++调用方可显式设`interp_unvoiced=true`复现旧插值行为。CLI/batch及Web调用
+的新CLI继承修正默认值；无模型、Index格式或参数结构迁移，回滚可使用部署前CLI。
+原有raw-F0真实音频E2E门禁现在验证该默认值，不再在测试中另行关闭插值；
+bounded DSP门禁覆盖无声首尾/间隔、跨block停顿、pitch、median、显式旧模式和I/O失败。
+此修正不等于已验证所有声线的自然度，也不改变确定性合成或训练器的实验性状态。
+
+### 2.2 生成器输出激活对齐修正（2026-10-24）
+
+NSF生成器在`conv_post`之前的LeakyReLU负半轴系数必须匹配参考实现的`0.01`；
+upsampling/residual层仍为`0.1`。原推理与训练实现均误用了后者，单独的波形相关性
+门限未捕获预训练模型约4.1%的相对L2误差。`test_vits_alignment`和独立参考驱动的
+`test_generator_trainer`在相关性`>0.999`之外增加相对L2`<1e-3`门禁。
+
+权重布局、公共API与输入格式不变，训练和推理必须同时修正。旧二进制生成的微调权重
+可能已适应错误的激活函数；保留旧模型与CLI备份，不能假设切换后的旧模型音质合格。
+回滚通过恢复整组训练/推理CLI完成，不改写历史权重。新训练仍需独立可懂度和人工验收。
+
+### 2.3 RMVPE 前端与独立参考修正（2026-10-24）
+
+RMVPE必须匹配上游`MelSpectrogram`：HTK频率刻度、Slaney面积归一化、128个mel带、
+16 kHz输入、1024点periodic Hann/FFT、160 hop、30–8000 Hz、reflect center、
+log clamp 1e-5。Slaney面积归一化不等于Slaney频率刻度；旧实现及自写Python参考
+同时使用了错误刻度，因此旧`rmvpe_ref_*`对齐不能证明符合RMVPE预训练输入契约。
+新的`rmvpe_htk_*`必须直接调用独立上游实现并记录源代码、模型、真实语音和产物哈希。
+E2E使用`e2e_htk_*`；旧VITS固定输入数值fixture保留，但不作为音高准确性证据。
+
+训练与推理共享修正前端，无公共API、权重或Index格式迁移。旧微调模型可加载，但它们
+基于错误F0训练，不能自动获得音质资格；原素材/权重保留，新试验必须重新提取F0并从
+未经这些错误标签微调的预训练权重开始。训练/推理CLI整组部署、备份回滚，不能只切换
+一侧。新前端仍需原bounded-window误差/资源门禁和短真实音频人工听审。
+
+### 2.4 采样合成恢复与兼容（2026-10-24）
+
+独立真实语音A/B听审确认恢复prior/NSF随机成分比原均值模式明显更自然。
+默认合成采用`SynthesisMode::kSampled`：prior为`mean + exp(log_std) * N(0,1) * 0.66666`；
+NSF在有声帧使用标准差0.003、无声帧使用0.1/3的高斯激励，随后经过原source linear/tanh。
+`kMean`同时关闭两处随机成分，保留旧数值参考及显式回滚路径。不改模型/Index格式、
+模块边界、噪声之外的网络运算或C++/CUDA运行依赖。
+
+`VCConfig`与`SynthesizerConfig`增加模式及64位seed（默认0）；非法模式初始化失败。
+convert/batch支持`--synthesis-mode sampled|mean`与`--synthesis-seed`，Web继承默认。
+训练CLI支持相同模式并以现有`--seed`驱动合成采样；debug Flow/source/decode使用配置模式，
+纯encoder stats不受影响。训练仍是已有clip前处理缓存策略，不宣称与上游逐步刷新噪声等价。
+
+噪声由私有无状态counter hash（SplitMix64）及Box-Muller生成，prior/NSF分流；同一
+模式、seed与输入可复现。prior索引为(frame_offset+frame)*192+channel，NSF为
+(frame_offset+frame)*400+sample，不随矩阵总长度重新排列。保留原五参数`infer`（offset=0），
+增加带末尾`sampling_frame_offset`的重载；必须在访问输入前拒绝派生索引溢出。pipeline分块传入
+该片段在反射补边后音频中的100 Hz起始帧，使相同绝对位置使用相同抽样。
+不持有跨调用RNG状态，也不新增随音频增长的噪声数组。既有NSF phase reset仍保留，
+不构成实时流连续性保证；
+必须重新通过bounded/legacy长音频的现有误差和资源门限，不得为随机化放宽。
+
+旧mean模式fixture显式选`kMean`，新增sampled参考使用相同真实语音及明确的高斯输入，
+由独立上游网络计算，相关性>0.999、相对L2<1e-3；同时检查seed复现/变化、UV噪声、
+非法模式及非有限采样失败。训练/转换程序整组部署并留备份，旧模型需重新听审，
+ASR或数值一致性不能替代最终自然度及目标音色验收。
+
+### 2.5 动态包络对齐修正（2026-10-26）
+
+RMS音量匹配须使用居中窗口、边界补零及固定窗口长度归一化；线性插值采用
+half-pixel坐标、边界钳制（对应参考`align_corners=false`）。旧实现使用前向窗口、
+尾窗变长分母及端点对齐，不能由“与旧实现一致”的测试替代独立参考验证。
+`rms_mix_rate=1`仍完全旁路音量匹配；0完整跟随源包络，中间值按原幂次混合。
+默认仍采用1秒窗口、0.5秒hop，不增加已被听审否决的100ms全频动态增益入口。
+
+迁移：模型、Index和采样序列不变；修正时间对齐会改变mix<1的输出，训练不受此
+后处理影响，无需重新训练。保留旧CLI用于历史音频复现，整组部署并备份；不替换
+原模型/联合训练golden。bounded路径每次最多读取一个窗口（16k为16000样本、
+40k为40000样本），包络记录仍落盘。边界、PCM和真实短音频须回归；数值对齐不能
+证明动态听感已经满足。100ms离线预览虽恢复动态，却被反馈音色变差和齿音增加，
+该方案未接入生产，仍需保持此前已接受的音色并解决动态问题。
 
 ## 3. User Scenarios
 
@@ -117,6 +195,12 @@ index rate、RMS mix 与 protect。任何保留但未实现的参数都应明确
 - 在本规格内实现训练、WebUI 或声源分离。
 
 ## 6. Verification and Acceptance
+
+2026-10-24 离线性能修复保留上述公共契约：Index 在 CPU 上对 query 做最多 4 路精确
+并行检索；VITS attention/大通道卷积使用 FP32 cuBLAS/CUDA。新增 `test_synth_ops`
+覆盖 attention 位置与卷积分块数值，`test_index` 覆盖并行距离及 tie 一致性。
+浮点重排仍须满足真实 VITS 的既有误差/相关性门限，不以加速为由放宽。
+短片段性能与未执行长音频门禁的边界见 [PROJECT_STATE](../PROJECT_STATE.md)。
 
 批处理输出继续采用 `output-dir/<stem>.wav`。不同输入映射到同一输出（包括递归子目录
 同名、`.wav`/`.WAV` 同 stem）时，`vc_batch` 必须在加载模型、创建输出目录或转换任一文件
@@ -231,8 +315,10 @@ Spec 001 产品范围，因此这些 focused 结果不足以把整个 001 规格
   进程中用相同模型/config 比较至少两个不同时长的真实 WAV，记录 peak RSS/device memory、
   硬件、命令和允许的 allocator/driver slack。只有证明峰值不随总时长增长，才能把 bounded
   file path 标为实现；单个短 fixture、空返回 vector 或仅在返回前 `clear()` 均不满足。当前
-  17.565/35.130 秒 gate 的 RSS 增量为 `12220 KiB`（允许 `65536 KiB`），device growth 长样本
+  历史17.565/35.130 秒 gate 的 RSS 增量为 `12220 KiB`（允许 `65536 KiB`），device growth 长样本
   未高于短样本；这是两个时长点的证据，不是任意时长经验外推。
+  2026-10-25复验曾失败；VITS提前释放已消费stage缓冲的修复及当前结果见PROJECT_STATE。
+  原输入时长、RSS与device容差保持不变；诊断observer不替代无插桩资源门禁。
 
 ### 8.3 Rollout and rollback
 
@@ -266,3 +352,24 @@ Spec 001 产品范围，因此这些 focused 结果不足以把整个 001 规格
   caller umask 语义。exact sample count、header backpatch 与文件 `fsync`/close 必须在 rename
   前成功；rename 是不可回滚的 runtime commit point，之后父目录 `fsync` 仅 best-effort，不能
   把已提交结果改报失败。契约保证运行时原子替换，不宣称完整 directory crash durability。
+
+## 2026-10-29 人工局部音高校正
+
+`VCConfig::pitch_edits` 是默认空列表，`vc_convert --pitch-edits` 使用严格格式
+`smooth:start:end;shift:start:end:semitones`，时间单位为输入音频秒，不包含反射 padding。
+支持 bounded 文件转换；legacy buffer/WavLM 路径拒绝非空修音配置，不静默忽略。
+
+- 最多 16 个按时间排序且互不接触/重叠的区间，每段 0.02–2 秒，时间 0–600 秒。
+  整段输入必须 ≤600 秒，终点不得超过输入时长。偏移范围 ±24 半音，所有数值必须有限。
+- 在已有 F0 后处理/全局变调之后，以 100 Hz 帧网格四舍五入定位。平滑保留两端，
+  在 log(F0) 域插值内部帧；任一原始或处理后 F0 为无声则拒绝该平滑区间。
+  偏移按半开区间执行，只改原始有声帧。原始 UV mask 始终保持。
+- 没有区间的调用完全走原路径；区间外 F0 不变。修音增加两份至多 61,100 帧 float
+  数组和一个临时 spool；仍使用原有有界波形路径、固定 seed、HuBERT/Index、RMS。
+- 这是人工选择的校正，不自动识别歌词或检测错音，不保证任何输入都正确。
+
+真实回放：CyberTom 正式模型的28秒尾段使用 `smooth:17.36:17.48;shift:23.05:23.11:12`，
+与听审接受的离线结果1,120,000个PCM样本逐一相同。局部秒数只适用于该28秒输入，
+不能直接用于整曲。共享原模型/索引与参数，不更改权重或模型格式。
+兼容与回滚：新增字段缺省为空；删除该 flag/清空列表恢复原推理。验证见
+[Web发布记录](../../docs/WEBUI_RELEASE_20261029.md)。

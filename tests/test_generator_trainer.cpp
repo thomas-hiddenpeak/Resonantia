@@ -1,9 +1,9 @@
 // Copyright 2024 Resonantia Authors.
 // Licensed under the MIT License.
 //
-// Validates the trainable autograd decoder against the proven inference
-// decoder: given the same latent z and harmonic source, the autograd
-// generator must reproduce the reference waveform (spec 002 correctness gate).
+// Validates the trainable autograd decoder against the independent Python
+// reference: equal latent z and harmonic source must reproduce its waveform
+// (spec 002 correctness gate). Agreement with C++ inference alone is insufficient.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -63,12 +63,18 @@ TEST_CASE("GeneratorTrainer failed re-init releases the previous checkpoint",
   CHECK_FALSE(trainer.export_model(path, "/tmp/uninitialized-generator.safetensors"));
 }
 
-TEST_CASE("Autograd decoder matches inference decoder", "[training][decoder][alignment]") {
+TEST_CASE("Autograd decoder matches independent reference", "[training][decoder][alignment]") {
   using namespace voxmutatio;
 
-  auto z = load("../tests/fixtures/vits_ref_z.bin");        // [192,584]
-  auto nsff0 = load("../tests/fixtures/vits_ref_nsff0.bin"); // [584]
-  auto ref_audio = load("../tests/fixtures/vits_ref_audio.bin"); // [233600]
+  bool sampled = false;
+  SECTION("historical mean-mode decoder") {}
+  SECTION("sampled latent and NSF excitation") { sampled = true; }
+  auto z = load(sampled ? "../tests/fixtures/vits_sampled_z.bin"
+                        : "../tests/fixtures/vits_ref_z.bin");
+  auto nsff0 = load(sampled ? "../tests/fixtures/e2e_htk_nsff0.bin"
+                            : "../tests/fixtures/vits_ref_nsff0.bin");
+  auto ref_audio = load(sampled ? "../tests/fixtures/vits_sampled_audio.bin"
+                                : "../tests/fixtures/vits_ref_audio.bin");
   REQUIRE(z.ok); REQUIRE(nsff0.ok); REQUIRE(ref_audio.ok);
   int T = z.shape[1];  // 584
   REQUIRE(z.shape[0] == 192);
@@ -77,6 +83,7 @@ TEST_CASE("Autograd decoder matches inference decoder", "[training][decoder][ali
 
   // Harmonic source from the (proven) synthesizer sine generator.
   synthesizer::SynthesizerConfig scfg;
+  scfg.synthesis_mode = sampled ? SynthesisMode::kSampled : SynthesisMode::kMean;
   scfg.model_path = g_path;
   scfg.version = ModelVersion::kV2;
   scfg.sample_rate = 40000;
@@ -104,8 +111,16 @@ TEST_CASE("Autograd decoder matches inference decoder", "[training][decoder][ali
   rms = std::sqrt(rms / cpp.size());
   std::cout << "correlation: " << c << ", RMS: " << rms << std::endl;
 
-  // The autograd decoder must reproduce the inference decoder output.
+  // Reference GeneratorNSF uses slope 0.01 only at the output activation;
+  // its residual and upsampling blocks use 0.1. A shared train/infer mistake
+  // can pass correlation and round-trip checks, so also gate relative error.
   CHECK(c > 0.999);
+  double reference_energy = 0.0;
+  for (float value : ref_audio.data) reference_energy += double(value) * value;
+  REQUIRE(reference_energy > 0.0);
+  const double relative_l2 = rms / std::sqrt(reference_energy / ref_audio.data.size());
+  std::cout << "autograd decoder relative L2: " << relative_l2 << std::endl;
+  CHECK(relative_l2 < 1e-3);
 }
 
 TEST_CASE("Decoder fine-tune reduces mel loss (real audio)", "[training][decoder][finetune]") {
@@ -120,6 +135,7 @@ TEST_CASE("Decoder fine-tune reduces mel loss (real audio)", "[training][decoder
   std::string g_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
 
   synthesizer::SynthesizerConfig scfg;
+  scfg.synthesis_mode = SynthesisMode::kMean;
   scfg.model_path = g_path; scfg.version = ModelVersion::kV2;
   scfg.sample_rate = 40000; scfg.spk_embed_dim = 109;
   synthesizer::Synthesizer synth; REQUIRE(synth.init(scfg));
@@ -182,6 +198,7 @@ TEST_CASE("Fine-tuned decoder exports and round-trips through inference",
   std::string g_path = "../models/pretrained_v2/pretrained_v2/f0G40k.safetensors";
 
   synthesizer::SynthesizerConfig scfg;
+  scfg.synthesis_mode = SynthesisMode::kMean;
   scfg.model_path = g_path; scfg.version = ModelVersion::kV2;
   scfg.sample_rate = 40000; scfg.spk_embed_dim = 109;
   synthesizer::Synthesizer base; REQUIRE(base.init(scfg));

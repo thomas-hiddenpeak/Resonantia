@@ -10,11 +10,13 @@
 #include "subprocess_test.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <type_traits>
 #include <sys/stat.h>
@@ -80,6 +82,57 @@ bool write_binary(const std::string& path, const std::vector<std::uint8_t>& byte
 }
 
 }  // namespace
+
+TEST_CASE("Flat Index multi-query search preserves scalar distances and ties",
+          "[index][cuda-flat][exact]") {
+    constexpr int rows = 257, dim = 33, queries = 19, k = 8;
+    std::vector<float> data(rows * dim), input(queries * dim);
+    std::vector<std::uint8_t> bytes;
+    append_u64(bytes, rows);
+    append_u64(bytes, dim);
+    for (int r = 0; r < rows; ++r) {
+        for (int d = 0; d < dim; ++d) {
+            // Duplicate rows deliberately exercise equal-distance top-k ordering.
+            const float value = ((r % 37) * 13 + d * 7) % 101 / 19.0f;
+            data[r * dim + d] = value;
+            append_float(bytes, value);
+        }
+    }
+    for (int i = 0; i < queries * dim; ++i)
+        input[i] = (i * 17 % 83) / 23.0f;
+    std::copy_n(data.begin(), dim, input.begin());  // exact zero-distance match
+    TempIndex file;
+    REQUIRE(write_binary(file.path, bytes));
+    voxmutatio::index::CudaFlatIndex index;
+    REQUIRE(index.load(file.path));
+
+    std::vector<float> expected_distances(queries * k), scratch(rows);
+    std::vector<int64_t> expected_indices(queries * k), order(rows);
+    for (int q = 0; q < queries; ++q) {
+        for (int r = 0; r < rows; ++r) {
+            float distance = 0;
+            for (int d = 0; d < dim; ++d) {
+                const float difference = input[q * dim + d] - data[r * dim + d];
+                distance += difference * difference;
+            }
+            scratch[r] = distance;
+        }
+        std::iota(order.begin(), order.end(), 0);
+        std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                          [&](int64_t a, int64_t b) { return scratch[a] < scratch[b]; });
+        for (int j = 0; j < k; ++j) {
+            expected_indices[q * k + j] = order[j];
+            expected_distances[q * k + j] = scratch[order[j]];
+        }
+    }
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        const auto [distances, indices] = index.search(input.data(), queries, k, dim);
+        REQUIRE(indices == expected_indices);
+        REQUIRE(distances == expected_distances);
+    }
+    input.back() = std::numeric_limits<float>::quiet_NaN();
+    REQUIRE(index.search(input.data(), queries, k, dim).first.empty());
+}
 
 TEST_CASE("Feature blend rate 0.0", "[index][blend]") {
     const int frames = 10;

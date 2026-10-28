@@ -15,6 +15,7 @@ get_filename_component(RESONANTIA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUT
 include("${RESONANTIA_ROOT}/cmake/ResonantiaCatch2.cmake")
 
 add_library(host_transport STATIC
+    "${RESONANTIA_ROOT}/src/io/audio_io.cpp"
     "${RESONANTIA_ROOT}/tools/web/http_transport.cpp"
     "${RESONANTIA_ROOT}/src/separation/sep_registry.cpp"
     "${RESONANTIA_ROOT}/tools/app_support/training_cancel.cpp")
@@ -34,7 +35,7 @@ function(register_host_contract name timeout)
         ENVIRONMENT "CUDA_VISIBLE_DEVICES=;OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
 endfunction()
 
-foreach(name IN ITEMS test_web_job_lifecycle test_web_result_contract test_web_train_cancel)
+foreach(name IN ITEMS test_web_job_lifecycle test_web_result_contract test_web_train_cancel test_web_audio_upload)
     add_executable(${name} "${RESONANTIA_ROOT}/tests/${name}.cpp")
     target_link_libraries(${name} PRIVATE host_web)
     register_host_contract(${name} 30)

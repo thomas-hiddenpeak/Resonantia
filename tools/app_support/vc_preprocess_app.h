@@ -25,6 +25,7 @@ struct VcPreprocessOptions {
     bool deecho = false;
     bool denoise = false;
     bool no_slice = false;
+    bool preserve_stereo = false;
     bool vad = false;
     double vad_threshold = 0.5;
     std::string separation_dir = "models/separation";

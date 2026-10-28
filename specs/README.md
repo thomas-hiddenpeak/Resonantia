@@ -77,7 +77,7 @@ spec 写着 `Complete`，不等于当前提交已经构建并执行了对应测�
 | [001 Voice Conversion](./001-voice-conversion-engine/spec.md) | 内容、F0、检索、合成、pipeline、bounded/legacy 文件转换与工具 | 功能目标有效；顶部完成状态和内嵌历史数值需由当前追踪证据复核 |
 | [001 data model](./001-voice-conversion-engine/data-model.md) | 核心数据结构意图 | 与 `core/types.h` 不一致时记录 drift，不由代码自动覆盖模型意图 |
 | [002 Voice Training](./002-voice-training/spec.md) | C++/CUDA 微调与 GAN | 断点续训、生产稳定性和音色效果等未验证项不得由已有训练 smoke 推断 |
-| [003 WebUI](./003-webui/spec.md) | Web/API、上传、训练与转换编排 | As-built baseline；默认开放、可选 token、WAV-only、非实时且服务本身无 TLS |
+| [003 WebUI](./003-webui/spec.md) | Web/API、上传、训练与转换编排 | As-built baseline；默认开放、可选 token；Web经FFmpeg解码常见格式，模型CLI仍为WAV；非实时且服务本身无TLS |
 | [004 Source Separation](./004-source-separation/spec.md) | STFT、UMX、RoFormer、VAD、预处理接入 | 大模型与 reference 测试属于可选资产门禁 |
 | [006 Realtime Voice Conversion](./006-realtime-voice-conversion/spec.md) | 持久流式 runtime、本机 ALSA、Index-enabled 质量路径、时延/背压/连续性 | `Approved` / R0 evidence 部分完成 / 产品未实现；已有 legacy characterization、报告 validator、manifest 与 standalone exact-Index 诊断 probe，后者不是产品 backend/上限；目标 model+matching Index/licensed corpus 仍阻塞 qualification |
 | [PROJECT_STATE](./PROJECT_STATE.md) | 维护性状态摘要 | 仅作导航；冲突时回到规范权威链和实现事实链并记录 drift |

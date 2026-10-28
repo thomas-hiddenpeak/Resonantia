@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "voxmutatio/core/pitch_edit.h"
 
 namespace voxmutatio {
 
@@ -53,6 +54,9 @@ enum class F0Method : std::uint8_t {
     kPm,     // Reserved; current pipeline rejects this unsupported method
 };
 
+/// Reproducible sampled synthesis, or the legacy zero-noise numerical control.
+enum class SynthesisMode : std::uint8_t { kSampled, kMean };
+
 /// Content (SSL) encoder selection
 enum class ContentEncoder : std::uint8_t {
     kHubert,  // HuBERT/ContentVec (default; stock RVC v1/v2 models)
@@ -66,6 +70,8 @@ enum class ContentEncoder : std::uint8_t {
 
 /// Voice conversion configuration
 struct VCConfig {
+    // Optional manual correction; bounded file conversion only, <=600s input.
+    std::vector<PitchEdit> pitch_edits;
     // Model paths
     std::string hubert_model_path;       // required when content_encoder=kHubert
     std::string synthesizer_model_path;  // VITS synthesizer safetensors
@@ -85,7 +91,9 @@ struct VCConfig {
     int filter_radius = 0;               // F0 median-filter kernel (0=off; odd >=3 smooths)
     double edge_pad_sec = 0.5;           // reflect-pad seconds each end (RVC x_pad; anti edge-artifact)
     bool apply_highpass = true;          // RVC 48Hz Butterworth high-pass on 16k input
-    bool interp_unvoiced = true;         // interpolate F0 across unvoiced frames (smooth pitch)
+    SynthesisMode synthesis_mode = SynthesisMode::kSampled;
+    std::uint64_t synthesis_seed = 0;   // fixed draws per call; no persistent RNG state
+    bool interp_unvoiced = false;        // preserve unvoiced F0; true explicitly enables legacy gap filling
 
     // Long-audio handling: clips longer than max_chunk_sec are split at silence and
     // converted per-chunk, then stitched. HuBERT/Index/VITS run per chunk, while F0

@@ -105,7 +105,7 @@ voxmutatio::VCConfig base_config() {
     cfg.rms_mix_rate = 1.0;   // isolate chunking (no RMS envelope matching)
     cfg.protect = 0.5;        // protect disabled (>=0.5)
     cfg.apply_highpass = true;
-    cfg.interp_unvoiced = true;
+    // Exercise the production default: do not fill unvoiced F0 gaps.
     cfg.filter_radius = 3;
     return cfg;
 }

@@ -11,6 +11,18 @@
 #include "voxmutatio/training/mel_loss.h"
 #include "voxmutatio/training/posterior_encoder.h"
 
+TEST_CASE("RVC mel profile keeps crop frame counts and rejects incompatible geometry", "[training][joint]") {
+  using namespace voxmutatio::training;
+  MelSpecConfig config;
+  config.rvc_profile = true;
+  REQUIRE_THROWS_AS(MelLoss(config), std::invalid_argument);
+  config.n_fft = 2048; config.hop = 400; config.n_mels = 125;
+  MelLoss mel(config);
+  CHECK(mel.num_frames(12800) == 32);
+  CHECK(mel.num_frames(240000) == 600);
+  CHECK_THROWS_AS(mel.num_frames(824), std::invalid_argument);
+}
+
 TEST_CASE("Spectrogram host and GPU agree at odd padding boundaries", "[training][bounds]") {
   using namespace voxmutatio::training;
   for (const auto [length, fft, hop] :

@@ -133,30 +133,29 @@ std::vector<float> legacy_highpass(std::vector<float> audio) {
     return audio;
 }
 
-std::vector<float> legacy_rms(const std::vector<float>& source,
+std::vector<float> centered_rms(const std::vector<float>& source,
                               std::vector<float> output, double rate) {
     const auto envelope = [](const std::vector<float>& audio, int sample_rate,
                              std::size_t output_samples) {
         const std::size_t hop = static_cast<std::size_t>(sample_rate / 2);
         const std::size_t frame = 2 * hop;
-        const std::size_t record_count = std::max<std::size_t>(
-            1, (audio.size() + hop - 1) / hop);
+        const std::size_t record_count = audio.size() / hop + 1;
         std::vector<float> records(record_count);
         for (std::size_t record = 0; record < record_count; ++record) {
-            const std::size_t first = record * hop;
-            const std::size_t end = std::min(audio.size(), first + frame);
+            const std::size_t center = record * hop;
+            const std::size_t first = center >= frame / 2 ? center - frame / 2 : 0;
+            const std::size_t end = std::min(audio.size(), center + frame / 2);
             double sum = 0.0;
             for (std::size_t index = first; index < end; ++index) {
                 sum += static_cast<double>(audio[index]) * audio[index];
             }
             records[record] = static_cast<float>(
-                std::sqrt(sum / std::max<std::size_t>(1, end - first)));
+                std::sqrt(sum / frame));
         }
         std::vector<float> result(output_samples);
         for (std::size_t index = 0; index < output_samples; ++index) {
-            const double position = static_cast<double>(index) *
-                static_cast<double>(record_count - 1) /
-                static_cast<double>(std::max<std::size_t>(1, output_samples - 1));
+            const double position = std::clamp((static_cast<double>(index) + 0.5) *
+                record_count / output_samples - 0.5, 0.0, static_cast<double>(record_count - 1));
             const auto first = static_cast<std::size_t>(position);
             const float fraction = static_cast<float>(position - first);
             const float left = records[first];
@@ -273,6 +272,67 @@ TEST_CASE("Bounded quiet planner emits a sub-hop final core",
     CHECK(end == samples.size());
 }
 
+TEST_CASE("Default F0 processing preserves unvoiced consonants and silence",
+          "[bounded-pipeline][dsp][f0][contract]") {
+    TempDirectory directory;
+    REQUIRE(!directory.path().empty());
+    voxmutatio::VCConfig config;
+    std::vector<float> input = {0, 0, 100, 0, 0, 0, 200, 0, 0};
+    std::vector<float> expected = input;
+
+    SECTION("default preserves leading interior and trailing unvoiced frames") {}
+    SECTION("pitch shift changes only voiced frames") {
+        config.f0_up_key = 12;
+        for (auto& value : expected) value *= 2;
+    }
+    SECTION("Web median filter retains unvoiced runs") {
+        config.filter_radius = 3;
+        input = {0, 0, 100, 110, 120, 0, 0, 0, 220, 210, 200, 0, 0};
+        expected = {0, 0, 100, 110, 110, 0, 0, 0, 210, 210, 200, 0, 0};
+    }
+    SECTION("long silence spans spool blocks") {
+        input.assign(40'003, 0);
+        input.front() = 100;
+        input.back() = 200;
+        expected = input;
+    }
+    SECTION("single unvoiced frame") {
+        input = expected = {0};
+    }
+    SECTION("all-unvoiced compatibility interpolation stays silent") {
+        config.interp_unvoiced = true;
+        input = expected = {0, 0, 0, 0};
+    }
+    SECTION("explicit interpolation retains the historical behavior") {
+        config.interp_unvoiced = true;
+        expected = {100, 100, 100, 125, 150, 175, 200, 200, 200};
+    }
+    bounded_io::RawFloatSpool raw, processed;
+    REQUIRE(raw.create(directory.path()));
+    REQUIRE(raw.append(input));
+    std::string error;
+    REQUIRE(bounded_pipeline::process_f0(raw, directory.path(), config, processed, error));
+    INFO(error);
+    require_spool_equals(processed, expected, 1e-5f);
+    require_spool_equals(raw, input, 0.0f);
+}
+
+TEST_CASE("F0 spool creation failure preserves raw input",
+          "[bounded-pipeline][dsp][f0][contract]") {
+    TempDirectory directory;
+    REQUIRE(!directory.path().empty());
+    bounded_io::RawFloatSpool raw, processed;
+    const std::vector<float> input = {0, 120, 0};
+    REQUIRE(raw.create(directory.path()));
+    REQUIRE(raw.append(input));
+    const auto blocked = directory.path() / "not-a-directory";
+    { std::ofstream file(blocked); file << "occupied"; REQUIRE(file.good()); }
+    std::string error;
+    CHECK_FALSE(bounded_pipeline::process_f0(raw, blocked, {}, processed, error));
+    CHECK_FALSE(error.empty());
+    require_spool_equals(raw, input, 0.0f);
+}
+
 TEST_CASE("Bounded quiet planner preserves legacy float-energy tie breaking",
           "[bounded-pipeline][planner][contract]") {
     TempDirectory directory;
@@ -328,7 +388,7 @@ TEST_CASE("Bounded quiet planner preserves legacy float-energy tie breaking",
     CHECK(end == hop);
 }
 
-TEST_CASE("Bounded global RMS writer matches the legacy envelope and PCM rule",
+TEST_CASE("Bounded global RMS writer matches the centered envelope and PCM rule",
           "[bounded-pipeline][dsp][rms][contract]") {
     TempDirectory directory;
     REQUIRE(!directory.path().empty());
@@ -346,7 +406,7 @@ TEST_CASE("Bounded global RMS writer matches the legacy envelope and PCM rule",
             (0.45 - 0.25 * static_cast<double>(index) / output.size()) *
             std::cos(index * 0.019));
     }
-    const auto expected_float = legacy_rms(source, output, 0.35);
+    const auto expected_float = centered_rms(source, output, 0.35);
 
     bounded_io::RawFloatSpool source_spool;
     bounded_io::RawFloatSpool output_spool;
@@ -376,4 +436,62 @@ TEST_CASE("Bounded global RMS writer matches the legacy envelope and PCM rule",
     }
     INFO("maximum_pcm_error=" << maximum_error);
     CHECK(maximum_error == 0.0f);
+}
+
+// Independent librosa 0.11 / torch upstream change_rms values; generator and
+// provenance in dynamics-20261026/operator-goldens.json, not a C++ self-reference.
+TEST_CASE("RMS matches independent centered half-pixel reference", "[bounded-pipeline][dsp][rms][contract]") {
+    TempDirectory directory;
+    std::vector<float> source(32003), output(80007);
+    constexpr float levels1[]={.05f,.4f,.1f,.25f},levels2[]={.3f,.1f,.2f};
+    for(std::size_t i=0;i<source.size();++i)source[i]=levels1[(i/4000)%4];
+    for(std::size_t i=0;i<output.size();++i)output[i]=levels2[(i/7000)%3];
+    constexpr std::array<std::size_t,13> points={0,1,799,800,7999,8000,16000,32767,32768,65535,65536,79999,80006};
+    constexpr std::array<std::array<float,13>,3> expected={{
+    {{3.944427669e-01f,3.944427669e-01f,3.944427669e-01f,3.944427669e-01f,1.314809173e-01f,1.314809173e-01f,2.399103194e-01f,1.118033901e-01f,1.118033901e-01f,2.986869514e-01f,2.986822724e-01f,1.756208092e-01f,1.756208092e-01f}},
+    {{3.439953923e-01f,3.439953923e-01f,3.439953923e-01f,3.439953923e-01f,1.146651283e-01f,1.146651283e-01f,2.190480977e-01f,1.057371274e-01f,1.057371274e-01f,2.993427515e-01f,2.993404269e-01f,1.874144077e-01f,1.874144077e-01f}},
+    {{3.000000119e-01f,3.000000119e-01f,3.000000119e-01f,3.000000119e-01f,1.000000015e-01f,1.000000015e-01f,2.000000030e-01f,1.000000015e-01f,1.000000015e-01f,3.000000119e-01f,3.000000119e-01f,2.000000030e-01f,2.000000030e-01f}}
+    }};
+    for(int mode=0;mode<3;++mode) {
+        const double rate=mode*.5;
+        bounded_io::RawFloatSpool a,b;
+        REQUIRE(a.create(directory.path()));REQUIRE(b.create(directory.path()));
+        REQUIRE(a.append(source));REQUIRE(b.append(output));
+        const auto path=directory.path()/("independent-"+std::to_string(mode)+".wav");
+        bounded_io::AtomicWavStreamWriter writer;
+        REQUIRE(writer.open(path,40000,output.size()));std::string error;
+        REQUIRE(bounded_pipeline::write_global_rms_output(a,b,directory.path(),rate,writer,error));
+        REQUIRE(writer.commit());const auto actual=voxmutatio::io::read_audio(path.string(),40000);
+        REQUIRE(actual);REQUIRE(actual->data.size()==output.size());
+        for(std::size_t i=0;i<points.size();++i) {
+            INFO("rate="<<rate<<" sample="<<points[i]);
+            const auto pcm=static_cast<std::int16_t>(std::clamp(expected[mode][i],-1.f,1.f)*32767.f);
+            CHECK(std::abs(actual->data[points[i]]-float(pcm)/32768.f)<=2.f/32768.f);
+        }
+    }
+}
+
+TEST_CASE("Manual pitch corrections preserve endpoints, UV and unrelated frames", "[bounded][pitch]") {
+    TempDirectory directory;
+    std::vector<float> f0(800, 100.0f);
+    f0[301] = 400; f0[500] = 0;
+    bounded_io::RawFloatSpool raw, processed;
+    REQUIRE(raw.create(directory.path())); REQUIRE(raw.append(f0));
+    voxmutatio::VCConfig config; config.filter_radius = 0;
+    REQUIRE(voxmutatio::parse_pitch_edits("smooth:1:1.12;shift:2:2.06:12", config.pitch_edits));
+    std::string error;
+    REQUIRE(bounded_pipeline::process_f0(raw, directory.path(), config, processed, error, 2, 4));
+    std::vector<float> output; REQUIRE(processed.read(0, f0.size(), output));
+    for (size_t i = 0; i < f0.size(); ++i) {
+        if (i > 300 && i < 312) CHECK(std::abs(output[i] - 100) < 0.001f);
+        else if (i >= 400 && i < 406) CHECK(output[i] == 200);
+        else CHECK(output[i] == f0[i]);
+    }
+    for (const auto text : {"smooth:3:3.12", "smooth:3.95:4.1"}) {
+        REQUIRE(voxmutatio::parse_pitch_edits(text, config.pitch_edits));
+        CHECK_FALSE(bounded_pipeline::process_f0(raw, directory.path(), config, processed, error, 2, 4));
+    }
+    for (const auto text : {"smooth:nan:1", "shift:0:1:25", "smooth:1:0", "smooth:0:3",
+                            "smooth:0:1;smooth:0.5:1.5", "shift:0:1:12;", "smooth:0:1:2"})
+        CHECK_FALSE(voxmutatio::parse_pitch_edits(text, config.pitch_edits));
 }

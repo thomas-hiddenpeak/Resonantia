@@ -18,6 +18,9 @@ struct MelSpecConfig {
   int sample_rate = 40000;
   float fmin = 0.0f;
   float fmax = 0.0f;  // 0 => sample_rate/2
+  // Opt-in RVC training frontend: 40k/2048/400/125, reflect padding,
+  // magnitude sqrt(power+2e-7), log clamp 2e-6. Legacy default is unchanged.
+  bool rvc_profile = false;
 };
 
 /// Differentiable log-mel spectrogram. The Hann window is folded into the

@@ -308,14 +308,20 @@ TEST_CASE("Synthesizer contains representative VITS CUDA failures",
     const std::vector<float> latent(192, 0.0f);
     require_debug_cuda_failure_contained(
         synthesizer, latent, Operation::kAllocation, 1, {1, 0, 0, 0});
-    // conv_pre has input/weight/bias H2D copies followed by one D2H copy. Fail
-    // the fourth copy so the public seam covers the observable readback boundary.
+    // conv_pre owns four tensor buffers plus bounded im2col scratch. Its three
+    // launches are im2col, SGEMM, and bias; readback remains the fourth copy.
     require_debug_cuda_failure_contained(
-        synthesizer, latent, Operation::kCopy, 4, {4, 4, 1, 1});
+        synthesizer, latent, Operation::kAllocation, 5, {5, 3, 0, 0});
     require_debug_cuda_failure_contained(
-        synthesizer, latent, Operation::kLaunch, 1, {4, 3, 1, 0});
+        synthesizer, latent, Operation::kCopy, 4, {5, 4, 3, 3});
     require_debug_cuda_failure_contained(
-        synthesizer, latent, Operation::kSynchronize, 1, {4, 3, 1, 1});
+        synthesizer, latent, Operation::kLaunch, 1, {5, 3, 1, 0});
+    require_debug_cuda_failure_contained(
+        synthesizer, latent, Operation::kSynchronize, 1, {5, 3, 1, 1});
+    require_debug_cuda_failure_contained(
+        synthesizer, latent, Operation::kLaunch, 2, {5, 3, 2, 1});
+    require_debug_cuda_failure_contained(
+        synthesizer, latent, Operation::kSynchronize, 2, {5, 3, 2, 2});
 
     const auto recovered = synthesizer.debug_convpre(latent.data(), 1, 0);
     REQUIRE(recovered.size() == 512);

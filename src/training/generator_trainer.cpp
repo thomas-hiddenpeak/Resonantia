@@ -172,7 +172,9 @@ ag::Tensor GeneratorTrainer::decode(const ag::Tensor& z, const ag::Tensor& har, 
     C = Cout;
     L = Lout;
   }
-  x = ag::leaky_relu(x, 0.1f);
+  // Match GeneratorNSF's final F.leaky_relu(x) default, including its gradient.
+  // Earlier upsampling/residual activations retain their explicit 0.1 slope.
+  x = ag::leaky_relu(x, 0.01f);
   x = ag::conv1d(x, conv_post_w_, ag::Tensor{}, C, L, 1, 7, 1, 3, 1, 1);
   return ag::tanh_op(x);
 }
@@ -258,6 +260,11 @@ bool write_safetensors(const std::string& path, const std::vector<Entry>& entrie
 
 bool GeneratorTrainer::export_model(const std::string& src, const std::string& out) {
   return export_with_weights(src, out, {});
+}
+
+bool detail::write_safetensors_atomic(const std::string& path,
+                                     const std::vector<detail::ExportTensor>& entries) {
+  return write_safetensors(path, entries);
 }
 
 bool GeneratorTrainer::export_with_weights(

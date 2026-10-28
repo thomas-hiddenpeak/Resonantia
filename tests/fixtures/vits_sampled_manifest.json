@@ -1,0 +1,52 @@
+{
+  "seed": 0,
+  "prior_scale": 0.66666,
+  "nsf_voiced_std": 0.003,
+  "nsf_unvoiced_std": 0.03333333333333333,
+  "torch": "2.13.0+cu130",
+  "numpy": "2.2.6",
+  "source": "speech_librispeech.wav / vits_ref_phone.bin / e2e_htk_nsff0.bin",
+  "rng": "SplitMix64 counter hash; 32-bit open uniform midpoints; Box-Muller pairs; frame-major prior index",
+  "weights_sha256": "8792f5dc13bcbf8a5bf0a0890823ec0d5e5cb1102374a3f3a30bf59cf680a2da",
+  "upstream_sha256": "769615b8dbed4775c8083881663a79c0e5ec0b662dd5f0c0a1bc3ccdd9827e99",
+  "outputs": {
+    "vits_sampled_prior_noise.bin": {
+      "shape": [
+        192,
+        584
+      ],
+      "sha256": "b678c70a4e059f4366a4491ed6a890e20d8cef0f5c7122c63aaefc419050a893"
+    },
+    "vits_sampled_nsf_noise.bin": {
+      "shape": [
+        233600
+      ],
+      "sha256": "60cf1fe672f9a9fc3053e3b0f2dbc0b74f4f1214503349c3a383323542f9c1b5"
+    },
+    "vits_sampled_har.bin": {
+      "shape": [
+        233600
+      ],
+      "sha256": "d4217e5d8070b57481dea2bc859670e40fdc2d0eae44cb6f2c22e2f047c46ace"
+    },
+    "vits_sampled_z.bin": {
+      "shape": [
+        192,
+        584
+      ],
+      "sha256": "05114fc490a74e020e4c074be17cd852f46d402265b2c7cec309b197fc9d7d0d"
+    },
+    "vits_sampled_audio.bin": {
+      "shape": [
+        233600
+      ],
+      "sha256": "ac77ad8cc1917030a83398c8735ffc1e87e6cce79e40fdbc2920c0897471bd50"
+    }
+  },
+  "inputs": {
+    "speech_librispeech.wav": "799f78ed4beb4de7ceae3a809262d4ce242394342ccd1d58cef7d49dbc2def46",
+    "vits_ref_phone.bin": "339fc655878c69261e6d52ad758193401b870b13a48069a1c000e4bd9a4eae09",
+    "e2e_htk_nsff0.bin": "d2c6e6037161be766bc0f4787c6aa73409fe1f69e524f3f638d0cbc97da3b68d",
+    "e2e_htk_pitch.bin": "38cb6f513f63b5a95d432a0069ce1d76c370e403cb2f7aa74084a603d81a575d"
+  }
+}

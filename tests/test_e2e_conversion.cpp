@@ -63,8 +63,15 @@ TEST_CASE("End-to-end voice conversion (real audio)", "[e2e][integration]") {
     // Reference-exact mode: the Python reference is a synth-only chain (raw F0,
     // no high-pass, no reflect-pad), so disable the production front-end steps.
     cfg.apply_highpass = false;
-    cfg.interp_unvoiced = false;
+    // Use the production default for F0: preserve the raw unvoiced mask.
     cfg.edge_pad_sec = 0.0;
+
+    std::string reference_path = "../tests/fixtures/vits_sampled_audio.bin";
+    SECTION("Default sampled synthesis") {}
+    SECTION("Explicit legacy mean synthesis") {
+        cfg.synthesis_mode = SynthesisMode::kMean;
+        reference_path = "../tests/fixtures/e2e_htk_audio.bin";
+    }
 
     pipeline::VoiceConversionPipeline pipe;
     REQUIRE(pipe.init(cfg));
@@ -94,8 +101,9 @@ TEST_CASE("End-to-end voice conversion (real audio)", "[e2e][integration]") {
     }
 
     // Compare against Python RVC reference waveform
-    auto ref = load_bin1d("../tests/fixtures/vits_ref_audio.bin");
+    auto ref = load_bin1d(reference_path);
     REQUIRE(!ref.empty());
+    REQUIRE(result.audio.data.size() == ref.size());
     std::cout << "Reference: " << ref.size() << " samples" << std::endl;
 
     double corr = correlation(result.audio.data, ref);

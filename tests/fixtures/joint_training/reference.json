@@ -1,0 +1,38 @@
+{
+  "frames": 128,
+  "source_start_frame": 200,
+  "crop_start": 48,
+  "crop_frames": 32,
+  "losses": {
+    "d": 4.083311557769775,
+    "g": 43.96340560913086,
+    "mel": 0.5214394927024841,
+    "kl": 2.7040250301361084,
+    "fm": 13.697091102600098,
+    "adv": 4.097509860992432
+  },
+  "model_sha256": {
+    "/home/rm01/Resonantia/models/pretrained_v2/pretrained_v2/f0G40k.safetensors": "8792f5dc13bcbf8a5bf0a0890823ec0d5e5cb1102374a3f3a30bf59cf680a2da",
+    "/home/rm01/Resonantia/models/pretrained_v2/pretrained_v2/f0D40k.safetensors": "d6c1e43d9ddbb882deae8b0e9ea7c26081e470853e875bc67ba4963736465ac5"
+  },
+  "source_sha256": "f75033aa168b7027a6adf194b0df34d82a934c1ece6dd7abb1200a67084f5538",
+  "torch": "2.13.0+cu130",
+  "threads": 2,
+  "device": "cpu",
+  "learning_rate": 0.0001,
+  "betas": [
+    0.8,
+    0.99
+  ],
+  "eps": 1e-09,
+  "weight_decay": 0.01,
+  "speaker": 0,
+  "updates": 1,
+  "limits": "One real short phrase numerical fixture; no naturalness or timbre acceptance",
+  "upstream_sha256": {
+    "infer/module/models.py": "769615b8dbed4775c8083881663a79c0e5ec0b662dd5f0c0a1bc3ccdd9827e99",
+    "infer/module/attentions.py": "8820e6047353d99344fc73fbb6c69d85e4f61066fc498982cc895e9577d4519f",
+    "train/losses.py": "6eb912eb073b44cf624bac90cced3ff8fa21a3ed1eb5022d0c7d8fefbe1cd075",
+    "train/mel_processing.py": "de0d14c7ddd111334e152363e584c66538de881bf9164d9551e6198f9a3575f9"
+  }
+}

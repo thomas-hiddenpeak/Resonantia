@@ -35,6 +35,9 @@ float mel_to_hz(float mel) {
 }  // namespace
 
 MelLoss::MelLoss(const MelSpecConfig& cfg) : cfg_(cfg) {
+  if (cfg.rvc_profile && (cfg.n_fft != 2048 || cfg.hop != 400 || cfg.n_mels != 125 ||
+      cfg.sample_rate != 40000 || cfg.fmin != 0 || (cfg.fmax != 0 && cfg.fmax != 20000)))
+    throw std::invalid_argument("RVC mel profile requires 40k/2048/400/125 and the full frequency band");
   const double nyquist = static_cast<double>(cfg.sample_rate) / 2;
   const double upper = cfg.fmax == 0 ? nyquist : cfg.fmax;
   if (cfg.n_fft <= 1 || cfg.hop <= 0 || cfg.n_mels <= 0 || cfg.sample_rate <= 0 ||
@@ -57,9 +60,15 @@ MelLoss::MelLoss(const MelSpecConfig& cfg) : cfg_(cfg) {
   std::vector<float> cosw(N * F), sinw(N * F);
   for (int n = 0; n < N; ++n) {
     for (int f = 0; f < F; ++f) {
-      float ang = 2.0f * M_PI * f * n / N;
-      cosw[n * F + f] = window[n] * std::cos(ang);
-      sinw[n * F + f] = -window[n] * std::sin(ang);
+      if (cfg.rvc_profile) {
+        const double ang = 2.0 * M_PI * f * n / N;
+        cosw[n * F + f] = window[n] * std::cos(ang);
+        sinw[n * F + f] = -window[n] * std::sin(ang);
+      } else {
+        float ang = 2.0f * M_PI * f * n / N;
+        cosw[n * F + f] = window[n] * std::cos(ang);
+        sinw[n * F + f] = -window[n] * std::sin(ang);
+      }
     }
   }
   cosw_ = ag::Tensor::from_host(cosw, {N, F}, false);
@@ -91,10 +100,33 @@ MelLoss::MelLoss(const MelSpecConfig& cfg) : cfg_(cfg) {
     }
   }
   mel_basis_t_ = ag::Tensor::from_host(mel_t, {F, M}, false);
+  if (cfg.rvc_profile) {
+    // librosa's Slaney bank computes the frequency geometry in float64.
+    const auto hz = [](double m) {
+      return m < 15.0 ? m*(200.0/3.0) : 1000.0*std::exp(std::log(6.4)/27.0*(m-15.0));
+    };
+    const double max_mel = 15.0+std::log(20000.0/1000.0)/(std::log(6.4)/27.0);
+    std::vector<double> bands(M+2);
+    for (int i=0;i<M+2;++i) bands[i]=hz(max_mel*i/(M+1));
+    for (int f=0;f<F;++f) for (int m=0;m<M;++m) {
+      const double freq=40000.0*f/N;
+      const double tri=std::max(0.0,std::min((freq-bands[m])/(bands[m+1]-bands[m]),
+                                          (bands[m+2]-freq)/(bands[m+2]-bands[m+1])));
+      // librosa casts triangles to F32 before applying area normalization.
+      mel_t[f*M+m]=static_cast<float>(tri)*(2.0/(bands[m+2]-bands[m]));
+    }
+    mel_basis_t_=ag::Tensor::from_host(mel_t,{F,M},false);
+  }
 }
 
 int MelLoss::num_frames(int L) const {
   if (L < 0) throw std::invalid_argument("mel input length must be nonnegative");
+  if (cfg_.rvc_profile) {
+    const int pad=(cfg_.n_fft-cfg_.hop)/2;
+    if (L <= pad || L > std::numeric_limits<int>::max()-2*pad)
+      throw std::invalid_argument("RVC mel input must exceed reflect padding and fit kernel limits");
+    return 1+(L+2*pad-cfg_.n_fft)/cfg_.hop;
+  }
   if (L < cfg_.n_fft) return 0;
   return (L - cfg_.n_fft) / cfg_.hop + 1;
 }
@@ -105,13 +137,25 @@ ag::Tensor MelLoss::log_mel(const ag::Tensor& audio, int L) const {
       T > std::numeric_limits<int>::max() / cfg_.n_mels ||
       !audio.n || audio.shape() != std::vector<int>{1, L})
     throw std::invalid_argument("mel audio must have shape [1, L] and at least one frame");
-  auto frames = ag::frame(audio, T, cfg_.n_fft, cfg_.hop);   // [T, n_fft]
+  auto padded = audio;
+  if (cfg_.rvc_profile) {
+    const int pad=(cfg_.n_fft-cfg_.hop)/2;
+    std::vector<int> indices(L+2*pad);
+    for (int i=0;i<L+2*pad;++i) {
+      const int pos=i-pad;
+      indices[i]=pos<0 ? -pos : (pos>=L ? 2*L-2-pos : pos);
+    }
+    padded=ag::reshape(ag::embedding(ag::reshape(audio,{L,1}),indices,1),{1,L+2*pad});
+  }
+  auto frames = ag::frame(padded, T, cfg_.n_fft, cfg_.hop);   // [T, n_fft]
   auto re = ag::matmul(frames, cosw_);                       // [T, F]
   auto im = ag::matmul(frames, sinw_);                       // [T, F]
   auto power = ag::add(ag::mul(re, re), ag::mul(im, im));    // [T, F]
+  if (cfg_.rvc_profile)
+    power=ag::add(power,ag::Tensor::from_host(std::vector<float>(power.numel(),2e-7f),power.shape()));
   auto mag = ag::sqrt_op(power);                             // [T, F]
   auto mel = ag::matmul(mag, mel_basis_t_);                  // [T, n_mels]
-  return ag::log_op(mel);                                    // [T, n_mels]
+  return ag::log_op(cfg_.rvc_profile ? ag::clamp_min(mel,2e-6f) : mel);
 }
 
 std::vector<float> MelLoss::target_log_mel(const float* audio, int L,

@@ -63,6 +63,9 @@ test_audio/
 # Logs
 *.log
 
+# Browser tests only; the WebUI has no npm build/runtime dependency.
+tests/browser/node_modules/
+
 # Temporary files
 tmp/
 temp/
