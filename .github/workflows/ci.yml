@@ -89,7 +89,9 @@ jobs:
           node tests/test_web_joint_ui.cjs
           node tests/test_web_train_cancel_ui.cjs
       - name: Audit studio workflows and accessibility in Chromium
-        run: node tests/run_web_studio_browser.cjs
+        run: |
+          node tests/run_web_studio_browser.cjs
+          node tests/test_web_task_center_browser.cjs
 
   cuda-build-and-contract-tests:
     # Never scheduled by a push or PR. Readiness stays unset until a maintainer

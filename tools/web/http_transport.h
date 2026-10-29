@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -36,6 +37,7 @@ struct Request {
     std::string query;
     std::string content_type;
     std::string authorization;
+    std::string range;
     std::string body;
 
     // Internal transport hook: records the aggregate body reservation so its
@@ -82,6 +84,9 @@ private:
 void send_response(int fd, int status, const char* text, const std::string& content_type,
                    const std::string& body, const std::string& extra_headers = "");
 void send_json(int fd, const std::string& json);
+// Regular immutable task artifacts only. Sends bounded 64 KiB blocks and one
+// optional byte range; malformed/unsatisfiable ranges return 416, never full audio.
+void send_audio_file(int fd, const std::filesystem::path& path, const std::string& range);
 
 // Parses multipart/form-data and emits the same HTTP error contract used by all
 // upload routes. The returned Part views own their strings independently.

@@ -99,6 +99,7 @@
             <path d="M12 4v16m4-16 5 15" /></svg
           ><span>声线库</span>
         </button>
+        <button id="nav-tasks" class="tab-btn" data-tab="tasks" role="tab" aria-controls="panel-tasks" aria-selected="false" tabindex="-1"><span>任务中心</span></button>
       </nav>
       <div class="sidebar-note">
         <span class="eyebrow">为表达，留住细节</span>
@@ -228,6 +229,7 @@
                   </button>
                 </div>
                 <p class="field-status" id="convUploadStatus" role="status"></p>
+                <div id="revisionNotice" class="task-revision-notice" hidden><p id="revisionDescription"></p><button id="revisionParent" class="btn-small" type="button">查看原任务与结果</button><p class="hint">沿用原素材和输入类型，提交后保存为新版。变调、检索、保护等变化只重做转换；清理设置变化会重做清理及后续处理。实际复用情况记录在任务中。</p></div>
                 <button id="convRetryUpload" class="btn-secondary" hidden>
                   重试上传
                 </button>
@@ -403,8 +405,8 @@
                 <div class="param-group">
                   <label for="outputKind">想获得什么？</label
                   ><select id="outputKind">
-                    <option value="mix">完整翻唱 · 保留原伴奏</option>
-                    <option value="vocal">仅转换后的人声</option>
+                    <option value="mix">完整翻唱 + 干净人声（默认）</option>
+                    <option value="vocal">仅干净人声（不合成伴奏）</option>
                   </select>
                 </div>
                 <label class="check optional-cleanup"
@@ -429,6 +431,7 @@
                     <path d="M5 12h14m-6-6 6 6-6 6" />
                   </svg>
                 </button>
+                <button id="btnPreprocess" class="btn-secondary" type="button" disabled>只清理人声，先听效果</button><p class="hint">清理结果会单独保存在任务中心，可暂停和继续，不会替换当前上传音频。</p>
                 <p id="conversionReadiness" class="readiness" role="status">
                   上传一份音频后即可开始。
                 </p>
@@ -661,7 +664,8 @@
                   <p class="hint">
                     歌曲先分离人声，再去和声。有混响时再试去混响，逐步听审厚度与尾音。粤语和串烧可用，重点是同一歌手且没有重叠人声。
                   </p>
-                  <div class="cascade" id="trainCascade"></div>
+                  <div id="trainAutomaticCleanup"><p>随完整训练自动清理，过程与保存点统一保留：</p><div class="param-group check-inline"><label class="check"><input id="trainAutoSeparate" type="checkbox" /> 分离人声</label><label class="check"><input id="trainAutoDeharmony" type="checkbox" /> 去和声</label><label class="check"><input id="trainAutoDereverb" type="checkbox" /> 去混响</label></div><p id="trainAutomaticHint" class="hint">只勾选素材确实需要的处理；单人干声可全部跳过。</p></div>
+                  <p class="hint">也可逐步清理并听审。独立步骤保留历史，但暂不提供分块继续；长任务建议使用上方自动清理。</p><div class="cascade" id="trainCascade"></div>
                   <div class="param-group check-inline">
                     <label class="check"
                       ><input type="checkbox" id="recVad" />
@@ -905,6 +909,31 @@
             <p id="publishStatus" class="hint" role="status"></p>
           </section>
         </div>
+        <section id="panel-tasks" class="tab-panel" role="tabpanel" aria-labelledby="nav-tasks" hidden>
+          <div class="page-heading"><div><span class="eyebrow">进度与结果，随时回来查看</span><h1>任务中心</h1><p>关闭页面后任务继续。重新打开这里，可以找回进展、日志与结果。</p></div><span class="page-number">04 / 任务</span></div>
+          <div class="task-toolbar"><p id="taskConnection" role="status">正在读取后台状态…</p><button id="taskRefresh" class="btn-secondary" type="button">刷新 / 重连</button></div>
+          <div id="taskActive" class="task-toolbar" hidden><span id="taskActiveName"></span><button id="taskActiveOpen" class="btn-secondary" type="button">查看正在运行的任务</button></div>
+          <p id="taskStorage" class="hint">正在读取磁盘信息…</p><p id="taskStorageWarning" class="task-error" role="status" hidden></p>
+          <details class="task-storage-policy"><summary>保留与磁盘保护规则</summary><p>原始素材、结果、日志、训练保存点和候选不会自动删除。成功任务可清理冗余模型与重复音频副本；暂停、失败和中断的任务保留恢复内容。</p><p>任务文件大小合计上限 64 GiB，单任务 24 GiB，磁盘预留 8 GiB。到达保护线后，可恢复任务在安全保存点暂停；临时写入可能短时超过保护线。</p></details>
+          <p id="taskPending" class="hint" role="status" hidden></p><button id="taskRetrySubmission" class="btn-secondary" type="button" hidden>核实并重试未确认的提交（沿用原编号）</button>
+          <div class="task-workspace">
+            <aside class="task-history" aria-label="任务历史"><h2>最近任务</h2><p id="taskEmpty">暂无任务。先上传音频或建立训练。</p><ul id="taskList"></ul><div class="task-pagination"><button id="taskPrevious" class="btn-small" type="button">上一页</button><span id="taskPage">第 1 页</span><button id="taskNext" class="btn-small" type="button">下一页</button></div></aside>
+            <article id="taskDetail" class="task-detail" aria-labelledby="taskName" hidden>
+              <p id="taskStateLabel" class="eyebrow"></p><h2 id="taskName"></h2><button id="taskRename" class="text-button" type="button">重命名</button><p id="taskId" class="hint"></p>
+              <form id="taskRenameForm" class="task-rename" hidden><label for="taskRenameInput">任务名称</label><input id="taskRenameInput" type="text" maxlength="255" required aria-describedby="taskRenameHint" /><p id="taskRenameHint" class="hint">只修改显示名称，不影响素材、声线或任务进度。最多 255 字节，约 85 个汉字。</p><div class="task-actions"><button id="taskRenameSave" class="btn-secondary" type="submit">保存名称</button><button id="taskRenameCancel" class="text-button" type="button">取消</button></div><p id="taskRenameMessage" role="status"></p></form>
+              <h3 id="taskStage"></h3><p id="taskCounter"></p><progress id="taskProgress" aria-label="当前阶段进度" max="1" value="0"></progress>
+              <p id="taskTimes" class="hint"></p><p id="taskFreshness" class="hint"></p><p id="taskError" class="task-error" hidden></p><p id="taskRecovery"></p>
+              <div class="task-actions"><button id="taskPause" class="btn-secondary" type="button" hidden>安全暂停</button><button id="taskResume" class="btn-convert" type="button" hidden>继续此任务</button><button id="taskLegacyCancel" class="btn-secondary" type="button" hidden>停止训练（不支持完整续训）</button><button id="taskRevise" class="btn-secondary" type="button" hidden>调整参数再生成</button><button id="taskParent" class="btn-secondary" type="button" hidden>查看原版</button><button id="taskLibrary" class="btn-secondary" type="button" hidden>前往声线库</button><button id="taskCleanup" class="btn-secondary" type="button" hidden>清理冗余副本</button><button id="taskListen" class="btn-convert" type="button" hidden>载入试听与下载</button></div>
+              <p id="taskRetention" class="hint"></p><p id="taskActionMessage" role="status"></p>
+              <section id="taskResults" aria-label="已保存的音频" hidden><p id="taskOutputsNotice" class="hint" role="status" hidden></p><div class="task-audio-results">
+                <section id="taskPrimaryCard" class="task-audio-card" aria-labelledby="taskPrimaryTitle"><h3 id="taskPrimaryTitle">处理后音频</h3><p id="taskPrimaryHint" class="hint"></p><audio id="taskAudio" controls preload="metadata" aria-label="已保存的任务音频"></audio><button id="taskLoadPrimary" class="btn-secondary" type="button" hidden>载入音频</button><a id="taskDownload" class="text-button" download hidden>下载 WAV</a><p id="taskPrimaryMessage" class="hint" role="status"></p></section>
+                <section id="taskVocalCard" class="task-audio-card" aria-labelledby="taskVocalTitle" hidden><h3 id="taskVocalTitle">干净人声</h3><p class="hint">转换后的目标声线，不含伴奏。</p><audio id="taskVocalAudio" controls preload="metadata" aria-label="干净人声"></audio><button id="taskLoadVocal" class="btn-secondary" type="button" hidden>载入人声</button><a id="taskVocalDownload" class="text-button" download hidden>下载人声 WAV</a><p id="taskVocalMessage" class="hint" role="status"></p></section>
+              </div></section>
+              <details><summary>本次设置</summary><dl id="taskRecipe" class="task-recipe"></dl></details>
+              <details id="taskLogDetails"><summary>后台日志（最近部分）</summary><pre id="taskLog" tabindex="0" aria-label="后台日志">展开后读取</pre></details>
+            </article>
+          </div>
+        </section>
       </main>
       <footer>Resonantia <span>声音的质感，来自每一步的认真。</span></footer>
     </div>
@@ -925,6 +954,7 @@
         </div>
       </form>
     </dialog>
+    <script src="tasks.js"></script>
     <script src="app.js"></script>
     <script src="workflows.js"></script>
     <script src="studio.js"></script>

@@ -131,6 +131,9 @@ struct VCResult {
     double synth_ms = 0.0;              // synthesizer time
     double total_ms = 0.0;              // total pipeline time
     bool success = false;
+    // Only bounded conversion with an explicit checkpoint can pause. A pause
+    // publishes no output; success stays false and committed blocks survive.
+    bool paused = false;
     std::string error_message;
 };
 

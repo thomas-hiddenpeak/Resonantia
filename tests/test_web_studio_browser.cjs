@@ -25,6 +25,7 @@ const fs = require("node:fs"),
     let uploadFails = false,
       convertFails = false,
       convertCount = 0,
+      preprocessCount = 0,
       trainCount = 0;
     let releaseConversion = null,
       holdConversion = false,
@@ -41,6 +42,7 @@ const fs = require("node:fs"),
       result_ready: true,
       candidates: ["candidate_epoch_0000000200.safetensors"],
     };
+    const taskRecords = new Map();
     let runs = [run],
       trainingStatus = {
         name: "",
@@ -58,6 +60,17 @@ const fs = require("node:fs"),
           contentType: "application/json",
           body: JSON.stringify(body),
         });
+      if (p === '/api/tasks') return json({tasks:[...taskRecords.values()],active_id:[...taskRecords.values()].find(r=>r.state==='running')?.id || ''});
+      if (p === '/api/storage') return json({managed_bytes:0,available_bytes:107374182400,managed_limit_bytes:68719476736,task_limit_bytes:25769803776,reserve_bytes:8589934592,retained_tasks:taskRecords.size,history_tasks:taskRecords.size,retained_limit:256,history_limit:4096,reason:''});
+      if (p === '/api/task') return taskRecords.has(url.searchParams.get('id')) ? json(taskRecords.get(url.searchParams.get('id'))) : json({error:'missing'},404);
+      if (p === '/api/task/log') return route.fulfill({status:200,body:'retained fixture log'});
+      if (p === '/api/task/result') {
+        const range=/^bytes=(\d+)-(\d*)$/.exec(route.request().headers().range || '');
+        const start=range?Number(range[1]):0,end=range&&range[2]?Math.min(Number(range[2]),wav.length-1):wav.length-1;
+        const headers={'Accept-Ranges':'bytes','Content-Length':String(end-start+1)};
+        if(range)headers['Content-Range']=`bytes ${start}-${end}/${wav.length}`;
+        return route.fulfill({status:range?206:200,contentType:'audio/wav',headers,body:wav.subarray(start,end+1)});
+      }
       if (p === "/api/voices") return json(voices);
       if (p === "/api/sep-models") return json({});
       if (p === "/api/train/runs") return json({ runs });
@@ -75,16 +88,19 @@ const fs = require("node:fs"),
           contentType: "audio/wav",
           body: wav,
         });
-      if (p === "/api/convert") {
-        convertCount++;
+      if (p === "/api/tasks/convert" || p === '/api/tasks/preprocess') {
+        const preprocessing=p==='/api/tasks/preprocess';
+        if(preprocessing)preprocessCount++;else convertCount++;
         lastBody = route.request().postData();
         if (holdConversion) await new Promise((r) => (releaseConversion = r));
-        return convertFails
-          ? json({ error: "设备正在处理另一个任务" }, 409)
-          : route.fulfill({ status: 200, contentType: "audio/wav", body: wav });
+        if(convertFails)return json({error:'设备正在处理另一个任务'},409);
+        const id=/name="task_id"\r\n\r\n([^\r]+)/.exec(lastBody)[1];
+        taskRecords.set(id,{id,name:'试听.wav',kind:preprocessing?'preprocess':'convert',state:'succeeded',stage:'done',attempt:1,completed:1,total:1,unit:'files',created_ms:Date.now(),finished_ms:Date.now(),parameters:{},actions:{},result_url:'/api/task/result?id='+id});
+        return json({task_id:id},202);
       }
       if (p === "/api/train") {
         trainCount++;
+        assert.match(route.request().postData(),/name="dereverb"\r\n\r\n1\r\n/,'automatic cleanup recipe was not submitted with training');
         return json({ error: "测试拒绝启动训练" }, 409);
       }
       throw new Error("Unexpected API call: " + p);
@@ -185,11 +201,13 @@ const fs = require("node:fs"),
     await page.waitForFunction(
       () => !document.querySelector("#btnConvert").disabled,
     );
+    await page.locator('#nav-convert').click();
     assert.match(await page.locator("#convInfo").textContent(), /设备正在/);
     assert(!(await page.locator("#resultSection").isVisible()));
     holdConversion = false;
     convertFails = false;
     await page.locator("#btnConvert").click();
+    await page.locator('#nav-convert').click();
     await page.locator("#resultSection").waitFor({ state: "visible" });
     assert.equal(convertCount, 2);
     assert(lastBody.includes("Tom_Cybersinger"));
@@ -201,6 +219,7 @@ const fs = require("node:fs"),
       () => document.querySelector("#resultAudio").readyState >= 1,
     );
     await page.locator("#resultAudio").evaluate((el) => (el.currentTime = 0.5));
+    await page.waitForFunction(()=>Math.abs(document.getElementById('resultAudio').currentTime-0.5)<0.1);
     await page.locator("#compareOriginal").click();
     assert.equal(
       await page.locator("#compareOriginal").getAttribute("aria-pressed"),
@@ -216,6 +235,9 @@ const fs = require("node:fs"),
       await page.locator("#compareConverted").getAttribute("aria-pressed"),
       "true",
     );
+    await page.locator('#btnPreprocess').click();await page.locator('#taskStateLabel').filter({hasText:'已完成'}).waitFor();
+    assert.equal(preprocessCount,1);assert.equal(convertCount,2,'cleanup must not synthesize a voice');
+    await page.locator('#nav-convert').click();
     await page.locator("#inputKind").selectOption("dry");
     assert(await page.locator("#resultStale").isVisible());
     await page.locator("#addPitchEdit").evaluate(el=>el.closest('details').open=true);
@@ -247,6 +269,8 @@ const fs = require("node:fs"),
     await page.waitForFunction(
       () => !document.querySelector("#btnTrain").disabled,
     );
+    await page.locator('#trainAutoDereverb').evaluate(el=>el.closest('details').open=true);
+    await page.locator('#trainAutoDereverb').check();
     await page.locator("#btnTrain").click();
     await page.locator("#trainingConfirm").waitFor({ state: "visible" });
     await accessibility("training confirmation");
@@ -318,15 +342,17 @@ const fs = require("node:fs"),
       stage: "training",
       log: "joint-full step=20/100 epoch=2",
     };
+    taskRecords.set('active-test',{id:'active-test',name:'Studio_Active',kind:'training',state:'running',stage:'training',phase:'training',attempt:1,completed:20,total:100,unit:'steps',created_ms:Date.now(),parameters:{recovery:'training-full-v1'},actions:{pause:true,resume:false}});
     await page.reload();
+    await page.locator('#nav-tasks').click();
+    await page.evaluate(()=>globalThis.resonantiaTasks.open('active-test'));
+    await page.locator('#taskCounter').filter({hasText:'20 / 100'}).waitFor();
+    assert(!(await page.locator('#taskPause').isDisabled()));
     await page.locator('[data-tab="train"]').click();
-    await page.waitForFunction(() =>
-      document.querySelector("#trainStage").textContent.includes("20/100"),
-    );
     assert(await page.locator("#voiceName").isDisabled());
     assert(await page.locator("#trainFileInput").isDisabled());
     assert(await page.locator("#btnTrain").isDisabled());
-    assert(!(await page.locator("#btnCancelTrain").isDisabled()));
+
     assert.deepEqual(errors, []);
     fs.writeFileSync(
       path.join(out, "result.json"),

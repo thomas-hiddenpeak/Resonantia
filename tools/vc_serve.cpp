@@ -98,6 +98,8 @@ bool resolve_paths(const StartupConfig& config, resonantia::web::Paths& paths) {
     paths.models = paths.repo + "/models";
     paths.build = paths.repo + "/build";
     paths.runs = paths.repo + "/runs";
+    paths.tasks = paths.runs + "/.web_tasks";
+    paths.enforce_task_storage = true;
     paths.hubert = paths.models + "/hubert_base/model.safetensors";
     paths.rmvpe = paths.models + "/rmvpe.safetensors";
     paths.gmodel = paths.models + "/pretrained_v2/pretrained_v2/f0G40k.safetensors";

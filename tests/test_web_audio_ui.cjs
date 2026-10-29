@@ -31,10 +31,11 @@ function harness() {
         setTimeout:()=>1,clearTimeout(){},setInterval:()=>1,clearInterval(){}, Audio:element,
         FormData:class{values=[];append(...args){this.values.push(args);}},
         apiFetch:async(url,options)=>{calls.push({url,options});assert(replies.length,'unexpected upload');return await replies.shift();},
+        resonantiaTasks:{isBusy:()=>false,observe(){},get(){},async submit(url,body){calls.push({url,options:{body}});assert(replies.length,'unexpected task');const r=await replies.shift();if(!r.ok)throw new Error(r.error);return 'audio-fixture';}},
         auditionSnapshot:async()=>true,setConn(){},errText:async r=>r.error,alert:m=>alerts.push(m)});
     const shared=source.slice(source.indexOf('// ---------- Audio uploads ----------'),source.indexOf('// ---------- Training job controls ----------'));
     const convert=source.slice(source.indexOf('// ---------- Convert ----------'),source.indexOf('const bind ='));
-    const conversion=source.slice(source.indexOf("$('btnConvert').addEventListener"),source.indexOf('// initial'));
+    const conversion=source.slice(source.indexOf("let localConversion = null;"),source.indexOf('// initial'));
     vm.runInContext(shared+convert+conversion,context);
     return {$,calls,replies,alerts,trainCascade,convCascade,run:s=>vm.runInContext(s,context)};
 }

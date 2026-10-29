@@ -248,3 +248,31 @@ joint-full扩展在完整更新边界保存FR-011恢复状态，原profile语义
 普通异常退出边界：`tools/vc_train.cpp`捕获options/parse/run期间的标准/未知C++异常，
 普通栈展开后返回1；异常诊断失败也保持1，不覆盖正常0/取消2。`test_vc_train_entry`
 以生产main+host替身验证此契约，不宣称覆盖noexcept析构异常、崩溃或致命GPU故障的清理。
+
+### 2026-10-29 Web训练进度迁移（实施中）
+
+依据[ADR-0010](../../docs/adr/0010-durable-web-task-lifecycle.md)，vc_train显式`--progress`
+输出已完成缓存文件与完整训练迭代计数。joint-full已恢复step必须从checkpoint真实值开始，
+不归零冒充新训练；旧模式也只在整个训练迭代完成后报告。此增量不改变optimizer/RNG/学习率/
+checkpoint语义；暂停与继续沿用完整状态门禁，不能把推理G当断点。
+
+训练素材清理的`vc_preprocess`可显式启用Spec004的CLI分块checkpoint，保存各文件/阶段的
+Roformer窗口；它不是训练optimizer/RNG状态，也不赋予旧decoder/gan/joint模式等价续训能力。
+Web训练编排独立保存素材/G/D副本及配方/程序身份，复用已验证的固定切片和joint-full完整
+checkpoint；完成G/Index分别留存，索引失败不重训。控制协议及旧作业导入边界见
+[Spec003](../003-webui/spec.md#任务控制与完整训练恢复接口)。原训练数值/更新顺序未改变，
+native清理恢复、Web编排host测试、真实训练恢复和浏览器验收分别记录，不相互代替。
+
+初始化恢复显式使用`--resume-initial`，与完整`--resume`互斥。持有目录锁并验证身份后，
+只清理已知初始临时写入，不接受已经存在完整状态、未知文件或链接的目录。
+Web完成训练后，即使最终轮不在CLI周期导出间隔内，也把已验证的最终推理G保存为该轮候选；
+不把optimizer checkpoint当候选，不覆盖冲突的既有候选，不自动发布。
+
+Web更新兼容修复将训练外层及嵌套切片身份改为显式编排协议，仍核验全部数据/配方/计算程序。
+两个已审计旧Web版本须按同一旧版本嵌套摘要精确匹配，不改写原标记，不改变CLI完整恢复点。
+本次仅验证身份/编排与迁移契约，未追加训练数值实验或长训练；见
+[Spec003兼容契约](../003-webui/spec.md#2026-10-29-web更新后的身份兼容修复)。
+
+任务重命名仅保存`display_name`元数据，训练目录/声线标识仍使用原`name`；完整训练身份明确排除
+显示名称，暂停后的改名不得使恢复配方失效。Web训练/推理任务共用显示名称接口，见
+[Spec003任务名称契约](../003-webui/spec.md#web-fr-014任务显示名称与双音频结果2026-10-29)。

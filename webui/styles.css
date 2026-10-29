@@ -1602,3 +1602,29 @@ dialog p {
 #regeneratePitch {
   margin-top: 15px;
 }
+
+/* Durable task history and stage monitoring. */
+.task-toolbar, .task-actions, .task-pagination { display:flex;align-items:center;gap:12px;flex-wrap:wrap; }
+.task-toolbar { justify-content:space-between;margin:0 0 24px; }
+.task-workspace { display:grid;grid-template-columns:minmax(220px,0.8fr) minmax(0,1.6fr);gap:24px;align-items:start; }
+.task-history,.task-detail { min-width:0;border:1px solid var(--border);border-radius:12px;padding:24px;background:var(--surface); }
+.task-history h2 { margin:0 0 16px; }.task-history ul { margin:0;padding:0;list-style:none; }
+.task-row { width:100%;text-align:left;padding:14px 12px;margin-bottom:8px;border:1px solid var(--border);border-radius:8px;background:transparent;color:inherit;cursor:pointer; }
+.task-row[aria-pressed="true"] { border-color:var(--accent);background:rgba(175,100,50,.08); }
+.task-row strong,.task-row span { display:block;overflow-wrap:anywhere; }.task-row span { margin-top:8px;font-size:12px;line-height:1.6; }
+.task-detail h2,.task-detail p,#taskPending { overflow-wrap:anywhere; }.task-detail p { line-height:1.8; }
+.task-detail progress { width:100%;accent-color:var(--accent);height:12px; }.task-detail details { margin-top:20px; }
+.task-detail summary { cursor:pointer;padding:8px 0; }.task-detail pre { white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow:auto;font-size:12px;line-height:1.6;background:#f0ece5;color:#292923;padding:16px;border-radius:8px; }
+.task-detail audio { width:100%;margin:12px 0; }.task-error { color:#9b2525; }.task-recipe { display:grid;grid-template-columns:auto 1fr;gap:8px 20px; }.task-recipe dd { margin:0;overflow-wrap:anywhere; }
+.task-audio-results { display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:16px;margin:20px 0; }
+.task-audio-card { min-width:0;padding:18px;border:1px solid var(--border);border-radius:10px; }
+.task-audio-card h3 { margin-top:0; }.task-audio-card a { display:inline-block;margin-top:10px; }
+.task-rename { margin:16px 0;padding:16px;border:1px solid var(--border);border-radius:8px; }
+.task-rename input { box-sizing:border-box;max-width:100%;width:100%;margin:8px 0; }
+.task-pagination { margin-top:18px;justify-content:space-between;font-size:12px; }#taskConnection[data-connected="false"] { color:#9b2525; }
+@media(max-width:850px) { .task-workspace { grid-template-columns:minmax(0,1fr); }.task-history,.task-detail { padding:18px; }.task-history ul { max-height:290px;overflow:auto; } }
+@media(max-width:480px) { .tab-btn .icon { display:none; }.tab-btn { font-size:11px;gap:2px; }.task-actions > button { width:100%; } }
+
+.task-storage-policy { margin:12px 0 24px; }.task-storage-policy p { line-height:1.8; } #taskActiveName { overflow-wrap:anywhere;min-width:0;max-width:100%; }
+
+.task-revision-notice { padding: 1rem; margin: 1rem 0; border: 1px solid var(--border); border-radius: 12px; overflow-wrap: anywhere; }

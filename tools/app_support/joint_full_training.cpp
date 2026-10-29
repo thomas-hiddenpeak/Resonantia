@@ -1,6 +1,8 @@
+#include "tools/app_support/progress_protocol.h"
 // Copyright 2026 Resonantia Authors. Licensed under the MIT License.
 #include "tools/app_support/joint_full_training.h"
 #include "tools/app_support/joint_feature_cache.h"
+#include "tools/app_support/joint_initialization.h"
 #include "src/io/bounded_audio_io.h"
 #include "src/training/joint_features.h"
 #include "voxmutatio/content/hubert_encoder.h"
@@ -94,7 +96,7 @@ int run_full_joint_training(const VcTrainOptions& o,resonantia::training_control
   using namespace resonantia::training_control;
   if(!o.gan_mode||o.gan_profile!="joint-full"||o.epochs<1||o.epochs>2000||o.segment_frames!=32||
       o.synthesis_mode!=SynthesisMode::kSampled||o.cache_dir.empty()||o.checkpoint_dir.empty()||
-      o.speaker<0||o.speaker>108)
+      o.speaker<0||o.speaker>108||(o.resume_initial&&!o.resume_path.empty()))
     throw std::invalid_argument("invalid joint-full options");
   // Validate all audio metadata and recipe bounds before CUDA/model work.
   std::vector<fs::path> files;
@@ -113,11 +115,13 @@ int run_full_joint_training(const VcTrainOptions& o,resonantia::training_control
   for(const auto& file:files){io::detail::WavChunkReader reader;if(!reader.open(file))throw std::runtime_error("cannot read joint-full WAV: "+file.string());validate_audio(reader.metadata());}
   const fs::path state_dir=o.checkpoint_dir,cache_dir=o.cache_dir;
   RunLock lock(state_dir);
-  if(o.resume_path.empty())for(const auto& entry:fs::directory_iterator(state_dir))
+  if(o.resume_initial)validate_initial_training_directory(state_dir);
+  else if(o.resume_path.empty())for(const auto& entry:fs::directory_iterator(state_dir))
     if(entry.path().filename()!=".lock")throw std::invalid_argument("checkpoint directory is not empty; use a new directory or --resume");
   fs::create_directories(cache_dir);
   const fs::path hubert_file=fs::is_directory(o.hubert_path)?fs::path(o.hubert_path)/"model.safetensors":fs::path(o.hubert_path);
   const fs::path dmodel=o.discriminator_path.empty()?fs::path(o.pretrained_path).parent_path()/"f0D40k.safetensors":fs::path(o.discriminator_path);
+  if(o.progress)write_progress_message(std::cout,{"identity",0,0,"unknown"});
   std::cout<<"Preparing model/data identity on CPU before CUDA feature extraction"<<std::endl;
   const auto generator_hash=sha256_file(o.pretrained_path),discriminator_hash=sha256_file(dmodel);
   const auto hubert_hash=sha256_file(hubert_file),rmvpe_hash=sha256_file(o.rmvpe_path);
@@ -147,6 +151,7 @@ int run_full_joint_training(const VcTrainOptions& o,resonantia::training_control
         if(clip_digest(clip)!=clip_digest(reloaded))throw std::runtime_error("frozen cache roundtrip mismatch");
       }
       input.frames=clip.frames;input.payload_hash=clip_digest(clip);
+      if(o.progress)write_progress_message(std::cout,{"cache",i+1,inputs.size(),"files"});
       std::cout<<"Cache "<<i+1<<'/'<<inputs.size()<<" frames="<<clip.frames<<" hits="<<hits<<std::endl;
     }
   } // Frozen models are released before the joint graph/optimizer is allocated.
@@ -160,6 +165,7 @@ int run_full_joint_training(const VcTrainOptions& o,resonantia::training_control
     <<frontend<<o.epochs<<' '<<o.speaker<<' '<<o.seed<<' '<<o.learning_rate<<' '<<o.learning_rate_decay<<'\n';
   for(const auto& input:inputs)recipe<<std::quoted(input.audio.filename().string())<<' '<<input.key<<' '<<input.payload_hash<<'\n';
   const auto identity=sha256(recipe.str());RunState state=RunState::begin(identity,inputs.size(),o.epochs,o.seed,o.learning_rate,o.learning_rate_decay);
+  if(o.resume_initial)recover_initial_training_directory(state_dir,identity);
   const auto marker=state_dir/"identity.txt";
   if(fs::exists(marker)) {
     if(fs::file_size(marker)>128)throw std::runtime_error("invalid training identity marker");
@@ -189,6 +195,7 @@ int run_full_joint_training(const VcTrainOptions& o,resonantia::training_control
   auto save_on_stop=[&](TrainingResult result){save_state(trainer,state,state_dir);
     std::cout<<"Joint-full stopped at complete step="<<state.step<<"; resume checkpoint retained; no model exported"<<std::endl;
     return static_cast<int>(result);};
+  if(o.progress)write_progress_message(std::cout,{"training",std::uint64_t(state.step),inputs.size()*o.epochs,"steps"});
   while(!state.done()) {
     if(const auto result=cancel.poll();result!=TrainingResult::kCompleted)return save_on_stop(result);
     const auto& input=inputs.at(state.current_clip());const auto load_start=Clock::now();
@@ -198,6 +205,7 @@ int run_full_joint_training(const VcTrainOptions& o,resonantia::training_control
     training::JointStepOptions step;step.crop_frames=32;step.crop_start=state.crop(clip.frames);
     const auto step_start=Clock::now();const auto loss=trainer.step(clip,step);const double step_time=elapsed(step_start);step_seconds+=step_time;
     state.advance();trainer.set_learning_rate(state.learning_rate());
+    if(o.progress)write_progress_message(std::cout,{"training",std::uint64_t(state.step),inputs.size()*o.epochs,"steps"});
     std::cout<<std::setprecision(9)<<"joint-full step="<<state.step<<'/'<<inputs.size()*o.epochs<<" epoch="<<state.epoch()
       <<" clip="<<state.slot()<<'/'<<inputs.size()<<" frames="<<clip.frames<<" crop="<<step.crop_start<<" lr="<<trainer.learning_rate()
       <<" D="<<loss.discriminator<<" G="<<loss.generator<<" mel="<<loss.mel<<" kl="<<loss.kl<<" fm="<<loss.feature<<" adv="<<loss.adversarial

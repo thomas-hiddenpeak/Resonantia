@@ -12,6 +12,10 @@
 namespace voxmutatio::app_support {
 
 struct VcConvertOptions {
+    bool progress = false;
+    std::string checkpoint_dir;
+    std::string pause_file;
+    bool resume = false;
     VCConfig config;
     std::string input_path;
     std::string output_path;

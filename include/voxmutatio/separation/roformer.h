@@ -12,6 +12,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "voxmutatio/core/operation_progress.h"
+#include "voxmutatio/io/block_checkpoint.h"
 
 namespace voxmutatio::separation {
 
@@ -32,13 +34,21 @@ class Roformer {
   /// Full separation of a stereo signal (planar [2, L]) -> stem [2, L].
   /// Throws std::invalid_argument for an invalid/oversized shape or non-finite input;
   /// throws std::runtime_error when uninitialized or when execution/output fails.
-  [[nodiscard]] std::vector<float> separate_stereo(const std::vector<float>& stereo, int L) const;
+  /// Optional checkpoint is borrowed, caller-bound to exact input/model/config
+  /// and implementation. It retains model windows, replaying overlap-add in its
+  /// original order. Safe boundaries may throw io::OperationPaused after saving;
+  /// corrupt/mismatched blocks fail. No output is returned on pause/failure.
+  [[nodiscard]] std::vector<float> separate_stereo(const std::vector<float>& stereo, int L,
+                                                    const ProgressObserver& observer = {},
+                                                    io::BlockCheckpoint* checkpoint = nullptr) const;
   /// Mono at sr -> mono stem at sr (resample to 44100, stereo, run, downmix).
   /// Null, empty, oversized, invalid-rate, and non-finite inputs throw
   /// std::invalid_argument;
   /// initialization, resampling, execution, and non-finite outputs throw
   /// std::runtime_error.
-  [[nodiscard]] std::vector<float> separate_mono(const float* audio, int L, int sr) const;
+  [[nodiscard]] std::vector<float> separate_mono(const float* audio, int L, int sr,
+                                                  const ProgressObserver& observer = {},
+                                                  io::BlockCheckpoint* checkpoint = nullptr) const;
 
   // --- staged alignment hooks (return host tensors) ---
   // These use the same invalid_argument/runtime_error convention as the

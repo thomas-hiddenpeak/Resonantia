@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 #include <sys/resource.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -13,6 +15,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "tools/web/workflow_support.h"
 
@@ -65,6 +68,10 @@ void require_no_children() {
 }
 
 int child_main(const std::string& mode, const char* marker) {
+    if(mode=="--child-hold") {
+        {std::ofstream out(marker);out<<getpid()<<'\n';if(!out)return 91;}
+        std::this_thread::sleep_for(5s);return 0;
+    }
     {
         std::ofstream output(marker, std::ios::app);
         output << mode << '\n';
@@ -79,11 +86,37 @@ int child_main(const std::string& mode, const char* marker) {
     }
     return 0;
 }
+void inherited_resource(const fs::path& self,const fs::path& root) {
+    int previous=0;require(prctl(PR_GET_CHILD_SUBREAPER,&previous)==0&&prctl(PR_SET_CHILD_SUBREAPER,1)==0,"subreaper setup");
+    struct Restore{int value;~Restore(){prctl(PR_SET_CHILD_SUBREAPER,value);}} restore{previous};
+    struct Children {
+        pid_t owner=-1,worker=-1;
+        ~Children(){for(auto pid:{owner,worker})if(pid>0){kill(pid,SIGKILL);int status;while(waitpid(pid,&status,0)<0&&errno==EINTR){}}}
+    } children;
+    const auto marker=root/"orphan-worker",lease=root/"gpu-lease";
+    children.owner=fork();require(children.owner>=0,"fork runner owner");
+    if(children.owner==0) {
+        ProcessSpec spec;spec.argv={self.string(),"--child-hold",marker.string()};spec.log_path=root/"orphan.log";spec.resource_lock=lease;
+        const auto result=PosixProcessRunner{}.run(spec);_exit(result.success()?0:91);
+    }
+    const auto until=std::chrono::steady_clock::now()+2s;
+    while(std::chrono::steady_clock::now()<until){std::ifstream in(marker);in>>children.worker;if(children.worker>0)break;std::this_thread::sleep_for(1ms);}
+    require(children.worker>0,"worker did not start");
+    require(kill(children.owner,SIGKILL)==0,"kill isolated runner owner");
+    int status;require(waitpid(children.owner,&status,0)==children.owner,"reap isolated owner");children.owner=-1;
+    ProcessSpec competing;competing.argv={self.string(),"--child-ok",(root/"competing").string()};competing.log_path=root/"competing.log";competing.resource_lock=lease;
+    const auto denied=PosixProcessRunner{}.run(competing);
+    require(denied.termination==ProcessTermination::kLaunchFailed&&denied.system_error==EBUSY&&!fs::exists(root/"competing"),
+            "runner death released GPU ownership while its worker was alive");
+    require(kill(children.worker,SIGTERM)==0,"stop owned fixture worker");
+    require(waitpid(children.worker,&status,0)==children.worker,"reap adopted worker");children.worker=-1;
+    require(PosixProcessRunner{}.run(competing).success(),"resource was not released after worker exit");
+}
 }
 
 int main(int argc, char** argv) {
     if (argc == 3 && (std::string(argv[1]) == "--child-ok" ||
-                      std::string(argv[1]) == "--child-signal"))
+                      std::string(argv[1]) == "--child-signal" || std::string(argv[1]) == "--child-hold"))
         return child_main(argv[1], argv[2]);
     try {
         require(argc == 1, "unexpected arguments");
@@ -152,13 +185,27 @@ int main(int argc, char** argv) {
                 std::cout << scenario << ": expected failure, no children/FD delta, recovery success\n";
             }
             require(failures_seen == 4, "not all natural failure cases ran");
+            ProcessSpec observed;
+            observed.argv={self.string(),"--child-ok",marker.string()};observed.log_path=fixture_path/"observed.log";
+            observed.log_filter_terms={"not-in-this-line"};int count=0;
+            observed.observe_line=[&](std::string_view line){require(line=="--child-ok","observer line framing");++count;};
+            require(runner.run(observed).success()&&count==1,"observer must see filtered child lines");
+            observed.log_filter_terms.clear();
+            observed.observe_line=[](std::string_view){throw std::runtime_error("observer storage failure");};
+            auto failed=runner.run(observed);
+            require(!failed.success()&&failed.termination==ProcessTermination::kExited&&failed.exit_code==0&&failed.io_error!=0,
+                    "observer failure must be separate from successful child exit");
+            require(read(observed.log_path).find("--child-ok")!=std::string::npos,"observer exception lost child log");
+            require_no_children();require(descriptor_count()==baseline_fds,"observer exception leaked resources");
+            inherited_resource(self,fixture_path);
+            require_no_children();require(descriptor_count()==baseline_fds,"resource inheritance leaked children or descriptors");
             std::uintmax_t bytes = 0;
             for (const auto& entry : fs::directory_iterator(fixture_path)) {
                 require(entry.is_regular_file(), "unexpected fixture artifact");
                 bytes += entry.file_size();
             }
             require(bytes <= 8192, "fixture/log output exceeded 8KiB");
-            std::cout << "Temporary output=" << bytes << " bytes; max helper children=1\n";
+            std::cout << "Temporary output=" << bytes << " bytes; max worker children=1 plus isolated runner owner\n";
         }
         require(!fs::exists(fixture_path), "temporary fixture was not removed");
         require_no_children();

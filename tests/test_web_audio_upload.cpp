@@ -1,5 +1,6 @@
 // Host-only HTTP upload contracts. Model processes are always mocked.
 #include "tools/web/web_service.h"
+#include "voxmutatio/io/audio_io.h"
 #include <sys/socket.h>
 #include <unistd.h>
 #include <atomic>
@@ -24,12 +25,13 @@ void write(const fs::path& path, const std::string& bytes) {
     std::ofstream out(path, std::ios::binary); out << bytes;
     out.close(); check(bool(out), "fixture write failed");
 }
-std::string pcm() {
+std::string pcm(unsigned frames = 4) {
     std::string wav = "RIFF";
     auto le = [&](unsigned n, int bytes) { while (bytes--) { wav += char(n & 255); n >>= 8; } };
-    le(44, 4); wav += "WAVEfmt "; le(16, 4); le(1, 2); le(1, 2);
+    le(36 + frames * 2, 4); wav += "WAVEfmt "; le(16, 4); le(1, 2); le(1, 2);
     le(44100, 4); le(88200, 4); le(2, 2); le(16, 2); wav += "data";
-    le(8, 4); le(10, 2); le(20, 2); le(30, 2); le(40, 2);
+    le(frames * 2, 4);
+    for (unsigned i = 0; i < frames; ++i) le((i % 4 + 1) * 10, 2);
     return wav;
 }
 struct Runner : ProcessRunner {
@@ -246,6 +248,49 @@ void run() {
     check(kill(pid, 0) == -1 && errno == ESRCH, "timed out child was not reaped");
 }
 
+// Duration-only model substitute: execute the actual input/output resamplers,
+// preserving the same frame-count rounding as the bounded 40k/16k/40k path.
+void cover_lengths() {
+    struct LengthRunner : ProcessRunner {
+        int truncate_frames = 0;
+        ProcessResult run(const ProcessSpec& spec) const override {
+            const auto arg = [&](const std::string& key) {
+                auto it = std::find(spec.argv.begin(), spec.argv.end(), key);
+                check(it != spec.argv.end() && ++it != spec.argv.end(), "missing test argument");
+                return *it;
+            };
+            if (spec.argv.front().ends_with("vc_preprocess")) {
+                write(fs::path(arg("--output-dir")) / "processed.wav", read_file(arg("--input")));
+            } else {
+                auto audio = voxmutatio::io::read_audio(arg("--input"), 16000);
+                check(audio.has_value(), "roundtrip test input");
+                auto output = voxmutatio::io::resample_linear(audio->data.data(),
+                    static_cast<int>(audio->data.size()), 16000, 40000);
+                check(output.size() > static_cast<unsigned>(truncate_frames), "short test output");
+                output.resize(output.size() - truncate_frames);
+                check(voxmutatio::io::write_audio(arg("--output"), output.data(),
+                    static_cast<int>(output.size()), 40000), "roundtrip test output");
+            }
+            return {ProcessTermination::kExited, 0};
+        }
+    };
+    TempDir temp("/tmp", "resonantia-cover-length-");
+    Paths paths; paths.runs = temp.path() + "/runs"; paths.build = temp.path() + "/build";
+    auto runner = std::make_shared<LengthRunner>();
+    auto service = std::make_shared<WebService>(paths, runner);
+    const std::string fields =
+        "--audio-test\r\nContent-Disposition: form-data; name=\"workflow\"\r\n\r\nsong\r\n"
+        "--audio-test\r\nContent-Disposition: form-data; name=\"output_kind\"\r\n\r\nmix\r\n";
+    for (unsigned frames : {44100u, 44103u, 44105u, 44108u, 88213u}) {
+        auto reply = request(service, "/api/convert", {{"source.wav", pcm(frames)}}, fields);
+        check(reply.status == 200, "valid resampling rounding rejected for " + std::to_string(frames) + ": " + reply.body);
+        check(reply.body.size() == 44 + frames * 4, "cover must preserve the original stereo duration");
+    }
+    runner->truncate_frames = 400;
+    check(request(service, "/api/convert", {{"source.wav", pcm(44103)}}, fields).status == 500,
+          "genuinely truncated conversion must not be stretched into a successful mix");
+}
+
 // Real decoder integration: one second of provenance-tracked human speech,
 // transcoded only for codec coverage. Does not execute a voice/model process.
 void codecs(const std::string& ffmpeg, const std::string& speech) {
@@ -297,7 +342,7 @@ int main(int argc, char** argv) {
             std::cout << getpid() << std::endl;
             for (;;) pause();
         }
-        if (argc == 3) codecs(argv[1], argv[2]); else run();
+        if (argc == 3) codecs(argv[1], argv[2]); else { run(); cover_lengths(); }
         std::cout << "Web audio upload checks passed\n"; return 0;
     }
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

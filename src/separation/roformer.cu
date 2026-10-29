@@ -723,9 +723,31 @@ struct Roformer::Impl {
 
   // Chunked overlap-add for long audio (time attention is O(T^2)): 50% Hann
   // overlap, normalize by window sum so single-cover regions recover exactly.
-  std::vector<float> forward_chunked(const std::vector<float>& stereo, int L) const {
-    if (chunk_size <= 0 || L <= chunk_size) return forward(stereo, L);
+  std::vector<float> forward_chunked(const std::vector<float>& stereo, int L,const ProgressObserver& observer,io::BlockCheckpoint* checkpoint) const {
+    const auto block=[&](const std::vector<float>& input,int count,std::uint64_t offset) {
+      const auto key="window_"+std::to_string(offset);
+      if(checkpoint) {
+        checkpoint->boundary();
+        if(auto cached=checkpoint->load(key,offset,2ULL*count))return std::move(*cached);
+      }
+      auto result=forward(input,count);
+      if(checkpoint) {
+        if(result.size()!=2ULL*count)throw std::runtime_error("Roformer checkpoint output shape mismatch");
+        detail::require_finite_output(result,"Roformer checkpoint output");
+        checkpoint->save(key,offset,result);
+      }
+      return result;
+    };
+    if (chunk_size <= 0 || L <= chunk_size) {
+      report_progress(observer,"separation",0,1,"chunks");
+      auto result=block(stereo,L,0);
+      report_progress(observer,"separation",1,1,"chunks");
+      if(checkpoint)checkpoint->boundary();
+      return result;
+    }
     const int cs = chunk_size, hop = cs / 2;
+    const std::uint64_t chunks=1+(static_cast<std::uint64_t>(L-cs)+hop-1)/hop;
+    std::uint64_t completed=0;report_progress(observer,"separation",0,chunks,"chunks");
     std::vector<float> win(cs);
     for (int i = 0; i < cs; ++i) win[i] = 0.5f - 0.5f * std::cos(2.0 * M_PI * i / cs);
     std::vector<float> out(static_cast<size_t>(2) * L, 0.0f), wsum(L, 0.0f);
@@ -740,7 +762,7 @@ struct Roformer::Impl {
         for (int i = 0; i < len; ++i)
           chunk[static_cast<size_t>(c) * cs + i] =
               stereo[static_cast<size_t>(c) * L + static_cast<size_t>(start) + i];
-      auto y = forward(chunk, cs);
+      auto y = block(chunk, cs, static_cast<std::uint64_t>(start));
       // There is no preceding/following chunk at the signal boundaries, so do
       // not fade the uncovered outer half to zero. Interior overlaps retain the
       // complementary periodic-Hann pair whose weights sum to one.
@@ -753,6 +775,8 @@ struct Roformer::Impl {
               y[static_cast<size_t>(c) * cs + i] * weight;
         wsum[static_cast<size_t>(start) + i] += weight;
       }
+      report_progress(observer,"separation",++completed,chunks,"chunks");
+      if(checkpoint)checkpoint->boundary();
       if (last) break;
     }
     for (int c = 0; c < 2; ++c)
@@ -908,7 +932,7 @@ std::vector<float> Roformer::debug_mask(const std::vector<float>& blk_ref, int T
   });
 }
 
-std::vector<float> Roformer::separate_stereo(const std::vector<float>& stereo, int L) const {
+std::vector<float> Roformer::separate_stereo(const std::vector<float>& stereo, int L,const ProgressObserver& observer,io::BlockCheckpoint* checkpoint) const {
   if (!valid()) throw std::runtime_error("Roformer is not initialized");
   p_->require_supported_length(L, true);
   if (L <= 0 || stereo.size() != static_cast<size_t>(2) * L) {
@@ -916,7 +940,7 @@ std::vector<float> Roformer::separate_stereo(const std::vector<float>& stereo, i
   }
   detail::require_finite_input(stereo, "Roformer stereo input");
   return p_->with_scratch_release([&] {
-    auto out = p_->forward_chunked(stereo, L);
+    auto out = p_->forward_chunked(stereo, L,observer,checkpoint);
     detail::require_finite_output(out, "Roformer stereo output");
     return out;
   });
@@ -938,7 +962,7 @@ std::vector<float> Roformer::debug_apply(const std::vector<float>& mask,
       [&] { return p_->apply_from_host_mask(mask, stereo, L, T); });
 }
 
-std::vector<float> Roformer::separate_mono(const float* audio, int L, int sr) const {
+std::vector<float> Roformer::separate_mono(const float* audio, int L, int sr,const ProgressObserver& observer,io::BlockCheckpoint* checkpoint) const {
   if (!valid()) throw std::runtime_error("Roformer is not initialized");
   if (!audio || L <= 0 || sr <= 0) {
     throw std::invalid_argument("Roformer mono input requires audio, L > 0, and sr > 0");
@@ -958,7 +982,7 @@ std::vector<float> Roformer::separate_mono(const float* audio, int L, int sr) co
   int L44 = static_cast<int>(r.size());
   std::vector<float> stereo(static_cast<size_t>(2) * L44);
   for (int i = 0; i < L44; ++i) { stereo[i] = r[i]; stereo[L44 + i] = r[i]; }
-  auto st = p_->forward_chunked(stereo, L44);
+  auto st = p_->forward_chunked(stereo, L44,observer,checkpoint);
   std::vector<float> mono(L44);
   for (int i = 0; i < L44; ++i) mono[i] = 0.5f * (st[i] + st[L44 + i]);
   if (sr != msr) mono = io::resample_linear(mono.data(), L44, msr, sr);

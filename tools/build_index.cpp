@@ -29,6 +29,7 @@
 
 #include "voxmutatio/content/hubert_encoder.h"
 #include "voxmutatio/io/audio_io.h"
+#include "tools/app_support/progress_protocol.h"
 
 namespace fs = std::filesystem;
 
@@ -144,13 +145,15 @@ void print_usage() {
     std::cout << "Usage:\n"
               << "  build_index --hubert <path> --input-dir <dir> --output <index.bin>\n\n"
               << "Extracts HuBERT v2 features from all .wav files in the\n"
-              << "directory and writes a flat feature index.\n";
+              << "directory and writes a flat feature index.\n"
+              << "  --progress  Emit structured completed-file progress\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string hubert_path, input_dir, output_path;
+    bool progress=false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view argument(argv[i]);
@@ -170,7 +173,8 @@ int main(int argc, char** argv) {
             destination = argv[++i];
             return true;
         };
-        if (a == "--hubert") {
+        if (a == "--progress") {progress=true;
+        } else if (a == "--hubert") {
             if (!value(hubert_path)) return 1;
         } else if (a == "--input-dir") {
             if (!value(input_dir)) return 1;
@@ -198,6 +202,7 @@ int main(int argc, char** argv) {
     cfg.use_final_proj = false;
     cfg.num_layers = 12;
 
+    if(progress)voxmutatio::app_support::write_progress_message(std::cout,{"loading-models",0,0,"unknown"});
     voxmutatio::content::HubertEncoder encoder;
     if (!encoder.init(cfg)) {
         std::cerr << "Failed to init HuBERT\n";
@@ -234,6 +239,8 @@ int main(int argc, char** argv) {
                   return left.generic_string() < right.generic_string();
               });
 
+    std::uint64_t handled=0;
+    if(progress)voxmutatio::app_support::write_progress_message(std::cout,{"indexing",0,audio_paths.size(),"files"});
     for (const auto& audio_path : audio_paths) {
         auto audio = voxmutatio::io::read_audio(audio_path.string(), 16000);
         if (!audio.has_value() || audio->data.empty()) {
@@ -267,6 +274,7 @@ int main(int argc, char** argv) {
         ++file_count;
         std::cout << "  " << audio_path.filename().string() << ": "
                   << frames << " frames\n";
+        if(progress)voxmutatio::app_support::write_progress_message(std::cout,{"indexing",++handled,audio_paths.size(),"files"});
     }
 
     if (ntotal == 0) {

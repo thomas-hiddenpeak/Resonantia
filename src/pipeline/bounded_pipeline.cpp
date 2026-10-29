@@ -539,7 +539,7 @@ bool build_raw_f0(bounded_io::RawFloatSpool& filtered,
                   const std::filesystem::path& spool_directory,
                   Infer&& infer, bounded_io::RawFloatSpool& raw_f0,
                   std::uint64_t& maximum_input_samples,
-                  std::string& error) {
+                  std::string& error,const ProgressObserver& observer,io::BlockCheckpoint* checkpoint) {
     if (!raw_f0.create(spool_directory)) {
         return fail(error, "failed to create raw F0 spool");
     }
@@ -548,6 +548,7 @@ bool build_raw_f0(bounded_io::RawFloatSpool& filtered,
         return fail(error, "F0 virtual input length overflow");
     }
     const std::uint64_t total_frames = virtual_samples / kPitchHop + 1;
+    report_progress(observer,"f0",0,total_frames,"frames100hz");
 
     for (std::uint64_t first_frame = 0; first_frame < total_frames;) {
         detail::F0WindowPlan plan;
@@ -568,6 +569,17 @@ bool build_raw_f0(bounded_io::RawFloatSpool& filtered,
             !narrow_int(input_samples, input_count)) {
             return fail(error, "F0 window exceeds the extractor range");
         }
+        const auto block_key="f0_"+std::to_string(first_frame);
+        if(checkpoint) {
+            checkpoint->boundary();
+            if(auto cached=checkpoint->load(block_key,first_frame,plan.crop_frame_count)) {
+                if(!raw_f0.append(*cached))return fail(error,"cached F0 spool append failed");
+                first_frame=plan.end_frame;
+                report_progress(observer,"f0",first_frame,total_frames,"frames100hz");
+                checkpoint->boundary();
+                continue;
+            }
+        }
         std::vector<float> window;
         if (!read_reflected(filtered, source_samples, pad, plan.input_start,
                             input_size, window, error)) {
@@ -587,7 +599,11 @@ bool build_raw_f0(bounded_io::RawFloatSpool& filtered,
                 crop_data, static_cast<std::size_t>(plan.crop_frame_count)))) {
             return fail(error, "raw F0 spool append failed");
         }
+        if(checkpoint)checkpoint->save(block_key,first_frame,std::span<const float>(
+            crop_data,static_cast<std::size_t>(plan.crop_frame_count)));
         first_frame = plan.end_frame;
+        report_progress(observer,"f0",first_frame,total_frames,"frames100hz");
+        if(checkpoint)checkpoint->boundary();
     }
     return raw_f0.sample_count() == total_frames ||
            fail(error, "raw F0 spool length mismatch");
@@ -981,7 +997,7 @@ bool detail::write_global_rms_output(
 
 VCResult VoiceConversionPipeline::convert_file_bounded(
         const std::string& input_path, const std::string& output_path,
-        int speaker_id) try {
+        int speaker_id,const ProgressObserver& observer,io::BlockCheckpoint* checkpoint) try {
     using clock = std::chrono::high_resolution_clock;
     const auto start_time = clock::now();
     VCResult result;
@@ -1048,6 +1064,7 @@ VCResult VoiceConversionPipeline::convert_file_bounded(
         result.error_message = "failed to create incremental WAV staging";
         return finish_failure("failed to create incremental WAV staging");
     }
+    report_progress(observer,"input-snapshot",0,0,"unknown");
     bounded_io::RawFloatSpool stable;
     if (!detail::resample_wav_to_stable_snapshot(
             reader, spool_directory, stable, source_samples,
@@ -1055,6 +1072,7 @@ VCResult VoiceConversionPipeline::convert_file_bounded(
         return finish_failure("bounded input snapshot failed");
     }
 
+    report_progress(observer,"highpass",0,0,"unknown");
     bounded_io::RawFloatSpool filtered;
     if (!detail::filter_stable_source(
             stable, spool_directory, config_.apply_highpass, filtered,
@@ -1112,7 +1130,7 @@ VCResult VoiceConversionPipeline::convert_file_bounded(
             [this](const float* audio, int samples) {
                 return extract_f0(audio, samples);
             },
-            raw_f0, maximum_f0_input, result.error_message)) {
+            raw_f0, maximum_f0_input, result.error_message,observer,checkpoint)) {
         return finish_failure("bounded F0 extraction failed");
     }
     bounded_io::RawFloatSpool processed_f0;
@@ -1130,6 +1148,7 @@ VCResult VoiceConversionPipeline::convert_file_bounded(
         return finish_failure("bounded F0 resource observation exceeded its profile");
     }
 
+    report_progress(observer,"synthesis",0,source_samples,"samples16k");
     bounded_io::RawFloatSpool raw_output;
     if (!raw_output.create(spool_directory)) {
         result.error_message = "failed to create raw synthesis spool";
@@ -1148,6 +1167,21 @@ VCResult VoiceConversionPipeline::convert_file_bounded(
             return finish_failure("bounded quiet planning failed");
         }
         if (done) break;
+
+        const auto block_key="synth_"+std::to_string(core_start);
+        if(checkpoint) {
+            checkpoint->boundary();
+            const auto start=core_start*kOutputSampleRate/kInputSampleRate;
+            const auto end=core_end*kOutputSampleRate/kInputSampleRate;
+            if(raw_output.sample_count()!=start||end<=start)
+                return finish_failure("cached synthesis absolute alignment mismatch");
+            if(auto cached=checkpoint->load(block_key,core_start,end-start)) {
+                if(!raw_output.append(*cached))return finish_failure("cached synthesis spool append failed");
+                report_progress(observer,"synthesis",core_end,source_samples,"samples16k");
+                checkpoint->boundary();
+                continue;
+            }
+        }
 
         std::uint64_t virtual_samples = 0;
         std::uint64_t right_context = 0;
@@ -1247,12 +1281,21 @@ VCResult VoiceConversionPipeline::convert_file_bounded(
             }
             remaining -= count;
         }
+        if(checkpoint) {
+            std::vector<float> committed;
+            if(!raw_output.read(output_start,static_cast<std::size_t>(core_output),committed))
+                return finish_failure("cannot read completed synthesis block");
+            checkpoint->save(block_key,core_start,committed);
+        }
+        report_progress(observer,"synthesis",core_end,source_samples,"samples16k");
+        if(checkpoint)checkpoint->boundary();
     }
     if (raw_output.sample_count() != output_samples) {
         result.error_message = "bounded synthesis output length mismatch";
         return finish_failure("bounded synthesis output length mismatch");
     }
 
+    report_progress(observer,"output",0,0,"unknown");
     if (!detail::write_global_rms_output(
             filtered, raw_output, spool_directory, config_.rms_mix_rate,
             writer, result.error_message)) {
@@ -1269,6 +1312,11 @@ VCResult VoiceConversionPipeline::convert_file_bounded(
     result.error_message.clear();
     result.total_ms = std::chrono::duration<double, std::milli>(
         clock::now() - start_time).count();
+    return result;
+} catch (const io::OperationPaused& error) {
+    VCResult result;
+    result.paused=checkpoint!=nullptr;
+    result.error_message=error.what();
     return result;
 } catch (const std::exception& error) {
     VCResult result;

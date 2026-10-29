@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 #include "tools/app_support/vc_preprocess_app.h"
+#include "tools/app_support/progress_protocol.h"
+#include "tools/app_support/operation_checkpoint.h"
 
 #include <algorithm>
 #include <cctype>
@@ -63,6 +65,9 @@ void print_usage(std::ostream& output) {
         "  --trim             Trim leading/trailing silence before slicing\n"
         "  --trim-thresh <f>  Amplitude threshold for --trim (default: 0.020)\n"
         "  --separate         Extract vocals (MelBand-RoFormer) before slicing\n"
+        "  --checkpoint-dir <dir> Save completed Roformer windows for restart\n"
+        "  --resume           Reuse matching input/model/recipe checkpoints\n"
+        "  --pause-file <p>   One-byte 0/1 control; safe pause exits 2, errors exit 1\n"
         "  --deharmony        Remove backing/harmony vocals (karaoke RoFormer)\n"
         "  --dereverb         Remove reverb (MelBand-RoFormer) before slicing\n"
         "  --deecho           Remove echo + reverb (MelBand-RoFormer) before slicing\n"
@@ -78,6 +83,7 @@ void print_usage(std::ostream& output) {
         "  --vad              Slice on Silero-VAD speech regions (smart slicing)\n"
         "  --vad-thresh <f>   VAD speech probability threshold (default: 0.5)\n"
         "  --vad-dir <path>   VAD model dir (default: models/vad)\n"
+        "  --progress          Emit structured completed-boundary progress\n"
         "  --help             Show this help\n";
 }
 
@@ -95,6 +101,14 @@ ParseStatus parse_vc_preprocess_options(int argc, char* const argv[],
         if (argument == "--help" || argument == "-h") {
             print_usage(output);
             return ParseStatus::kExitSuccess;
+        } else if (argument == "--progress") {options.progress=true;
+        } else if (argument == "--checkpoint-dir") {
+            const char* value = next(argument); if (!value) return ParseStatus::kExitFailure;
+            options.checkpoint_dir=value;
+        } else if (argument == "--pause-file") {
+            const char* value = next(argument); if (!value) return ParseStatus::kExitFailure;
+            options.pause_file=value;
+        } else if (argument == "--resume") {options.resume=true;
         } else if (argument == "--input") {
             const char* value = next(argument); if (!value) return ParseStatus::kExitFailure;
             options.input = value;
@@ -198,10 +212,14 @@ ParseStatus parse_vc_preprocess_options(int argc, char* const argv[],
         error << "error: invalid value for --hop-sec: must fit the sample-count range\n";
         return ParseStatus::kExitFailure;
     }
+    if((options.resume||!options.pause_file.empty())&&options.checkpoint_dir.empty()) {
+        error << "error: --resume and --pause-file require --checkpoint-dir\n";
+        return ParseStatus::kExitFailure;
+    }
     return ParseStatus::kRun;
 }
 
-int run_vc_preprocess(const VcPreprocessOptions& options) {
+int run_vc_preprocess(const VcPreprocessOptions& options) try {
     if (options.preserve_stereo && (!options.no_slice || options.trim || options.vad ||
                                     options.sample_rate != 44100)) {
         std::cerr << "error: --preserve-stereo requires --no-slice --sr 44100 without trim/VAD\n";
@@ -239,6 +257,43 @@ int run_vc_preprocess(const VcPreprocessOptions& options) {
         return model;
     };
 
+    const auto progress=[&](std::string_view phase,std::uint64_t done,std::uint64_t total,std::string_view unit) {
+        if(options.progress)write_progress_message(std::cout,{phase,done,total,unit});
+    };
+    const auto observer=[&](std::string_view phase)->ProgressObserver {
+        if(!options.progress)return {};
+        return [&,phase](const OperationProgress& p){progress(phase,p.completed,p.total,p.unit);};
+    };
+    std::unique_ptr<OperationCheckpointSession> checkpoint_session;
+    if(!options.checkpoint_dir.empty()) {
+        if(files.size()>4096)throw std::invalid_argument("checkpoint preprocessing accepts at most 4096 files");
+        progress("identity",0,files.size(),"files");
+        OperationIdentity identity("preprocessing");
+        std::ostringstream recipe;recipe.imbue(std::locale::classic());recipe<<std::setprecision(std::numeric_limits<double>::max_digits10);
+        recipe<<options.sample_rate<<' '<<options.segment_seconds<<' '<<options.hop_seconds<<' '<<options.minimum_rms<<' '
+              <<options.trim_threshold<<' '<<options.trim<<' '<<options.no_slice<<' '<<options.preserve_stereo<<' '
+              <<options.vad<<' '<<options.vad_threshold;
+        identity.field("recipe",recipe.str());
+        for(std::size_t i=0;i<files.size();++i) {
+            identity.field("filename",fs::path(files[i]).filename().string());identity.file("input",files[i]);
+            progress("identity",i+1,files.size(),"files");
+        }
+        const auto add_model=[&](bool enabled,const std::string& chosen,const std::string& canonical) {
+            identity.field(canonical,enabled?"enabled":"disabled");if(!enabled)return;
+            const auto model=chosen.empty()?canonical:chosen;
+            identity.field("model",model);
+            for(const auto* suffix:{".safetensors",".json","_config.i64","_dim_inputs.i64","_freq_indices.i64","_num_bands_per_freq.i64"})
+                identity.file(suffix,fs::path(options.separation_dir)/(model+suffix));
+        };
+        add_model(options.separate,options.separate_model,"vocal_roformer");
+        add_model(options.deharmony,options.deharmony_model,"karaoke_roformer");
+        add_model(options.dereverb,options.dereverb_model,"dereverb_roformer");
+        add_model(options.deecho,options.deecho_model,"deecho_roformer");
+        add_model(options.denoise,options.denoise_model,"denoise_roformer");
+        if(options.vad)identity.file("vad",fs::path(options.vad_dir)/"silero_vad.safetensors");
+        checkpoint_session=std::make_unique<OperationCheckpointSession>(options.checkpoint_dir,identity.finish(),options.resume,options.pause_file);
+    }
+    progress("loading-models",0,0,"unknown");
     std::unique_ptr<separation::Roformer> vocal_separator;
     if (options.separate) {
         auto model = resolve_model("separate", options.separate_model, "vocal_roformer");
@@ -328,7 +383,16 @@ int run_vc_preprocess(const VcPreprocessOptions& options) {
     int total = 0;
     int dropped = 0;
     int readable = 0;
+    std::uint64_t handled=0;
+    progress("files",0,files.size(),"files");
     for (const auto& file : files) {
+        if(checkpoint_session)checkpoint_session->boundary();
+        const auto file_done=[&]{progress("files",++handled,files.size(),"files");
+            if(checkpoint_session)checkpoint_session->boundary();};
+        const auto checkpoint_for=[&](std::string_view phase)->std::unique_ptr<io::BlockCheckpoint> {
+            if(!checkpoint_session)return {};
+            return checkpoint_session->stage("file_"+std::to_string(handled)+"_"+std::string(phase));
+        };
         if (options.preserve_stereo) {
             auto loaded = io::read_stereo_audio(file);
             if (!loaded || loaded->frames() == 0) {
@@ -340,10 +404,12 @@ int run_vc_preprocess(const VcPreprocessOptions& options) {
             for (int i = 0; i < count; ++i) {
                 planar[i] = loaded->data[2*i]; planar[count+i] = loaded->data[2*i+1];
             }
-            for (auto* stage : {vocal_separator.get(), deharmonizer.get(), dereverberator.get(),
-                                deechoer.get(), denoiser.get()}) {
+            for (const auto& [phase,stage] : std::vector<std::pair<std::string_view,separation::Roformer*>>{
+                    {"separate",vocal_separator.get()},{"deharmony",deharmonizer.get()},
+                    {"dereverb",dereverberator.get()},{"deecho",deechoer.get()},{"denoise",denoiser.get()}}) {
                 if (!stage) continue;
-                planar = stage->separate_stereo(planar, count);
+                auto checkpoint=checkpoint_for(phase);
+                planar = stage->separate_stereo(planar, count,observer(phase),checkpoint.get());
                 if (planar.size() != loaded->data.size()) {
                     std::cerr << "error: stereo cleanup changed frame count\n"; return 1;
                 }
@@ -357,34 +423,39 @@ int run_vc_preprocess(const VcPreprocessOptions& options) {
             }
             ++readable; ++total;
             std::cout << "  " << fs::path(file).filename().string() << " -> stereo processed\n";
-            continue;
+            file_done();continue;
         }
         auto loaded = io::read_audio(file, options.sample_rate);
         if (!loaded) {
             std::cerr << "skip (read failed): " << file << "\n";
-            continue;
+            file_done();continue;
         }
         ++readable;
         std::vector<float> audio = std::move(loaded->data);
         if (vocal_separator) {
+            auto checkpoint=checkpoint_for("separate");
             audio = vocal_separator->separate_mono(
-                audio.data(), static_cast<int>(audio.size()), options.sample_rate);
+                audio.data(), static_cast<int>(audio.size()), options.sample_rate,observer("separate"),checkpoint.get());
         }
         if (deharmonizer) {
+            auto checkpoint=checkpoint_for("deharmony");
             audio = deharmonizer->separate_mono(
-                audio.data(), static_cast<int>(audio.size()), options.sample_rate);
+                audio.data(), static_cast<int>(audio.size()), options.sample_rate,observer("deharmony"),checkpoint.get());
         }
         if (dereverberator) {
+            auto checkpoint=checkpoint_for("dereverb");
             audio = dereverberator->separate_mono(
-                audio.data(), static_cast<int>(audio.size()), options.sample_rate);
+                audio.data(), static_cast<int>(audio.size()), options.sample_rate,observer("dereverb"),checkpoint.get());
         }
         if (deechoer) {
+            auto checkpoint=checkpoint_for("deecho");
             audio = deechoer->separate_mono(
-                audio.data(), static_cast<int>(audio.size()), options.sample_rate);
+                audio.data(), static_cast<int>(audio.size()), options.sample_rate,observer("deecho"),checkpoint.get());
         }
         if (denoiser) {
+            auto checkpoint=checkpoint_for("denoise");
             audio = denoiser->separate_mono(
-                audio.data(), static_cast<int>(audio.size()), options.sample_rate);
+                audio.data(), static_cast<int>(audio.size()), options.sample_rate,observer("denoise"),checkpoint.get());
         }
         if (options.trim) {
             auto [low, high] = voiced_span(audio, static_cast<float>(options.trim_threshold),
@@ -406,7 +477,7 @@ int run_vc_preprocess(const VcPreprocessOptions& options) {
             }
             ++total;
             std::cout << "  " << fs::path(file).filename().string() << " -> processed\n";
-            continue;
+            file_done();continue;
         }
 
         int index = 0;
@@ -417,7 +488,7 @@ int run_vc_preprocess(const VcPreprocessOptions& options) {
             if (regions.empty()) {
                 std::cout << "  " << fs::path(file).filename().string()
                           << " -> 0 clips (no speech detected)\n";
-                continue;
+                file_done();continue;
             }
         } else {
             regions.emplace_back(0, count);
@@ -445,6 +516,7 @@ int run_vc_preprocess(const VcPreprocessOptions& options) {
         }
         std::cout << "  " << fs::path(file).filename().string()
                   << " -> " << index << " clips\n";
+        file_done();
     }
     if (readable == 0) {
         std::cerr << "error: no input audio could be read from " << options.input << "\n";
@@ -453,6 +525,10 @@ int run_vc_preprocess(const VcPreprocessOptions& options) {
     std::cout << "Wrote " << total << " clips to " << options.output_dir
               << " (dropped " << dropped << " silent)\n";
     return 0;
+} catch(const io::OperationPaused& e) {
+    std::cout << "Paused: " << e.what() << std::endl;return 2;
+} catch(const std::exception& e) {
+    std::cerr << "Operation failed: " << e.what() << std::endl;return 1;
 }
 
 }  // namespace voxmutatio::app_support

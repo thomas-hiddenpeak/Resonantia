@@ -44,6 +44,8 @@
     q(id).textContent = text;
   }
   function render() {
+    const backgroundBusy = !!globalThis.resonantiaTasks?.isBusy();
+    const storageReason = globalThis.resonantiaTasks?.blockingReason() || "";
     const ready = convCascade.state.ready && !!convFile;
     const candidate = globalThis.resonantiaWorkflow?.hasCandidate();
     const name = candidate
@@ -70,18 +72,20 @@
           : "已准备就绪，使用当前设置生成。";
     if (conversionState === "upload-error")
       reason = "音频尚未准备好，请在上传区域重试。";
-    if (convRunning) reason = "处理期间请保留此页面；完成后即可试听。";
-    else if (activeTrain) reason = "训练正在使用设备，结束后可生成翻唱。";
+    if (convRunning) reason = "后台任务提交后可关闭页面，进展和结果在任务中心。";
+    else if (backgroundBusy || activeTrain) reason = "后台任务正在使用设备，请到任务中心查看或安全暂停。";
     if (conversionState === "error")
       reason = "设置和输入已保留，可再次点击生成。";
     if (conversionState === "done")
       reason = "向下对照听审，也可以调整后重新生成。";
     if (convCascade.state.busy && !convRunning)
       reason = "正在清理人声，完成后可试听并继续生成。";
+    if (storageReason && !convRunning) reason = storageReason;
     setText("conversionReadiness", reason);
     q("btnConvert").disabled =
-      convRunning || !!activeTrain || convCascade.state.busy || !ready || !name;
+      !!storageReason || backgroundBusy || convRunning || !!activeTrain || convCascade.state.busy || !ready || !name;
     q("regeneratePitch").disabled = q("btnConvert").disabled;
+    q('btnPreprocess').disabled=backgroundBusy || !!storageReason || convRunning || convCascade.state.busy || !ready || q('inputKind').value==='manual' || (q('inputKind').value==='dry'&&!q('conversionDereverb').checked);
     q("resultStale").hidden =
       !resultSettings || resultSettings === settingsKey();
     if (conversionState === "done" && !q("resultStale").hidden) {
@@ -150,8 +154,8 @@
             ? "上传并检查录音后即可开始。"
             : "下一步会请你核对本次训练计划。",
     );
-    if (!!activeTrain !== trainingLocked) {
-      trainingLocked = !!activeTrain;
+    if ((!!activeTrain || backgroundBusy) !== trainingLocked) {
+      trainingLocked = !!activeTrain || backgroundBusy;
       q("trainingForm")
         .querySelectorAll("input,select,button")
         .forEach((el) => {
@@ -168,6 +172,7 @@
         .forEach((el) => (el.disabled = true));
     q("btnTrain").disabled =
       trainingLocked ||
+      !!storageReason ||
       convRunning ||
       trainCascade.state.busy ||
       !/^[A-Za-z0-9_-]{1,64}$/.test(q("voiceName").value.trim()) ||
@@ -175,6 +180,9 @@
     q("trainUploadArea").setAttribute("aria-disabled", String(trainingLocked));
     q("trainUploadArea").tabIndex = trainingLocked ? -1 : 0;
     q("trainNavStatus").hidden = !activeTrain;
+    const manualTraining=!!trainCascade.state.applied.length;
+    for (const id of ['trainAutoSeparate','trainAutoDeharmony','trainAutoDereverb']) q(id).disabled=trainingLocked || manualTraining || resume;
+    q('trainAutomaticHint').textContent=manualTraining?'已逐步处理素材，自动清理不重复执行；重置素材后可改用自动清理。':'只勾选素材确实需要的处理；单人干声可全部跳过。';
     q("trainUploadStatus").classList.toggle(
       "error",
       q("trainUploadStatus").textContent.startsWith("上传失败"),
@@ -185,6 +193,7 @@
       convert: "制作翻唱",
       train: "训练声线",
       library: "声线库",
+      tasks: "任务中心",
     };
     document.querySelectorAll(".tab-btn").forEach((el) => {
       const active = el.dataset.tab === tab;
@@ -449,12 +458,6 @@
     },
     true,
   );
-  window.addEventListener("beforeunload", (event) => {
-    if (convRunning) {
-      event.preventDefault();
-      event.returnValue = "";
-    }
-  });
   // Existing scripts may have completed discovery before this presentation layer.
   connection(online);
   navigate("convert");

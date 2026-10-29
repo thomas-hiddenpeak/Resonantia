@@ -3,12 +3,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const source = fs.readFileSync(path.join(__dirname, '../webui/app.js'), 'utf8');
+const source = fs.readFileSync(path.join(process.argv[2] || path.join(__dirname,'../webui'), 'app.js'), 'utf8');
 const end = source.indexOf('// Extract a human-readable message');
 assert.ok(end > 0);
 
 function client(answers, {cached = '', unavailableStorage = false, open = false} = {}) {
-  let accepted = 'correct', prompts = 0;
+  let accepted = 'correct', prompts = 0, delayResponse = null;
   const storage = new Map(cached ? [['resonantiaAuthToken', cached]] : []);
   const sent = [];
   const context = vm.createContext({
@@ -22,12 +22,16 @@ function client(answers, {cached = '', unavailableStorage = false, open = false}
     fetch: async (url, options) => {
       const token = options.headers.get('Authorization');
       sent.push(token);
-      return {status: open || token === `Bearer ${accepted}` ? 200 : 401};
+      const response={status: open || token === `Bearer ${accepted}` ? 200 : 401};
+      if(delayResponse){const pending=delayResponse;delayResponse=null;await pending;}
+      assert.equal(Object.hasOwn(options,'quietAuth'),false,'private polling option leaked to fetch');
+      return response;
     },
   });
   vm.runInContext(source.slice(0, end), context);
   return {
-    request: () => vm.runInContext("apiFetch('/api/status')", context),
+    request: (quiet=false) => vm.runInContext(`apiFetch('/api/status', {quietAuth:${quiet}})`, context),
+    hold: () => {let release;delayResponse=new Promise(resolve=>release=resolve);return release;},
     prompts: () => prompts,
     rotate: () => { accepted = 'rotated'; },
     sent,
@@ -53,6 +57,14 @@ function client(answers, {cached = '', unavailableStorage = false, open = false}
   assert.equal((await fallback.request()).status, 200);
   assert.equal((await fallback.request()).status, 200);
   assert.equal(fallback.prompts(), 1);
+  const quiet=client(['correct'],{cached:'expired'});
+  assert.equal((await quiet.request(true)).status,401);assert.equal(quiet.prompts(),0);
+  assert.equal((await quiet.request()).status,200);assert.equal(quiet.prompts(),1);
+  const delayed=client(['correct'],{cached:'expired'}),release=delayed.hold();
+  const old=delayed.request(true);
+  assert.equal((await delayed.request()).status,200);release();
+  assert.equal((await old).status,200,'late 401 must reuse the newly accepted token');
+  assert.equal((await delayed.request(true)).status,200);assert.equal(delayed.prompts(),1);
   for (const options of [{cached: 'correct'}, {open: true}]) {
     const c = client([], options);
     assert.equal((await c.request()).status, 200);

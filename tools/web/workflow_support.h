@@ -1,12 +1,15 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
+#include <string_view>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "tools/web/http_transport.h"
+#include "tools/web/task_storage.h"
 
 namespace resonantia::web {
 
@@ -16,11 +19,17 @@ struct Paths {
     std::string build;
     std::string runs;
     std::string webroot;
+    // Empty disables persistence for embedding/legacy contract fixtures.
+    std::string tasks;
     std::string hubert;
     std::string rmvpe;
     std::string gmodel;
     std::string dmodel;
     std::string ffmpeg = "/usr/bin/ffmpeg";
+    // The standalone server enables this; embedded deterministic fixtures can
+    // opt in with small limits without depending on their host disk capacity.
+    bool enforce_task_storage = false;
+    TaskStorageLimits storage_limits;
 };
 
 enum class ProcessLogMode {
@@ -30,9 +39,16 @@ enum class ProcessLogMode {
 
 struct ProcessSpec {
     std::vector<std::string> argv;
+    // Optional cross-process resource lease. A spawned child inherits the lock,
+    // so a crashed runner cannot admit another GPU worker while it is still live.
+    // Busy returns kLaunchFailed/EBUSY without spawning; callers may retry later.
+    std::filesystem::path resource_lock;
     std::filesystem::path log_path;
     ProcessLogMode log_mode = ProcessLogMode::kAppend;
     std::vector<std::string> log_filter_terms;
+    // Borrowed line, valid only during this synchronous call, before log filtering.
+    // Failure is reported as io_error after the child has been drained/reaped.
+    std::function<void(std::string_view)> observe_line;
 };
 
 enum class ProcessTermination {

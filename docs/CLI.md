@@ -122,6 +122,10 @@ decay=0.999875、crop32、sampled、seed0，单GPU FP32 batch1；每轮每个cli
 目标audio/spec与payload校验；单文件上限8MiB，只读取当前clip，训练prior及噪声不缓存。
 数据、模型、配方或缓存内容不一致时拒绝恢复，不忽略损坏缓存。
 
+`--resume-initial`只用于joint-full初始化写入中断、尚无完整checkpoint的目录，不能与
+`--resume`同时使用。持锁检查目录形状和配方身份后，仅清理已知的identity/state0临时写入；
+已有完整checkpoint、未知文件、链接或身份不符均拒绝。Web在没有完整保存点时显式使用此入口。
+
 新训练要求checkpoint目录为空（内部锁除外）。第0步、每5轮、最终轮和协作停止时保存
 完整`state_step_XXXXXXXXXX.safetensors`，原子提交后保留最新两份；50/100/150/200轮另存
 `candidate_epoch_XXXXXXXXXX.safetensors`。同目录锁避免并发写入，阶段耗时及epoch/step/LR

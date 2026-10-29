@@ -27,20 +27,28 @@ function requestAuthToken() {
     return authPromptPromise;
 }
 async function apiFetch(url, options = {}) {
+    const { quietAuth = false, ...fetchOptions } = options;
     const send = (token) => {
         const headers = new Headers(options.headers || {});
         if (token) headers.set('Authorization', 'Bearer ' + token);
-        return fetch(url, { ...options, headers });
+        return fetch(url, { ...fetchOptions, headers });
     };
     let token = storedAuthToken();
     let response = await send(token);
     if (response.status !== 401) return response;
-    storeAuthToken('');
+    const latest = storedAuthToken();
+    if (latest && latest !== token) {
+        response = await send(latest);
+        if (response.status === 401 && storedAuthToken() === latest) storeAuthToken('');
+        return response;
+    }
+    if (storedAuthToken() === token) storeAuthToken('');
+    if (quietAuth) return response;
     token = await requestAuthToken();
     if (!token) return response;
     storeAuthToken(token);
     response = await send(token);
-    if (response.status === 401) storeAuthToken('');
+    if (response.status === 401 && storedAuthToken() === token) storeAuthToken('');
     return response;
 }
 
@@ -82,6 +90,7 @@ function applyTrainingMode(reset = true) {
     $('trainSeg').disabled = joint || full;
     $('trainEpochs').disabled = joint;
     const hint = $('trainJointHint'); if (hint) hint.hidden = !joint;
+    const automatic = $('trainAutomaticCleanup'); if (automatic) automatic.hidden = !full;
     const controls = $('trainFullControls'); if (controls) controls.hidden = !full;
     const resume = $('trainResume'); if (resume && !full) resume.checked = false;
     if (joint) {
@@ -121,7 +130,7 @@ async function loadPresets() {
     const cs = $('convPreset'); cs.innerHTML = '';
     PRESETS.inference.forEach((p) => { const o = document.createElement('option'); o.value = p.id; o.textContent = p.name; cs.appendChild(o); });
     cs.onchange = () => applyPreset(cs.value);
-    if (PRESETS.inference[1]) { cs.value = PRESETS.inference[1].id; applyPreset(cs.value); }
+    if (PRESETS.inference[1] && !convSource) { cs.value = PRESETS.inference[1].id; applyPreset(cs.value); }
     applyVoicePreset();
 }
 function applyTier(id) {
@@ -207,15 +216,15 @@ function pollJob(name, jobId) {
     return new Promise((resolve, reject) => {
         const tick = async () => {
             try {
-                const r = await apiFetch(`${API}/train/status?name=${encodeURIComponent(name)}`);
-                if (!r.ok) throw new Error(await errText(r));
-                const s = await r.json();
-                if (!jobId || s.job_id !== jobId || s.name !== name) throw new Error('处理任务已变化，请重新确认输入');
+                const response=await apiFetch(API+'/task?id='+encodeURIComponent(jobId),{quietAuth:true});
+                if (!response.ok) throw new Error(await errText(response));
+                const task=await response.json();
+                if (task.id!==jobId || task.name!==name) {reject(new Error('处理任务标识不匹配'));return;}
                 setConn(true);
-                if (s.running) setTimeout(tick, 1000); else resolve(s);
-            } catch (e) { reject(e); }
-        };
-        tick();
+                if (['queued','running','pause_requested'].includes(task.state)) setTimeout(tick,1500);
+                else resolve({error:task.state!=='succeeded',state:task.state,detail:task.error});
+            } catch(error) {setConn(false);setTimeout(tick,2500);}
+        };tick();
     });
 }
 // Fetch the current work-set audio as a frozen blob snapshot for per-stage audition.
@@ -265,6 +274,7 @@ function Cascade(containerId, getName, resetBtnId) {
         setBusy(false);
     }
     async function apply(s, row, st, au) {
+        if (globalThis.resonantiaTasks?.isBusy()) return;
         const name = getName(); if (!name) { alert('请先完成上传'); return; }
         setBusy(true); st.textContent = `正在${s.name}…`;
         try {
@@ -273,13 +283,14 @@ function Cascade(containerId, getName, resetBtnId) {
             const r = await apiFetch(`${API}/step`, { method: 'POST', body: fd });
             if (!r.ok) throw new Error(await errText(r));
             const accepted = await r.json();
+            globalThis.resonantiaTasks?.open(accepted.job_id);
             const done = await pollJob(name, accepted.job_id);
-            if (done.error) throw new Error('处理失败（见服务端日志）');
+            if (done.error) throw new Error(done.detail || '任务未完成，请在任务中心查看记录');
             state.applied.push(s.name);
             st.textContent = state.applied.length + '. 已应用 ✓'; row.classList.add('applied');
             updateOrder();
             await auditionSnapshot(name, au);
-        } catch (e) { st.textContent = '失败: ' + e.message; }
+        } catch (e) { st.textContent = '状态需核实: ' + e.message; globalThis.resonantiaTasks?.refresh(); }
         setBusy(false);
     }
     return { enable, setBusy, state };
@@ -418,146 +429,28 @@ $('trainResetPre').onclick = () => { trainMatSig = ''; ensureTrainMaterial(); };
 $('trainRetryUpload').onclick = () => ensureTrainMaterial();
 
 // ---------- Training job controls ----------
-async function restoreActiveTraining() {
-    if (activeTrain) return;
-    try {
-        const r = await apiFetch(`${API}/train/status`);
-        if (!r.ok) return;
-        const s = await r.json();
-        // A manual submission may have started while this request was pending.
-        if (activeTrain || !s.running || s.kind !== 'train' || !s.job_id || !s.name) return;
-        const job = { name: s.name, id: s.job_id, cancelSent: !!s.cancel_requested, cancelInFlight: false };
-        activeTrain = job;
-        updateTrainBtn();
-        $('trainProgress').style.display = 'block';
-        $('btnCancelTrain').disabled = true;
-        $('trainStage').textContent = '正在恢复训练进度…';
-        pollTrain(job);
-    } catch (_) { /* A later page load can retry; never submit or cancel a job here. */ }
-}
-
 $('btnTrain').addEventListener('click', async () => {
-    if (activeTrain) return;
+    if (activeTrain || globalThis.resonantiaTasks?.isBusy()) return;
     if (globalThis.resonantiaStudio && !(await globalThis.resonantiaStudio.confirmTraining())) return;
-    if (activeTrain) return;
-    const name = $('voiceName').value.trim();
-    const job = { name, id: null, cancelSent: false, cancelInFlight: false };
-    activeTrain = job;
-    // Files were uploaded as the work-set in step 2; the cascade cleaned it.
-    const fd = new FormData();
-    fd.append('name', name);
-    fd.append('mode', $('trainMode').value);
-    const full = $('trainMode').value === 'joint-full';
+    if (activeTrain || globalThis.resonantiaTasks?.isBusy()) return;
+    const name = $('voiceName').value.trim(), full = $('trainMode').value === 'joint-full';
     const resume = full && $('trainResume')?.checked;
+    const fd = new FormData(); fd.append('name', name); fd.append('mode', $('trainMode').value);
     if (!full) fd.append('steps', $('trainSteps').value);
     if (full) fd.append('resume', resume ? '1' : '0');
-    fd.append('seg', $('trainSeg').value);
-    fd.append('epochs', $('trainEpochs').value);
+    fd.append('seg', $('trainSeg').value); fd.append('epochs', $('trainEpochs').value);
     fd.append('vad', !resume && $('recVad').checked ? '1' : '0');
-    updateTrainBtn();
-    $('btnCancelTrain').disabled = true;
-    $('trainProgress').style.display = 'block';
-    $('trainStage').textContent = '提交中…';
-    $('trainFill').style.width = '0%';
+    for (const [field,id] of [['separate','trainAutoSeparate'],['deharmony','trainAutoDeharmony'],['dereverb','trainAutoDereverb']])
+        fd.append(field,full && !resume && !trainCascade.state.applied?.length && $(id)?.checked ? '1' : '0');
+    activeTrain = {name, id:null}; updateTrainBtn();
+    $('trainProgress').style.display = 'block'; $('btnCancelTrain').hidden = true;
+    $('trainStage').textContent = '正在提交，进度与结果将在任务中心保留。';
     try {
-        const r = await apiFetch(`${API}/train`, { method: 'POST', body: fd });
-        if (!r.ok) throw new Error(await errText(r));
-        const accepted = await r.json();
-        if (!accepted.job_id) throw new Error('服务器未返回作业标识，请核实服务状态');
-        job.id = accepted.job_id;
-        pollTrain(job);
-    } catch (err) {
-        if (activeTrain !== job) return;
-        $('trainStage').textContent = '提交结果未确认: ' + err.message;
-        activeTrain = null; updateTrainBtn();
-    }
+        await globalThis.resonantiaTasks.submit(API+'/train',fd,'training');
+        $('trainStage').textContent = '请在任务中心查看状态，可以关闭本页面。';
+    } catch(error) { $('trainStage').textContent = '提交未受理：'+error.message; }
+    finally { activeTrain=null;updateTrainBtn(); }
 });
-
-$('btnCancelTrain').addEventListener('click', async () => {
-    const job = activeTrain;
-    if (!job || !job.id || job.cancelSent || job.cancelInFlight) return;
-    job.cancelInFlight = true;
-    $('btnCancelTrain').disabled = true;
-    $('trainStage').textContent = '正在请求取消…';
-    const fd = new FormData(); fd.append('job_id', job.id);
-    try {
-        const r = await apiFetch(`${API}/train/cancel`, { method: 'POST', body: fd });
-        if (!r.ok) throw new Error(await errText(r));
-        const result = await r.json();
-        if (activeTrain !== job) return;
-        if (result.job_id !== job.id) throw new Error('取消响应的作业标识不匹配');
-        job.cancelSent = true;
-        $('trainStage').textContent = result.cancelled ? '已取消；已提交素材保留' : '已请求取消，等待当前阶段结束…';
-        // Only the status poll retires the UI job. An acknowledgement does not
-        // release the server's resources or permit this UI to start another job.
-    } catch (err) {
-        if (activeTrain !== job) return;
-        $('trainStage').textContent = '取消未确认: ' + err.message;
-    } finally {
-        job.cancelInFlight = false;
-    }
-});
-
-const STAGE_LABELS = {queued:'等待设备',preparing:'准备素材',preprocessing:'清理与切分素材',separating:'分离人声',training:'训练中',indexing:'构建音色检索索引',publishing:'保存候选',done:'完成',error:'失败',cancelled:'已停止'};
-async function pollTrain(job) {
-    if (activeTrain !== job) return;
-    try {
-        const r = await apiFetch(`${API}/train/status?name=${encodeURIComponent(job.name)}`);
-        if (!r.ok) throw new Error(await errText(r));
-        const s = await r.json();
-        if (activeTrain !== job) return;
-        if (s.job_id !== job.id || s.kind !== 'train') {
-            $('trainStage').textContent = '当前作业已变化，无法确认本次训练结果，请核实服务状态';
-            $('btnCancelTrain').disabled = true;
-            activeTrain = null; updateTrainBtn(); return;
-        }
-        $('trainFill').style.width = s.done ? '100%' : '0%';
-        $('trainLog').textContent = s.log || '';
-        $('trainLog').scrollTop = $('trainLog').scrollHeight;
-        $('btnCancelTrain').disabled = !s.cancellable || job.cancelSent || job.cancelInFlight || s.cancel_requested;
-        if (s.running) {
-            $('trainStage').textContent = s.cancel_requested || job.cancelSent ? '已请求取消，等待当前阶段结束…' :
-                job.cancelInFlight ? '正在请求取消…' : s.stage === 'publishing' ? '正在保存训练结果，已无法取消…' : (STAGE_LABELS[s.stage] || s.stage);
-            if (s.stage === 'training' && !s.cancel_requested && !job.cancelSent && !job.cancelInFlight) {
-                const progress = [...(s.log || '').matchAll(/joint-full step=(\d+)\/(\d+) epoch=(\d+)/g)].pop();
-                const cache = [...(s.log || '').matchAll(/Cache (\d+)\/(\d+) frames=/g)].pop();
-                const preparing = (s.log || '').lastIndexOf('Preparing model/data identity');
-                if (cache && Number(cache[2]) > 0 && (!progress || cache.index > progress.index)) {
-                    $('trainStage').textContent = `准备训练特征：${cache[1]}/${cache[2]} 段`;
-                    $('trainFill').style.width = Math.min(100, Math.floor(100 * Number(cache[1]) / Number(cache[2]))) + '%';
-                } else if (preparing >= 0 && (!progress || preparing > progress.index)) {
-                    $('trainStage').textContent = '准备训练：核验素材并载入模型…';
-                    $('trainFill').style.width = '0%';
-                } else if (progress && Number(progress[2]) > 0) {
-                    $('trainStage').textContent = `训练中：${progress[1]}/${progress[2]} 步，已完成 ${progress[3]} 轮`;
-                    $('trainFill').style.width = Math.min(100, Math.floor(100 * Number(progress[1]) / Number(progress[2]))) + '%';
-                    const times = [...(s.log || '').matchAll(/train_seconds=([\d.]+)/g)].map(m=>Number(m[1])).filter(v=>Number.isFinite(v)&&v>0);
-                    if (times.length) $('trainStage').textContent += ` · 最近计算耗时 ${(times.reduce((a,b)=>a+b,0)/times.length).toFixed(2)} 秒/步（不含准备与保存）`;
-                }
-            }
-            setTimeout(() => pollTrain(job), 1500);
-        } else if (s.done) {
-            $('btnCancelTrain').disabled = true;
-            activeTrain = null; updateTrainBtn();
-            if (s.cancelled) $('trainStage').textContent = s.resumable ? '已停止；完整训练进度和固定素材已保留，可恢复' : '已取消；已提交素材保留';
-            else if (s.error) $('trainStage').textContent = '训练失败，请查看日志';
-            else if (s.review_required) {
-                $('trainStage').textContent = '训练完成，候选已保存，等待听审；现有声线保持不变';
-                globalThis.resonantiaWorkflow?.refreshRuns();
-            }
-            else { $('trainStage').textContent = '完成 ✓ 已生成声线「' + job.name + '」'; loadVoices(); }
-        } else {
-            $('trainStage').textContent = '等待作业状态…';
-            setTimeout(() => pollTrain(job), 1500);
-        }
-        globalThis.resonantiaStudio?.trainingStatus(s);
-    } catch (e) {
-        if (activeTrain !== job) return;
-        $('btnCancelTrain').disabled = true;
-        $('trainStage').textContent = '暂时无法确认作业状态，正在重试…';
-        setTimeout(() => pollTrain(job), 2500);
-    }
-}
 
 // ---------- Voices ----------
 async function loadVoices() {
@@ -567,7 +460,8 @@ async function loadVoices() {
         const d = await response.json();
         configureTrainingProfiles(d.training_profiles);
         setConn(true);
-        const sel = $('voiceSelect'), cur = sel.value, voices = d.voices || [];
+        const sel = $('voiceSelect'), cur = sel.value, voices = [...(d.voices || [])];
+        if(convSource?.parameters?.voice&&!voices.includes(convSource.parameters.voice))voices.push(convSource.parameters.voice);
         sel.innerHTML = '';
         if (voices.length === 0) {
             const o = document.createElement('option');
@@ -588,6 +482,7 @@ $('btnRefreshVoices').addEventListener('click', loadVoices);
 
 // ---------- Convert ----------
 let convFile = null, convUrl = null;
+let convSource = null;
 let convRunning = false;
 let convUploadGeneration = 0, convUploadQueue = Promise.resolve();
 const convArea = $('convUploadArea');
@@ -600,7 +495,8 @@ $('convFileInput').addEventListener('change', (e) => { if (e.target.files[0]) se
 function setConvFile(f) {
     if (convRunning || convCascade.state.busy) return;
     if (!supportedAudio(f)) { alert('请上传 ' + AUDIO_FORMATS); return; }
-    convFile = f;
+    convSource = null; $('revisionNotice').hidden=true;
+    convFile = f;globalThis.resonantiaWorkflow?.lock(false);
     globalThis.resonantiaStudio?.conversion('input');
     globalThis.resonantiaWorkflow?.resetPitchEdits();
     $('resultSection').style.display = 'none';
@@ -613,18 +509,19 @@ $('btnConvRemove').addEventListener('click', () => {
     if (convRunning || convCascade.state.busy) return;
     ++convUploadGeneration;
     $('convUploadStatus').textContent = '';
+    convSource=null;$('revisionNotice').hidden=true;
     convFile = null; $('convFileInput').value = '';
     globalThis.resonantiaWorkflow?.resetPitchEdits();
     $('resultSection').style.display = 'none';
     $('convFileInfo').style.display = 'none'; convArea.style.display = 'block';
     $('convOrigAudition').style.display = 'none';
-    convCascade.state.ready = false; convCascade.setBusy(false);
+    convCascade.state.ready = false; convCascade.setBusy(false);globalThis.resonantiaWorkflow?.lock(false);
     $('btnConvert').disabled = true;
     globalThis.resonantiaStudio?.conversion('empty');
 });
 // Upload the input as a work-set (session) so the cascade + audition can operate.
 function ensureConvMaterial() {
-    if (!convFile || convRunning || convCascade.state.busy) return;
+    if (!convFile || convSource || convRunning || convCascade.state.busy) return;
     const file = convFile, generation = ++convUploadGeneration;
     const current = () => generation === convUploadGeneration;
     invalidateMaterial(convCascade, 'convOrigAudition'); $('btnConvert').disabled = true;
@@ -664,72 +561,123 @@ bind('rmsMixRate', 'rmsMixRateValue', (v) => (v / 100).toFixed(2));
 bind('protect', 'protectValue', (v) => (v / 100).toFixed(2));
 bind('filterRadius', 'filterRadiusValue', (v) => v);
 
+let localConversion = null;
+function observeLocalConversion(record) {
+    const local = localConversion;
+    if (!local || record.id !== local.id || local.generation !== convUploadGeneration) return;
+    const running = ['queued','running','pause_requested'].includes(record.state);
+    convRunning = running; convCascade.setBusy(running); globalThis.resonantiaWorkflow?.lock(running);
+    if (running) {
+        $('convInfo').textContent='任务在后台运行。请到任务中心查看阶段、进度与日志。';
+    } else if (record.state === 'succeeded' && !local.completed) {
+        local.completed=true; $('convProgress').style.display='none';
+        if(record.actions?.revise){convSource=record;showRevision();globalThis.resonantiaWorkflow?.lock(false);}
+        if (!storedAuthToken()) {
+            const url=API+'/task/result?id='+encodeURIComponent(record.id);
+            $('resultSection').style.display='block';$('resultAudio').src=url;
+            $('btnDownload').onclick=()=>{const link=document.createElement('a');link.href=url;link.download='converted_'+local.name.replace(/\.[^.]+$/,'.wav');link.click();};
+            globalThis.resonantiaStudio?.conversion('done');
+        } else {
+            $('convProgress').style.display='block';$('convInfo').textContent='完成。请在任务中心载入试听与下载。';
+        }
+    } else if (record.state === 'failed') {
+        $('convInfo').textContent='转换失败：'+record.error+'。请到任务中心查看日志或继续此任务。';
+        globalThis.resonantiaStudio?.conversion('error');
+    } else if (!local.completed) {
+        $('convInfo').textContent='任务已停止运行，状态和保存点在任务中心保留。';
+        globalThis.resonantiaStudio?.conversion('ready');
+    }
+    globalThis.resonantiaStudio?.render();
+}
+globalThis.resonantiaTasks?.observe(observeLocalConversion);
+
+function showRevision() {
+    $('revisionNotice').hidden=!convSource;
+    if(convSource)$('revisionDescription').textContent='正在调整：'+convSource.name+'。原任务和结果保留，新版会单独保存。';
+    $('revisionParent').onclick=()=>{if(convSource)globalThis.resonantiaTasks.open(convSource.id);};
+}
+globalThis.resonantiaReviseAudio = async function(record) {
+    if(convRunning||convCascade.state.busy||globalThis.resonantiaTasks.isBusy())throw new Error('请等待当前处理完成');
+    if(!record.actions?.revise||!['convert','preprocess'].includes(record.kind)||record.state!=='succeeded')throw new Error('此任务不能调整参数');
+    const response=await apiFetch(API+'/task?id='+encodeURIComponent(record.id));
+    if(!response.ok)throw new Error(await errText(response));
+    const source=await response.json();if(source.id!==record.id||!source.actions?.revise)throw new Error('原任务状态已变化，请刷新');
+    const generation=++convUploadGeneration;convSource=source;convFile={name:source.name};localConversion=null;
+    $('convFileInput').value='';$('convFileInfo').querySelector('.file-name').textContent=source.name;
+    $('convFileInfo').style.display='flex';convArea.style.display='none';$('resultSection').style.display='none';$('convProgress').style.display='none';
+    $('nav-convert').click();await loadVoices();if(generation!==convUploadGeneration)return;
+    const p=source.parameters;$('voiceSelect').value=p.voice;lastVoicePreset=p.voice;
+    for(const [key,id,scale] of [['f0_up_key','pitchShift',1],['index_rate','indexRate',100],['rms_mix_rate','rmsMixRate',100],['protect','protect',100],['filter_radius','filterRadius',1]]) {
+        const el=$(id),value=Number(p[key])*scale;
+        if(id==='filterRadius'&&![...el.options].some(o=>o.value===String(value))){const option=document.createElement('option');option.value=String(value);option.textContent=value+'（原任务）';el.appendChild(option);}
+        if(id==='pitchShift'){el.min='-48';el.max='48';}
+        if(el.type==='range'&&scale===100)el.step=Number.isInteger(value)?'1':'any';
+        el.value=value;el.dispatchEvent(new Event('input',{bubbles:true}));
+    }
+    globalThis.resonantiaWorkflow.restore(p);convCascade.state.applied=[];convCascade.state.ready=true;convCascade.setBusy(false);
+    showRevision();globalThis.resonantiaWorkflow.lock(false);
+    $('convUploadStatus').textContent='已载入原任务素材与设置，无需重新上传。';
+    const audio=$('convOrigAudio');audio.pause();if(audio._url)URL.revokeObjectURL(audio._url);audio._url='';audio.removeAttribute('src');
+    const url=API+'/task/source?id='+encodeURIComponent(source.id);
+    let available=true;
+    try {
+        if(!storedAuthToken())audio.src=url;
+        else {
+            const r=await apiFetch(url);if(!r.ok)throw new Error(await errText(r));
+            const size=Number(r.headers.get('Content-Length'));if(!Number.isSafeInteger(size)||size<=0||size>128*1024*1024){await r.body?.cancel();throw new Error('原音频超过页面试听上限');}
+            const reader=r.body.getReader(),chunks=[];let total=0;
+            for(;;){const {done,value}=await reader.read();if(done)break;total+=value.byteLength;if(total>size){await reader.cancel();throw new Error('音频长度不一致');}chunks.push(value);}
+            if(total!==size)throw new Error('原音频下载不完整');
+            if(generation!==convUploadGeneration)return;
+            audio._url=URL.createObjectURL(new Blob(chunks,{type:'audio/wav'}));audio.src=audio._url;
+        }
+    }catch(error){available=false;$('convUploadStatus').textContent='设置已载入，原音频试听暂不可用：'+error.message;}
+    if(generation!==convUploadGeneration)return;
+    $('convOrigAudition').style.display=available?'flex':'none';audio.style.display='block';
+    globalThis.resonantiaStudio?.conversion('ready');
+};
+
 $('btnConvert').addEventListener('click', async () => {
-    if (convRunning || convCascade.state.busy) return;
+    if (convRunning || convCascade.state.busy || globalThis.resonantiaTasks?.isBusy()) return;
     if (!convCascade.state.ready) { alert('请先上传待转换音频'); return; }
     if (!$('voiceSelect').value && !globalThis.resonantiaWorkflow?.hasCandidate()) { alert('请先选择已发布声线或训练候选'); return; }
     try { globalThis.resonantiaWorkflow?.validate(); }
-    catch (error) {
-        if (globalThis.resonantiaStudio) globalThis.resonantiaStudio.validationError(error.message);
-        else alert(error.message);
-        return;
-    }
-    const inputName = convFile.name;
-    const generation = convUploadGeneration;
-    convRunning = true;
-    convCascade.setBusy(true);
-    globalThis.resonantiaWorkflow?.lock(true);
-    $('btnConvert').disabled = true;
-    $('convProgress').style.display = 'block';
-    $('resultSection').style.display = 'none';
+    catch(error) { globalThis.resonantiaStudio?.validationError(error.message); return; }
+    const fd = new FormData(); fd.append(convSource?'source_task':'session',convSource?convSource.id:CONV_SESSION); fd.append('voice', $('voiceSelect').value || 'base');
+    fd.append('f0_up_key', $('pitchShift').value); fd.append('index_rate', $('indexRate').value / 100);
+    fd.append('rms_mix_rate', $('rmsMixRate').value / 100); fd.append('protect', $('protect').value / 100);
+    fd.append('filter_radius', $('filterRadius').value); globalThis.resonantiaWorkflow?.append(fd);
+    const local = {name:convFile.name,generation:convUploadGeneration,id:null,completed:false};
+    localConversion=local;
+    $('resultSection').style.display='none';
+    convRunning=true;convCascade.setBusy(true);globalThis.resonantiaWorkflow?.lock(true);
+    $('convProgress').style.display='block';$('convInfo').textContent='正在提交后台任务…';
     globalThis.resonantiaStudio?.conversion('running');
-    // Single blocking request -> honest indeterminate bar + elapsed time (no fake %).
-    $('convFill').classList.add('indeterminate');
-    const t0 = Date.now();
-    const iv = setInterval(() => { $('convInfo').textContent = `转换中… 已用 ${Math.round((Date.now() - t0) / 1000)}s`; }, 500);
     try {
-        const fd = new FormData();
-        fd.append('session', CONV_SESSION);
-        fd.append('voice', $('voiceSelect').value || 'base');
-        fd.append('f0_up_key', $('pitchShift').value);
-        fd.append('index_rate', $('indexRate').value / 100);
-        fd.append('rms_mix_rate', $('rmsMixRate').value / 100);
-        fd.append('protect', $('protect').value / 100);
-        fd.append('filter_radius', $('filterRadius').value);
-        globalThis.resonantiaWorkflow?.append(fd);
-        const r = await apiFetch(`${API}/convert`, { method: 'POST', body: fd });
-        setConn(true);
-        clearInterval(iv);
-        if (!r.ok) throw new Error(await errText(r));
-        const blob = await r.blob();
-        if (generation !== convUploadGeneration) throw new Error('输入已变化，请重新转换');
-        if (convUrl) URL.revokeObjectURL(convUrl);
-        convUrl = URL.createObjectURL(blob);
-        $('convFill').classList.remove('indeterminate'); $('convFill').style.width = '100%'; $('convInfo').textContent = '完成！';
-        setTimeout(() => {
-            $('convProgress').style.display = 'none';
-            $('resultSection').style.display = 'block';
-            $('resultAudio').src = convUrl;
-            $('btnDownload').onclick = () => { const a = document.createElement('a'); a.href = convUrl; a.download = 'converted_' + inputName.replace(/\.[^.]+$/, '.wav'); a.click(); };
-            convRunning = false;
-            convCascade.setBusy(false);
-            globalThis.resonantiaWorkflow?.lock(false);
-            $('btnConvert').disabled = !convCascade.state.ready;
-            globalThis.resonantiaStudio?.conversion('done');
-        }, 600);
-    } catch (err) {
-        clearInterval(iv);
-        $('convFill').classList.remove('indeterminate'); $('convFill').style.width = '0%';
-        $('convInfo').textContent = '转换失败: ' + err.message;
-        convRunning = false;
-        convCascade.setBusy(false);
-        globalThis.resonantiaWorkflow?.lock(false);
-        $('btnConvert').disabled = !convCascade.state.ready;
-        globalThis.resonantiaStudio?.conversion('error');
+        local.id=await globalThis.resonantiaTasks.submit(API+'/tasks/convert',fd,'convert');
+        $('convInfo').textContent='请在任务中心查看进度、试听和下载，可以关闭此页面。';
+        globalThis.resonantiaStudio?.conversion('ready');
+    } catch(error) {
+        $('convInfo').textContent='提交未受理：'+error.message;globalThis.resonantiaStudio?.conversion('error');
+    } finally {
+        convRunning=false;convCascade.setBusy(false);globalThis.resonantiaWorkflow?.lock(false);
+        $('btnConvert').disabled=!convCascade.state.ready;
+        const record=globalThis.resonantiaTasks.get(local.id);if(record)observeLocalConversion(record);
+        globalThis.resonantiaStudio?.render();
     }
 });
 
-// initial
+$('btnPreprocess').addEventListener('click', async () => {
+    if (convRunning || convCascade.state.busy || !convCascade.state.ready || globalThis.resonantiaTasks.isBusy()) return;
+    const workflow=$('inputKind').value;
+    if (workflow==='manual' || (workflow==='dry'&&!$('conversionDereverb').checked)) return;
+    const fd=new FormData();fd.append(convSource?'source_task':'session',convSource?convSource.id:CONV_SESSION);fd.append('workflow',workflow);fd.append('output_kind','vocal');
+    fd.append('pp_dereverb',$('conversionDereverb').checked?'1':'0');
+    try {await globalThis.resonantiaTasks.submit(API+'/tasks/preprocess',fd,'preprocess');}
+    catch(error){$('convProgress').style.display='block';$('convInfo').textContent='清理未受理：'+error.message;}
+    finally {globalThis.resonantiaStudio?.render();}
+});
+
+// initial: task restoration is owned by tasks.js, including terminal history.
 loadPresets();
 loadVoices();
-restoreActiveTraining();

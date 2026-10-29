@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "tools/app_support/vc_train_app.h"
+#include "tools/app_support/progress_protocol.h"
 #include "tools/app_support/joint_full_training.h"
 
 #include <algorithm>
@@ -173,6 +174,7 @@ int run_joint_training(const VcTrainOptions& options,
             iteration+1,options.steps,clip.frames,step.crop_start,loss.discriminator,loss.generator,
             loss.mel,loss.kl,loss.feature,loss.adversarial);
         std::fflush(stdout);
+        if(options.progress)write_progress_message(std::cout,{"training",std::uint64_t(iteration+1),std::uint64_t(options.steps),"steps"});
         return true;
     });
     if(result!=TrainingResult::kCompleted) {
@@ -201,6 +203,7 @@ void print_usage(std::ostream& output) {
         "  --checkpoint-dir <dir> Full state every 5 epochs; keep latest 2\n"
         "                         Candidates at epochs 50/100/150/200\n"
         "  --resume <file>  Resume joint-full state with matching recipe/dataset\n"
+        "  --resume-initial Restart interrupted initialization with no published state\n"
         "  --dmodel <path>  Discriminator safetensors (default: f0D40k next to G)\n"
         "  --speaker <id>   Source speaker embedding id (default: 0)\n"
         "  --steps <n>      Training steps (default: 300)\n"
@@ -211,6 +214,7 @@ void print_usage(std::ostream& output) {
         "  --seed <n>       Dataset and synthesis RNG seed (default: 0)\n"
         "  --synthesis-mode <m> sampled (default) or legacy mean\n"
         "  --cancel-file <path> Optional job channel (0=run, 1=cancel at safe point)\n"
+        "  --progress          Emit structured completed-boundary progress\n"
         "  --help           Show this help\n"
         "Exit status: 0=completed, 1=error, 2=cooperatively cancelled (no export)\n";
 }
@@ -244,9 +248,13 @@ ParseStatus parse_vc_train_options(int argc, char* const argv[],
             auto& dest=argument=="--cache-dir"?options.cache_dir:argument=="--checkpoint-dir"?options.checkpoint_dir:options.resume_path;
             if(!*value || !dest.empty()){error<<"error: "<<argument<<" requires a nonempty path and cannot be repeated\n";return ParseStatus::kExitFailure;}
             dest=value;
+        } else if (argument == "--resume-initial") {
+            if(options.resume_initial){error<<"error: --resume-initial cannot be repeated\n";return ParseStatus::kExitFailure;}
+            options.resume_initial=true;
         } else if (argument == "--dmodel") {
             const char* value = next(argument); if (!value) return ParseStatus::kExitFailure;
             options.discriminator_path = value;
+        } else if (argument == "--progress") {options.progress=true;
         } else if (argument == "--hubert") {
             const char* value = next(argument); if (!value) return ParseStatus::kExitFailure;
             options.hubert_path = value;
@@ -337,6 +345,9 @@ ParseStatus parse_vc_train_options(int argc, char* const argv[],
         }
     }
     if(options.gan_profile=="joint-full") {
+        if(options.resume_initial&&!options.resume_path.empty()) {
+            error<<"error: --resume-initial and --resume are mutually exclusive\n";return ParseStatus::kExitFailure;
+        }
         if(!epochs_seen)options.epochs=200;
         if(!segment_seen)options.segment_frames=32;
         if(!lr_seen)options.learning_rate=1e-4f;
@@ -345,8 +356,8 @@ ParseStatus parse_vc_train_options(int argc, char* const argv[],
             error<<"error: joint-full requires epochs 1..2000, seg 32, sampled, cache-dir and checkpoint-dir; steps is unsupported\n";
             return ParseStatus::kExitFailure;
         }
-    } else if(!options.cache_dir.empty() || !options.checkpoint_dir.empty() || !options.resume_path.empty()) {
-        error<<"error: cache-dir, checkpoint-dir and resume require joint-full\n";return ParseStatus::kExitFailure;
+    } else if(!options.cache_dir.empty() || !options.checkpoint_dir.empty() || !options.resume_path.empty() || options.resume_initial) {
+        error<<"error: cache-dir, checkpoint-dir, resume and resume-initial require joint-full\n";return ParseStatus::kExitFailure;
     }
     if (options.hubert_path.empty() || options.rmvpe_path.empty() ||
         options.pretrained_path.empty() || options.target_path.empty() ||
@@ -538,6 +549,7 @@ int run_vc_train(VcTrainOptions options) {
         }
 
         clips.push_back(std::move(clip));
+        if(options.progress)write_progress_message(std::cout,{"features",clips.size(),files.size(),"files"});
         std::cout << "  " << fs::path(file).filename().string()
                   << ": " << pitch_frames << " frames\n";
     }
@@ -639,6 +651,7 @@ int run_vc_train(VcTrainOptions options) {
                 (iteration + 1) % per_epoch == 0) {
                 gan.decay_lr(options.learning_rate_decay);
             }
+            if(options.progress)write_progress_message(std::cout,{"training",std::uint64_t(iteration+1),std::uint64_t(options.steps),"steps"});
             return true;
         });
         if (result != TrainingResult::kCompleted) return report(result);
@@ -722,6 +735,7 @@ int run_vc_train(VcTrainOptions options) {
             running = 0.0f;
             running_count = 0;
         }
+        if(options.progress)write_progress_message(std::cout,{"training",std::uint64_t(iteration+1),std::uint64_t(options.steps),"steps"});
         return true;
     });
     if (result != TrainingResult::kCompleted) return report(result);

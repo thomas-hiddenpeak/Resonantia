@@ -16,6 +16,8 @@
 #include <stdexcept>
 #include <string_view>
 #include <sys/wait.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <unordered_set>
 #include <unistd.h>
 #include <utility>
@@ -202,6 +204,25 @@ ProcessResult PosixProcessRunner::run(const ProcessSpec& spec) const {
         return launch_failure(ProcessTermination::kLaunchFailed, errno);
     }
 
+    UniqueFd resource;
+    if(!spec.resource_lock.empty()) {
+        const auto rejected=[&](int error) {
+            auto failure=launch_failure(ProcessTermination::kLaunchFailed,error);
+            write_all(log_fd.get(),error==EBUSY?
+                "[vc_serve] another GPU worker still owns the resource, possibly from a previous service; retry after it exits\n":
+                "[vc_serve] cannot acquire the GPU process resource lease\n",failure.io_error);
+            return failure;
+        };
+        if(spec.resource_lock.native().find('\0')!=std::string::npos)return rejected(EINVAL);
+        resource.reset(::open(spec.resource_lock.c_str(),O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK,0600));
+        if(resource.get()<0)return rejected(errno);
+        struct stat st{};
+        if(::fstat(resource.get(),&st))return rejected(errno);
+        if(!S_ISREG(st.st_mode)||st.st_nlink!=1)return rejected(EINVAL);
+        if(::flock(resource.get(),LOCK_EX|LOCK_NB))return rejected(errno==EWOULDBLOCK||errno==EAGAIN?EBUSY:errno);
+        if(!move_above_standard_descriptors(resource))return rejected(errno);
+    }
+
     int output_pipe[2] = {-1, -1};
     if (::pipe2(output_pipe, O_CLOEXEC) != 0) {
         return launch_failure(ProcessTermination::kLaunchFailed, errno);
@@ -230,6 +251,12 @@ ProcessResult PosixProcessRunner::run(const ProcessSpec& spec) const {
     if (action_error == 0) {
         action_error = posix_spawn_file_actions_addclose(actions.get(), output_write.get());
     }
+    if(action_error==0&&resource.get()>=0) {
+        // posix_spawn dup2 actions clear FD_CLOEXEC even for identical source
+        // and destination descriptors. The child retains this open description
+        // and its flock if the server dies before wait/reap. It owns no stdin.
+        action_error=posix_spawn_file_actions_adddup2(actions.get(),resource.get(),resource.get());
+    }
     if (action_error != 0) {
         return launch_failure(ProcessTermination::kLaunchFailed, action_error);
     }
@@ -254,6 +281,12 @@ ProcessResult PosixProcessRunner::run(const ProcessSpec& spec) const {
 
     ProcessResult result;
     result.termination = ProcessTermination::kExited;
+    bool observer_failed=false;
+    const auto observe=[&] {
+        if(!spec.observe_line||observer_failed)return;
+        try {spec.observe_line(line);}
+        catch(...) {observer_failed=true;}
+    };
     std::array<char, 8192> buffer{};
     for (;;) {
         const ssize_t count = ::read(output_read.get(), buffer.data(), buffer.size());
@@ -266,12 +299,14 @@ ProcessResult PosixProcessRunner::run(const ProcessSpec& spec) const {
         for (ssize_t index = 0; index < count; ++index) {
             const char character = buffer[static_cast<std::size_t>(index)];
             if (character == '\n') {
+                observe();
                 emit_log_line(log_fd.get(), line, true, spec.log_filter_terms,
                               result.io_error);
                 line.clear();
             } else {
                 line.push_back(character);
                 if (line.size() == kMaximumProcessLogLine) {
+                    observe();
                     emit_log_line(log_fd.get(), line, true, spec.log_filter_terms,
                                   result.io_error);
                     line.clear();
@@ -280,6 +315,7 @@ ProcessResult PosixProcessRunner::run(const ProcessSpec& spec) const {
         }
     }
     if (!line.empty()) {
+        observe();
         emit_log_line(log_fd.get(), line, false, spec.log_filter_terms, result.io_error);
     }
     output_read.reset();
@@ -306,6 +342,7 @@ ProcessResult PosixProcessRunner::run(const ProcessSpec& spec) const {
         result.system_error = ECHILD;
     }
     if (::close(log_fd.release()) != 0) record_io_error(result.io_error);
+    if(observer_failed&&!result.io_error)result.io_error=EIO;
     return result;
 }
 

@@ -9,10 +9,27 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
  const browser=await chromium.launch({executablePath,headless:true,args:['--no-sandbox']});
  try{
   const context=await browser.newContext({viewport:{width:1280,height:1000}});
+  let hold=false,fulfill,requestBody='',intercepted=false;let pending=Promise.resolve();const records=new Map();
+  await context.route('**/api/**',async route=>{
+    const req=route.request(),u=new URL(req.url()),p=u.pathname;
+    const json=(body,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(body)});
+    if(p==='/api/tasks/convert' && req.method()==='POST'){
+      intercepted=true;requestBody=req.postData();if(hold)await pending;
+      const id=/name="task_id"\r\n\r\n([^\r]+)/.exec(requestBody)?.[1];assert(id);
+      records.set(id,{id,name:path.basename(audio),kind:'convert',state:'succeeded',stage:'done',attempt:1,created_ms:Date.now(),finished_ms:Date.now(),parameters:{},actions:{},result_url:'/api/task/result?id='+id});return json({task_id:id},202);
+    }
+    if(p==='/api/tasks')return json({tasks:[...records.values()],active_id:''});
+    if(p==='/api/task')return records.has(u.searchParams.get('id'))?json(records.get(u.searchParams.get('id'))):json({error:'missing'},404);
+    if(p==='/api/task/log')return route.fulfill({status:200,body:'mock conversion'});
+    if(p==='/api/task/result')return route.fulfill({status:200,contentType:'audio/wav',body:fs.readFileSync(audio)});
+    // An unexpected write must never start a real model or publish a candidate.
+    if(req.method()==='POST' && p!=='/api/material')return json({error:'unexpected write blocked by browser test'},409);
+    return route.continue();
+  });
   const page=await context.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));
   const voices=await (await context.request.get(base+'/api/voices')).json();
   assert.deepEqual(voices.voices,['Tom_Cybersinger']);assert.deepEqual(voices.reviewed_voices,['Tom_Cybersinger']);
-  await page.goto(base);await page.waitForFunction(()=>document.querySelector('#voiceSelect').value==='Tom_Cybersinger');
+  await page.goto(base);assert(await page.evaluate(()=>!!globalThis.resonantiaTasks),'requires durable task UI');await page.waitForFunction(()=>document.querySelector('#voiceSelect').value==='Tom_Cybersinger');
   await page.waitForFunction(()=>document.querySelector('#convPreset').value==='tom_cybersinger');
   assert.equal(await page.locator('#voiceSelect option').count(),1);
   assert.match(await page.locator('#voiceSelect option:checked').textContent(),/^Tom Cybersinger/);
@@ -31,20 +48,17 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
   await page.locator('#inputKind').selectOption('harmonies');assert.equal(await page.locator('#outputKind').inputValue(),'vocal');
   await page.locator('#inputKind').selectOption('song');await page.locator('#outputKind').selectOption('mix');
   // Local repairs are offered after the first listening pass.
-  await page.route('**/api/convert',route=>route.fulfill({status:200,contentType:'audio/wav',body:fs.readFileSync(audio)}));
-  await page.locator('#btnConvert').click();await page.locator('#resultSection').waitFor({state:'visible'});
-  await page.unroute('**/api/convert');
+  await page.locator('#btnConvert').click();await page.locator('#nav-convert').click();await page.locator('#resultSection').waitFor({state:'visible'});
   await page.locator('#addPitchEdit').evaluate(el=>el.closest('details').open=true);await page.locator('#addPitchEdit').click();
   await page.locator('[data-role="start"]').fill('1');await page.locator('[data-role="end"]').fill('1.12');
-  let fulfill,requestBody='';const pending=new Promise(r=>fulfill=r);let intercepted=false;
-  await page.route('**/api/convert',async route=>{intercepted=true;requestBody=route.request().postData();await pending;await route.fulfill({status:200,contentType:'audio/wav',body:fs.readFileSync(audio)});});
+  hold=true;pending=new Promise(r=>fulfill=r);intercepted=false;
   await page.locator('#btnConvert').click();
   await page.waitForFunction(()=>document.querySelector('#convFileInput').disabled);
   for(let i=0;!intercepted&&i<100;i++)await page.waitForTimeout(20);
   assert(intercepted);assert(requestBody.includes('smooth:1:1.12'));assert(requestBody.includes('\r\n\r\nsong\r\n'));
   assert(requestBody.includes('\r\n\r\nTom_Cybersinger\r\n'),'conversion must use the renamed release');
   assert(await page.locator('#btnConvRemove').isDisabled());assert(await page.locator('#voiceSelect').isDisabled());
-  fulfill();await page.locator('#resultSection').waitFor({state:'visible'});assert(!(await page.locator('#convFileInput').isDisabled()));
+  fulfill();await page.locator('#nav-convert').click();await page.locator('#resultSection').waitFor({state:'visible'});assert(!(await page.locator('#convFileInput').isDisabled()));
   await page.locator('[data-tab="train"]').click();
   assert.equal(await page.locator('#trainMode').inputValue(),'joint-full');assert.equal(await page.locator('#trainEpochs').inputValue(),'200');
   await page.locator('[data-tab="library"]').click();

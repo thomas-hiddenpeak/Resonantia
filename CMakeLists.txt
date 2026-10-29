@@ -74,6 +74,7 @@ target_link_libraries(resonantia_core_obj PRIVATE CUDA::cudart)
 resonantia_add_component(resonantia_io_obj
     src/io/audio_io.cpp
     src/io/bounded_audio_io.cpp
+    src/io/block_checkpoint.cpp
     src/io/safetensors.cpp
 )
 target_link_libraries(resonantia_io_obj PRIVATE resonantia_core_obj)
@@ -248,11 +249,18 @@ resonantia_add_app_support(resonantia_vc_preprocess_app_support
 add_library(resonantia_training_control STATIC tools/app_support/training_cancel.cpp)
 target_include_directories(resonantia_training_control PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(resonantia_training_control PUBLIC Threads::Threads)
+target_link_libraries(resonantia_vc_convert_app_support PRIVATE resonantia_training_control)
+target_link_libraries(resonantia_vc_preprocess_app_support PRIVATE resonantia_training_control)
 
 resonantia_add_app_support(resonantia_vc_train_app_support
     tools/app_support/vc_train_app.cpp)
 target_sources(resonantia_vc_train_app_support PRIVATE tools/app_support/joint_full_training.cpp)
+target_sources(resonantia_vc_train_app_support PRIVATE tools/app_support/joint_initialization.cpp)
 target_link_libraries(resonantia_vc_train_app_support PRIVATE resonantia_training_control)
+
+add_library(resonantia_web_task_store STATIC tools/web/task_store.cpp tools/web/task_artifacts.cpp tools/web/task_storage.cpp)
+target_include_directories(resonantia_web_task_store PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(resonantia_web_task_store PUBLIC Threads::Threads)
 
 add_library(resonantia_web_support STATIC
     tools/web/http_transport.cpp
@@ -263,6 +271,7 @@ target_include_directories(resonantia_web_support PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
 )
 target_link_libraries(resonantia_web_support PRIVATE
+    resonantia_web_task_store
     resonantia_training_control
     voxmutatio
     Threads::Threads

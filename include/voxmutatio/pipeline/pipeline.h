@@ -5,6 +5,8 @@
 #include <vector>
 
 #include "voxmutatio/core/types.h"
+#include "voxmutatio/core/operation_progress.h"
+#include "voxmutatio/io/block_checkpoint.h"
 #include "voxmutatio/content/hubert_encoder.h"
 #include "voxmutatio/content/wavlm_encoder.h"
 #include "voxmutatio/f0/rmvpe.h"
@@ -53,9 +55,16 @@ public:
     /// success=false with a non-empty diagnostic when a VCResult can be
     /// constructed; a host allocation failure may propagate. Any failure
     /// before the atomic rename commit keeps an existing target unchanged.
+    /// Optional checkpoint is borrowed for this call. Its caller-bound identity
+    /// must include input, all model/index bytes, the full config and speaker.
+    /// Completed F0 windows and absolute synthesis cores are reused; global F0
+    /// processing and RMS remain unchanged. A safe stop returns success=false,
+    /// paused=true without publishing the target. Corrupt blocks return failure.
     VCResult convert_file_bounded(const std::string& input_path,
                                   const std::string& output_path,
-                                  int speaker_id = 0);
+                                  int speaker_id = 0,
+                                  const ProgressObserver& observer = {},
+                                  io::BlockCheckpoint* checkpoint = nullptr);
 
     /// Convert raw audio buffer.
     /// Recoverable model, CUDA, and runtime exceptions are returned as

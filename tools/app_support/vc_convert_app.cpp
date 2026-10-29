@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 #include "tools/app_support/vc_convert_app.h"
+#include "tools/app_support/progress_protocol.h"
+#include "tools/app_support/operation_checkpoint.h"
 
 #include <cstring>
 #include <iostream>
@@ -46,6 +48,10 @@ void print_usage(std::ostream& output) {
         << "  --speakers <n>        Legacy hint; checkpoint speaker count is authoritative\n"
         << "  --sr <hz>             Model rate; only 40 kHz is currently supported\n"
         << "  --device <cuda>       CUDA FP32 is the supported runtime\n"
+        << "  --progress          Emit structured completed-boundary progress\n"
+        << "  --checkpoint-dir <dir> Save immutable computation blocks (new directory)\n"
+        << "  --resume              Resume only the same input, models and numerical recipe\n"
+        << "  --pause-file <path>   One-byte 0/1 control; safe pause exits 2, errors exit 1\n"
         << "  --help                Show this help\n";
 }
 
@@ -74,7 +80,15 @@ ParseStatus parse_vc_convert_options(int argc, char* const argv[],
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--hubert") {
+        if (arg == "--progress") {options.progress=true;
+        } else if (arg == "--checkpoint-dir") {
+            const char* value = next(i, arg); if (!value) return ParseStatus::kExitFailure;
+            options.checkpoint_dir=value;
+        } else if (arg == "--pause-file") {
+            const char* value = next(i, arg); if (!value) return ParseStatus::kExitFailure;
+            options.pause_file=value;
+        } else if (arg == "--resume") {options.resume=true;
+        } else if (arg == "--hubert") {
             const char* value = next(i, arg); if (!value) return ParseStatus::kExitFailure;
             options.config.hubert_model_path = value;
         } else if (arg == "--model") {
@@ -245,10 +259,31 @@ ParseStatus parse_vc_convert_options(int argc, char* const argv[],
         error << "error: --index is required when --index-rate > 0\n";
         return ParseStatus::kExitFailure;
     }
+    if((options.resume||!options.pause_file.empty())&&options.checkpoint_dir.empty()) {
+        error << "error: --resume and --pause-file require --checkpoint-dir\n";
+        return ParseStatus::kExitFailure;
+    }
     return ParseStatus::kRun;
 }
 
-int run_vc_convert(const VcConvertOptions& options) {
+int run_vc_convert(const VcConvertOptions& options) try {
+    ProgressObserver observer;
+    if(options.progress)observer=[](const OperationProgress& p){write_progress_message(std::cout,p);};
+    std::unique_ptr<OperationCheckpointSession> session;
+    std::unique_ptr<io::BlockCheckpoint> checkpoint;
+    if(!options.checkpoint_dir.empty()) {
+        if(options.config.content_encoder!=ContentEncoder::kHubert)
+            throw std::invalid_argument("checkpoint conversion requires bounded HuBERT");
+        report_progress(observer,"identity",0,0,"unknown");
+        OperationIdentity identity("conversion");identity.field("recipe",conversion_recipe(options.config,options.speaker_id));
+        identity.file("input",options.input_path);identity.file("hubert",options.config.hubert_model_path);
+        identity.file("generator",options.config.synthesizer_model_path);
+        identity.file("pitch",options.config.f0_method==F0Method::kRmvpe?options.config.rmvpe_model_path:options.config.fcpe_model_path);
+        if(options.config.index_rate>0)identity.file("index",options.config.index_path);
+        session=std::make_unique<OperationCheckpointSession>(options.checkpoint_dir,identity.finish(),options.resume,options.pause_file);
+        checkpoint=session->stage("conversion");
+    }
+    report_progress(observer,"loading-models",0,0,"unknown");
     Device device;
     if (auto err = device.init(options.config.device, options.config.gpu_device)) {
         std::cerr << "CUDA init error: " << *err << "\n";
@@ -270,9 +305,10 @@ int run_vc_convert(const VcConvertOptions& options) {
     std::cout << "File path: "
               << (use_bounded_file_path ? "bounded HuBERT" : "legacy WavLM")
               << "\n";
-    const auto result = convert_file_with_policy(
-        pipeline, options.config, options.input_path, options.output_path,
-        options.speaker_id);
+    const auto result = use_bounded_file_path && (options.progress||checkpoint)?
+        pipeline.convert_file_bounded(options.input_path,options.output_path,options.speaker_id,observer,checkpoint.get()):
+        convert_file_with_policy(pipeline,options.config,options.input_path,options.output_path,options.speaker_id);
+    if(result.paused){std::cout<<"Paused: "<<result.error_message<<std::endl;return 2;}
     if (!result.success) {
         std::cerr << "Conversion failed: " << result.error_message << "\n";
         return 1;
@@ -284,6 +320,10 @@ int run_vc_convert(const VcConvertOptions& options) {
               << "  Index:   " << result.index_ms << " ms\n"
               << "  Synth:   " << result.synth_ms << " ms\n";
     return 0;
+} catch(const io::OperationPaused& e) {
+    std::cout << "Paused: " << e.what() << std::endl;return 2;
+} catch(const std::exception& e) {
+    std::cerr << "Operation failed: " << e.what() << std::endl;return 1;
 }
 
 }  // namespace voxmutatio::app_support

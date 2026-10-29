@@ -22,8 +22,10 @@ add_library(host_transport STATIC
 target_include_directories(host_transport PUBLIC
     "${RESONANTIA_ROOT}" "${RESONANTIA_ROOT}/include")
 target_link_libraries(host_transport PUBLIC Threads::Threads)
+add_library(host_task_store STATIC "${RESONANTIA_ROOT}/tools/web/task_store.cpp" "${RESONANTIA_ROOT}/tools/web/task_artifacts.cpp" "${RESONANTIA_ROOT}/tools/web/task_storage.cpp")
+target_link_libraries(host_task_store PUBLIC host_transport)
 add_library(host_workflow STATIC "${RESONANTIA_ROOT}/tools/web/workflow_support.cpp")
-target_link_libraries(host_workflow PUBLIC host_transport)
+target_link_libraries(host_workflow PUBLIC host_transport host_task_store)
 add_library(host_web STATIC "${RESONANTIA_ROOT}/tools/web/web_service.cpp")
 target_link_libraries(host_web PUBLIC host_workflow)
 
@@ -35,7 +37,12 @@ function(register_host_contract name timeout)
         ENVIRONMENT "CUDA_VISIBLE_DEVICES=;OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
 endfunction()
 
-foreach(name IN ITEMS test_web_job_lifecycle test_web_result_contract test_web_train_cancel test_web_audio_upload)
+add_executable(test_web_task_store
+    "${RESONANTIA_ROOT}/tests/test_web_task_store.cpp")
+target_link_libraries(test_web_task_store PRIVATE host_workflow)
+register_host_contract(test_web_task_store 30)
+
+foreach(name IN ITEMS test_web_process_contract test_web_tasks test_web_job_lifecycle test_web_result_contract test_web_train_cancel test_web_audio_upload)
     add_executable(${name} "${RESONANTIA_ROOT}/tests/${name}.cpp")
     target_link_libraries(${name} PRIVATE host_web)
     register_host_contract(${name} 30)
@@ -53,7 +60,7 @@ add_executable(test_web_train_cancel_commit
     "${RESONANTIA_ROOT}/tools/web/web_service.cpp"
     "${RESONANTIA_ROOT}/tools/web/workflow_support.cpp")
 target_compile_definitions(test_web_train_cancel_commit PRIVATE RESONANTIA_TEST_MATERIAL_COMMIT_GATE=1)
-target_link_libraries(test_web_train_cancel_commit PRIVATE host_transport)
+target_link_libraries(test_web_train_cancel_commit PRIVATE host_transport host_task_store)
 register_host_contract(test_web_train_cancel_commit 30)
 
 add_executable(test_web_train_cancel_publish
@@ -61,7 +68,7 @@ add_executable(test_web_train_cancel_publish
     "${RESONANTIA_ROOT}/tools/web/web_service.cpp"
     "${RESONANTIA_ROOT}/tools/web/workflow_support.cpp")
 target_compile_definitions(test_web_train_cancel_publish PRIVATE RESONANTIA_TEST_TRAINING_PUBLISH_GATE=1)
-target_link_libraries(test_web_train_cancel_publish PRIVATE host_transport)
+target_link_libraries(test_web_train_cancel_publish PRIVATE host_transport host_task_store)
 register_host_contract(test_web_train_cancel_publish 15)
 
 add_executable(test_training_cancel_protocol
@@ -91,3 +98,25 @@ add_executable(test_vc_train_entry "${RESONANTIA_ROOT}/tests/test_vc_train_entry
 target_link_libraries(test_vc_train_entry PRIVATE host_workflow)
 add_dependencies(test_vc_train_entry vc_train_entry_exception_fixture)
 register_host_contract(test_vc_train_entry 10 "$<TARGET_FILE:vc_train_entry_exception_fixture>")
+
+add_executable(test_progress_protocol "${RESONANTIA_ROOT}/tests/test_progress_protocol.cpp")
+target_link_libraries(test_progress_protocol PRIVATE host_transport)
+register_host_contract(test_progress_protocol 30)
+
+add_executable(test_block_checkpoint "${RESONANTIA_ROOT}/tests/test_block_checkpoint.cpp"
+    "${RESONANTIA_ROOT}/src/io/block_checkpoint.cpp")
+target_include_directories(test_block_checkpoint PRIVATE "${RESONANTIA_ROOT}/include")
+target_link_libraries(test_block_checkpoint PRIVATE Catch2::Catch2WithMain)
+register_host_contract(test_block_checkpoint 30)
+
+add_executable(test_checkpoint_initialization "${RESONANTIA_ROOT}/tests/test_checkpoint_initialization.cpp"
+    "${RESONANTIA_ROOT}/src/io/block_checkpoint.cpp" "${RESONANTIA_ROOT}/tools/app_support/joint_initialization.cpp")
+target_link_libraries(test_checkpoint_initialization PRIVATE Catch2::Catch2WithMain host_transport)
+register_host_contract(test_checkpoint_initialization 30)
+
+add_executable(test_task_artifacts "${RESONANTIA_ROOT}/tests/test_task_artifacts.cpp")
+target_link_libraries(test_task_artifacts PRIVATE host_workflow)
+register_host_contract(test_task_artifacts 30)
+add_executable(test_task_storage "${RESONANTIA_ROOT}/tests/test_task_storage.cpp")
+target_link_libraries(test_task_storage PRIVATE host_workflow)
+register_host_contract(test_task_storage 30)

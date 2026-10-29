@@ -6,7 +6,7 @@ file(MAKE_DIRECTORY "${_resonantia_test_output_dir}")
 include("${PROJECT_SOURCE_DIR}/cmake/ResonantiaCatch2.cmake")
 
 add_executable(test_joint_run_state "${PROJECT_SOURCE_DIR}/tests/test_joint_run_state.cpp")
-target_include_directories(test_joint_run_state PRIVATE "${PROJECT_SOURCE_DIR}")
+target_include_directories(test_joint_run_state PRIVATE "${PROJECT_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(test_joint_run_state PRIVATE Catch2::Catch2WithMain)
 
 function(resonantia_add_test_executable target source)
@@ -66,6 +66,7 @@ resonantia_register_test(test_joint_cache test_joint_cache
     LABELS "contract;training;host" TIMEOUT 30 NO_GPU_LOCK)
 
 set(_contract_targets
+    test_block_checkpoint
     test_core
     test_audio_io
     test_content_kernels
@@ -81,6 +82,16 @@ set(_contract_targets
 foreach(target IN LISTS _contract_targets)
     resonantia_add_test_executable(${target} "${PROJECT_SOURCE_DIR}/tests/${target}.cpp")
 endforeach()
+
+resonantia_register_test(test_block_checkpoint test_block_checkpoint
+    LABELS "contract;host;checkpoint" TIMEOUT 30 NO_GPU_LOCK)
+
+resonantia_add_test_executable(test_checkpoint_initialization "${PROJECT_SOURCE_DIR}/tests/test_checkpoint_initialization.cpp")
+target_sources(test_checkpoint_initialization PRIVATE "${PROJECT_SOURCE_DIR}/tools/app_support/joint_initialization.cpp")
+target_include_directories(test_checkpoint_initialization PRIVATE "${PROJECT_SOURCE_DIR}")
+target_link_libraries(test_checkpoint_initialization PRIVATE resonantia_training_control)
+resonantia_register_test(test_checkpoint_initialization test_checkpoint_initialization
+    LABELS "contract;host;checkpoint" TIMEOUT 30 NO_GPU_LOCK)
 
 resonantia_register_test(test_core test_core LABELS "contract;gpu" TIMEOUT 60)
 resonantia_register_test(test_joint_training test_joint_training LABELS "contract;gpu;training" TIMEOUT 60)
@@ -199,6 +210,36 @@ target_link_libraries(test_web_transaction_failure PRIVATE resonantia_web_suppor
 resonantia_register_test(test_web_transaction_failure test_web_transaction_failure
     LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
 
+resonantia_add_process_test_executable(test_progress_protocol
+    "${PROJECT_SOURCE_DIR}/tests/test_progress_protocol.cpp")
+target_link_libraries(test_progress_protocol PRIVATE resonantia_web_support voxmutatio)
+resonantia_register_test(test_progress_protocol test_progress_protocol
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
+resonantia_add_process_test_executable(test_web_tasks
+    "${PROJECT_SOURCE_DIR}/tests/test_web_tasks.cpp")
+target_link_libraries(test_web_tasks PRIVATE resonantia_web_support resonantia_web_task_store)
+resonantia_register_test(test_web_tasks test_web_tasks
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
+resonantia_add_process_test_executable(test_web_task_store
+    "${PROJECT_SOURCE_DIR}/tests/test_web_task_store.cpp")
+target_link_libraries(test_web_task_store PRIVATE resonantia_web_support resonantia_web_task_store)
+resonantia_register_test(test_web_task_store test_web_task_store
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
+resonantia_add_process_test_executable(test_task_artifacts
+    "${PROJECT_SOURCE_DIR}/tests/test_task_artifacts.cpp")
+target_link_libraries(test_task_artifacts PRIVATE resonantia_web_support resonantia_web_task_store)
+resonantia_register_test(test_task_artifacts test_task_artifacts
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
+resonantia_add_process_test_executable(test_task_storage
+    "${PROJECT_SOURCE_DIR}/tests/test_task_storage.cpp")
+target_link_libraries(test_task_storage PRIVATE resonantia_web_support resonantia_web_task_store)
+resonantia_register_test(test_task_storage test_task_storage
+    LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
+
 resonantia_add_process_test_executable(test_web_job_lifecycle
     "${PROJECT_SOURCE_DIR}/tests/test_web_job_lifecycle.cpp")
 target_link_libraries(test_web_job_lifecycle PRIVATE resonantia_web_support)
@@ -216,7 +257,7 @@ target_sources(test_web_job_ownership PRIVATE
 target_include_directories(test_web_job_ownership PRIVATE "${PROJECT_SOURCE_DIR}")
 target_compile_definitions(test_web_job_ownership PRIVATE
     RESONANTIA_TEST_JOB_OWNERSHIP=1)
-target_link_libraries(test_web_job_ownership PRIVATE voxmutatio resonantia_training_control)
+target_link_libraries(test_web_job_ownership PRIVATE voxmutatio resonantia_training_control resonantia_web_task_store)
 resonantia_register_test(test_web_job_ownership test_web_job_ownership
     LABELS "contract;web;host" TIMEOUT 15 NO_GPU_LOCK)
 
@@ -228,7 +269,7 @@ resonantia_register_test(test_web_process_contract test_web_process_contract
 
 resonantia_add_process_test_executable(test_web_audio_upload
     "${PROJECT_SOURCE_DIR}/tests/test_web_audio_upload.cpp")
-target_link_libraries(test_web_audio_upload PRIVATE resonantia_web_support)
+target_link_libraries(test_web_audio_upload PRIVATE resonantia_web_support voxmutatio)
 resonantia_register_test(test_web_audio_upload test_web_audio_upload
     LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
 # Explicit opt-in: FFmpeg codec availability is a deployment dependency, not
@@ -265,7 +306,7 @@ target_sources(test_web_train_cancel_commit PRIVATE
 target_include_directories(test_web_train_cancel_commit PRIVATE "${PROJECT_SOURCE_DIR}")
 target_compile_definitions(test_web_train_cancel_commit PRIVATE
     RESONANTIA_TEST_MATERIAL_COMMIT_GATE=1)
-target_link_libraries(test_web_train_cancel_commit PRIVATE voxmutatio resonantia_training_control)
+target_link_libraries(test_web_train_cancel_commit PRIVATE voxmutatio resonantia_training_control resonantia_web_task_store)
 resonantia_register_test(test_web_train_cancel_commit test_web_train_cancel_commit
     LABELS "contract;web;host" TIMEOUT 30 NO_GPU_LOCK)
 
@@ -279,7 +320,7 @@ target_sources(test_web_train_cancel_publish PRIVATE
 target_include_directories(test_web_train_cancel_publish PRIVATE "${PROJECT_SOURCE_DIR}")
 target_compile_definitions(test_web_train_cancel_publish PRIVATE
     RESONANTIA_TEST_TRAINING_PUBLISH_GATE=1)
-target_link_libraries(test_web_train_cancel_publish PRIVATE voxmutatio resonantia_training_control)
+target_link_libraries(test_web_train_cancel_publish PRIVATE voxmutatio resonantia_training_control resonantia_web_task_store)
 resonantia_register_test(test_web_train_cancel_publish test_web_train_cancel_publish
     LABELS "contract;web;host" TIMEOUT 15 NO_GPU_LOCK)
 
@@ -332,9 +373,11 @@ resonantia_register_test(test_realtime_benchmark_report test_realtime_benchmark_
 # Node is a test-only dependency; the static WebUI has no Node build/runtime dependency.
 find_program(RESONANTIA_NODE_EXECUTABLE NAMES node nodejs)
 if(RESONANTIA_NODE_EXECUTABLE)
+    set(RESONANTIA_WEB_TEST_UI_DIR "${PROJECT_SOURCE_DIR}/webui" CACHE PATH
+        "WebUI assets under test (allows isolated pre-deployment validation)")
     foreach(ui_test IN ITEMS test_web_auth_ui test_web_train_cancel_ui test_web_audio_ui test_web_joint_ui)
         add_test(NAME ${ui_test}
-            COMMAND "${RESONANTIA_NODE_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/${ui_test}.cjs")
+            COMMAND "${RESONANTIA_NODE_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/${ui_test}.cjs" "${RESONANTIA_WEB_TEST_UI_DIR}")
         set_tests_properties(${ui_test} PROPERTIES
             WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/tests"
             LABELS "contract;web;host" TIMEOUT 10)
@@ -396,6 +439,52 @@ resonantia_register_test(test_build_index_contract test_build_index_contract
          "${FIXTURES}/speech_01.wav"
     LABELS "integration;model;gpu;index" TIMEOUT 300
     ASSETS "${HUBERT}" "${SPEECH}" "${FIXTURES}/speech_01.wav")
+
+resonantia_add_process_test_executable(test_operation_checkpoint
+    "${PROJECT_SOURCE_DIR}/tests/test_operation_checkpoint.cpp")
+target_link_libraries(test_operation_checkpoint PRIVATE resonantia_web_support voxmutatio)
+resonantia_register_test(test_operation_checkpoint test_operation_checkpoint
+    ARGS "${HUBERT}" "${RMVPE}" "${G_V2}" "${FIXTURES}/speech_02.wav" "${MODELS}/separation"
+    LABELS "integration;model;gpu;checkpoint" TIMEOUT 300
+    ASSETS "${HUBERT}" "${RMVPE}" "${G_V2}" "${FIXTURES}/speech_02.wav"
+           "${MODELS}/separation/karaoke_roformer.json"
+           "${MODELS}/separation/karaoke_roformer.safetensors"
+           "${MODELS}/separation/karaoke_roformer_config.i64"
+           "${MODELS}/separation/karaoke_roformer_dim_inputs.i64"
+           "${MODELS}/separation/karaoke_roformer_freq_indices.i64"
+           "${MODELS}/separation/karaoke_roformer_num_bands_per_freq.i64")
+
+resonantia_add_process_test_executable(test_operation_progress
+    "${PROJECT_SOURCE_DIR}/tests/test_operation_progress.cpp")
+target_link_libraries(test_operation_progress PRIVATE resonantia_web_support voxmutatio)
+add_dependencies(test_operation_progress vc_convert vc_preprocess)
+resonantia_register_test(test_operation_progress test_operation_progress
+    ARGS "$<TARGET_FILE:vc_convert>" "$<TARGET_FILE:vc_preprocess>" "${HUBERT}" "${RMVPE}" "${G_V2}"
+         "${FIXTURES}/speech_02.wav" "${MODELS}/separation"
+    LABELS "integration;model;gpu;progress" TIMEOUT 300
+    ASSETS "${HUBERT}" "${RMVPE}" "${G_V2}" "${FIXTURES}/speech_02.wav"
+           "${MODELS}/separation/karaoke_roformer.json"
+           "${MODELS}/separation/karaoke_roformer.safetensors"
+           "${MODELS}/separation/karaoke_roformer_config.i64"
+           "${MODELS}/separation/karaoke_roformer_dim_inputs.i64"
+           "${MODELS}/separation/karaoke_roformer_freq_indices.i64"
+           "${MODELS}/separation/karaoke_roformer_num_bands_per_freq.i64")
+
+resonantia_add_process_test_executable(test_checkpoint_cli
+    "${PROJECT_SOURCE_DIR}/tests/test_checkpoint_cli.cpp")
+target_link_libraries(test_checkpoint_cli PRIVATE resonantia_web_support voxmutatio resonantia_training_control)
+add_dependencies(test_checkpoint_cli vc_convert vc_preprocess)
+resonantia_register_test(test_checkpoint_cli test_checkpoint_cli
+    ARGS "$<TARGET_FILE:vc_convert>" "$<TARGET_FILE:vc_preprocess>" "${HUBERT}" "${RMVPE}" "${G_V2}"
+         "${FIXTURES}/speech_02.wav" "${MODELS}/separation"
+    LABELS "integration;model;gpu;checkpoint;cli" TIMEOUT 300
+    ASSETS "${HUBERT}" "${RMVPE}" "${G_V2}" "${FIXTURES}/speech_02.wav"
+           "${MODELS}/separation/karaoke_roformer.json"
+           "${MODELS}/separation/karaoke_roformer.safetensors"
+           "${MODELS}/separation/karaoke_roformer_config.i64"
+           "${MODELS}/separation/karaoke_roformer_dim_inputs.i64"
+           "${MODELS}/separation/karaoke_roformer_freq_indices.i64"
+           "${MODELS}/separation/karaoke_roformer_num_bands_per_freq.i64")
 
 resonantia_add_process_test_executable(
     test_vc_convert_bounded_contract

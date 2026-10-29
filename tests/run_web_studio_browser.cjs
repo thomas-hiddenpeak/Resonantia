@@ -35,6 +35,7 @@ const types = {
   "app.js": "text/javascript",
   "workflows.js": "text/javascript",
   "studio.js": "text/javascript",
+  "tasks.js": "text/javascript",
   "presets.json": "application/json",
 };
 const server = http.createServer((req, res) => {
@@ -44,7 +45,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   res.writeHead(200, { "Content-Type": types[name] });
-  fs.createReadStream(path.join(root, "webui", name)).pipe(res);
+  fs.createReadStream(path.join(process.argv[3] || path.join(root, "webui"), name)).pipe(res);
 });
 (async () => {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));

@@ -1,6 +1,6 @@
 // Production profile controls against a minimal DOM; no browser/server/model.
 const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict');
-const source=fs.readFileSync(path.join(__dirname,'../webui/app.js'),'utf8');
+const source=fs.readFileSync(path.join(process.argv[2] || path.join(__dirname,'../webui'),'app.js'),'utf8');
 new vm.Script(source);
 const start=source.indexOf('// ---------- Training profiles ----------');
 const end=source.indexOf('// ---------- Presets',start);
@@ -53,7 +53,7 @@ console.log('Joint UI passed: capability discovery, old-server fallback, bounded
 const voiceStart=source.indexOf('// ---------- Voice presets ----------');
 const voiceEnd=source.indexOf('const CONV_SESSION',voiceStart);
 assert(voiceStart>=0 && voiceEnd>voiceStart,'voice preset selection missing');
-const presetData=JSON.parse(fs.readFileSync(path.join(__dirname,'../webui/presets.json'),'utf8'));
+const presetData=JSON.parse(fs.readFileSync(path.join(process.argv[2] || path.join(__dirname,'../webui'),'presets.json'),'utf8'));
 assert.deepEqual(presetData.inference.filter(p=>p.voice).map(p=>p.voice),['Tom_Cybersinger'],
     'only the current formal voice should have a voice-specific preset');
 const voiceElements=new Map();

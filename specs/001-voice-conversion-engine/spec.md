@@ -373,3 +373,26 @@ Spec 001 产品范围，因此这些 focused 结果不足以把整个 001 规格
 不能直接用于整曲。共享原模型/索引与参数，不更改权重或模型格式。
 兼容与回滚：新增字段缺省为空；删除该 flag/清空列表恢复原推理。验证见
 [Web发布记录](../../docs/WEBUI_RELEASE_20261029.md)。
+
+### 2026-10-29 Web长任务进度迁移（实施中）
+
+依据[ADR-0010](../../docs/adr/0010-durable-web-task-lifecycle.md)，bounded-file入口增加可选
+同步领域ProgressObserver，空观察器保持旧调用与数值路径。输入准备、F0、合成、输出提供实际
+边界计数；不读取Web任务ID，回调异常沿现有VCResult失败契约，不把未完成文件标成成功。
+CLI显式`--progress`才输出结构化边界行。本进度接口本身不代表恢复。
+
+同一迁移新增可选、借用的`io::BlockCheckpoint*`（空指针保持原路径）。恢复按原绝对帧格
+重放已完成的F0裁剪窗口，按QuietCorePlanner原切点重放已完成的40k合成core；仍在完整F0后
+执行全局平滑/修音、最后执行全局RMS及原子WAV提交。不重算已缓存的模型窗口，不改变采样seed
+和frame offset。暂停仅在完整块已持久化之后返回`VCResult{success=false, paused=true}`，
+不发布输出；损坏/错身份/写入失败返回普通失败，不能伪装暂停。
+
+`vc_convert --checkpoint-dir <dir>`显式启用；`--resume`继续同一身份，`--pause-file <path>`
+沿用单字节0/1作业通道，退出0为完成、2为安全暂停、1为错误。恢复前校验输入、实际选用的
+HuBERT/F0/G/索引字节、完整数值参数及正在执行的二进制摘要；改变模型/参数或升级二进制时拒绝
+混用旧块。限定HuBERT bounded路径，不给未合格WavLM宣称恢复支持。旧命令不传新增选项时无
+checkpoint I/O。库调用者负责绑定同样完整的身份，不从库读取Web任务ID。
+
+存储每块最多32MiB、每个store最多4096块/2GiB，独占flock、有限浮点和offset/count检查、
+SHA-256及staging/fsync/rename提交；块损坏不静默重算。已有空目录在初始身份写入中断后可修复，
+已有块却缺失身份必须拒绝。完整Web阶段复用、控制及页面恢复仍须按Spec003验收。

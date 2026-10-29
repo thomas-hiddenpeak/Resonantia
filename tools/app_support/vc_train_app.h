@@ -12,6 +12,7 @@
 namespace voxmutatio::app_support {
 
 struct VcTrainOptions {
+    bool progress = false;
     std::string hubert_path;
     std::string rmvpe_path;
     std::string pretrained_path;
@@ -31,6 +32,7 @@ struct VcTrainOptions {
     std::string cache_dir;       // joint-full only; immutable frozen frontends.
     std::string checkpoint_dir;  // joint-full only; retained across cancellation.
     std::string resume_path;     // Full state, never an inference model.
+    bool resume_initial = false; // Explicit restart of an uncommitted step-zero initialization.
     SynthesisMode synthesis_mode = SynthesisMode::kSampled;
 };
 

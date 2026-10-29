@@ -1546,10 +1546,20 @@ void run_open_server_contracts(Checks& checks, const fs::path& server,
     checks.expect(request(process.port(), "GET", "/api/voices").status == 200,
                   "default API mode should remain open");
 
+    checks.expect(request(process.port(), "GET", "/api/tasks", {}, {},
+                          "Range: bytes=1-2\r\nRange: bytes=3-4\r\n").status == 400,
+                  "duplicate Range headers must fail before routing");
     const auto cancel_method = request(process.port(), "GET", "/api/train/cancel");
     checks.expect(cancel_method.status == 405 && cancel_method.has_header("Allow: POST\r\n"),
                   "cancel endpoint must reject GET with Allow POST");
     const auto initial_job = request(process.port(), "GET", "/api/train/status").body;
+    const auto rename_method=request(process.port(),"GET","/api/task/rename");
+    checks.expect(rename_method.status==405&&rename_method.has_header("Allow: POST\r\n"),"rename method contract");
+    for(const auto& fields:std::vector<std::vector<std::pair<std::string,std::string>>>{
+        {{"id","missing-task"},{"name","标题"},{"name","重复"}},
+        {{"id","missing-task"},{"name","标题"}},
+        {{"id","missing-task"},{"name","标题"},{"expected_name","旧"},{"extra","unsupported"}}})
+        checks.expect(request(process.port(),"POST","/api/task/rename",multipart_body(fields),kMultipartType).status==400,"rename requires exactly three unique fields");
     checks.expect(request(process.port(), "POST", "/api/train/cancel",
                           multipart_body({{"job_id", "unknown"}}), kMultipartType).status == 404,
                   "cancel without an admitted job must return 404");

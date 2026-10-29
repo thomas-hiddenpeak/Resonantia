@@ -13,6 +13,9 @@
             dry:'直接转换原始上传的单人干声。保留自然轻重，避免不必要的清理。',
             manual:'使用下方逐步处理后的结果转换，仅输出人声；其他输入类型会重新使用原始上传文件。'
         }[mode];
+        q('inputKind').disabled = locked || !!convSource;
+        q('manualCleanup').querySelectorAll('button,select').forEach(el=>{if(convSource)el.disabled=true;});
+        q('convResetPre').disabled=locked||!!convSource;
         q('outputKind').disabled = locked || mode !== 'song';
         if (mode !== 'song') q('outputKind').value = 'vocal';
         else if (previousWorkflow !== 'song') q('outputKind').value = 'mix';
@@ -65,9 +68,20 @@
         validate: pitchText,
         resetPitchEdits: () => q('pitchEdits').replaceChildren(),
         refreshRuns,
+        restore(p) {
+            candidatePreview=null;q('candidateNotice').hidden=true;q('exitCandidate').hidden=true;
+            q('inputKind').value=p.workflow;workflowChanged();q('outputKind').value=p.output_kind;
+            q('conversionDereverb').checked=p.pp_dereverb==='1';
+            q('pitchEdits').replaceChildren();
+            for(const text of (p.pitch_edits||'').split(';').filter(Boolean)) {
+                q('addPitchEdit').onclick();const row=q('pitchEdits').lastElementChild,parts=text.split(':');
+                for(const [i,role] of ['mode','start','end','shift'].entries())if(parts[i]!==undefined)row.querySelector('[data-role="'+role+'"]').value=parts[i];
+                row.querySelector('select').dispatchEvent(new Event('change'));
+            }
+        },
         append(fd) {
             fd.append('workflow',q('inputKind').value); fd.append('output_kind',q('outputKind').value);
-            fd.append('pp_dereverb',q('conversionDereverb').checked?'1':'0');
+            if(!(convSource&&q('inputKind').value==='manual'))fd.append('pp_dereverb',q('conversionDereverb').checked?'1':'0');
             fd.append('pitch_edits',pitchText());
             if (candidatePreview) { fd.append('training_run',candidatePreview.run); fd.append('candidate',candidatePreview.file); }
         }
@@ -84,7 +98,7 @@
         run.candidates.forEach(file=>q('trainingCandidate').appendChild(option(file,'第 '+Number(file.slice(16,26))+' 轮')));
         q('trainingCandidate').value=run.candidates.at(-1)||'';
         q('runInfo').textContent=(run.result_ready?'训练结果已就绪，可试听候选或以新名称发布。':'训练结果尚未完整，请查看日志。')+(!run.result_ready?(run.resumable?' 已有可恢复检查点。':' 尚无恢复检查点。'):' 此任务已完成，无需恢复。');
-        q('resumeRun').disabled=!run.resumable || run.result_ready; q('publishName').value=(run.name==='CyberTom_Full_20261026'?'Tom_Cybersinger':run.name)+'_Released';
+        q('resumeRun').textContent=run.task_id?'查看原任务':'恢复训练'; q('resumeRun').disabled=!run.task_id && (!run.resumable || run.result_ready); q('publishName').value=(run.name==='CyberTom_Full_20261026'?'Tom_Cybersinger':run.name)+'_Released';
         q('previewCandidate').disabled=!run.candidates.length; q('publishVoice').disabled=!run.result_ready || !run.candidates.length;
     }
     async function refreshRuns() {
@@ -100,14 +114,14 @@
     q('refreshRuns').onclick=refreshRuns; q('trainingRun').onchange=chooseRun;
     q('refreshRunLog').onclick=async()=>{
         const name=q('trainingRun').value;if(!name)return;
-        try {const response=await apiFetch(API+'/train/status?name='+encodeURIComponent(name));
+        try {const run=selectedRun();if(run?.task_id){globalThis.resonantiaTasks?.open(run.task_id);return;}const response=await apiFetch(API+'/train/status?name='+encodeURIComponent(name));
             if(!response.ok)throw new Error(await errText(response));const result=await response.json();
             if(q('trainingRun').value===name)q('runLog').textContent=result.log||'暂无日志';
         }catch(error){q('runLog').textContent='日志读取失败：'+error.message;}
     };
     q('trainingCandidate').onchange=()=>{q('publishReviewed').checked=false;};
     q('resumeRun').onclick=()=>{
-        const run=selectedRun(); if(!run?.resumable || run.result_ready)return;
+        const run=selectedRun(); if(run?.task_id){globalThis.resonantiaTasks?.open(run.task_id);return;} if(!run?.resumable || run.result_ready)return;
         q('voiceName').value=run.name; q('trainMode').value='joint-full'; applyTrainingMode();
         q('trainResume').checked=true; updateTrainBtn();
         document.querySelector('[data-tab="train"]').click();

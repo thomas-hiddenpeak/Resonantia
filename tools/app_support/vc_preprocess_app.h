@@ -11,6 +11,10 @@
 namespace voxmutatio::app_support {
 
 struct VcPreprocessOptions {
+    bool progress = false;
+    std::string checkpoint_dir;
+    std::string pause_file;
+    bool resume = false;
     std::string input;
     std::string output_dir;
     int sample_rate = 40'000;

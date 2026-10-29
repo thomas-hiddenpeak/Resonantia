@@ -172,3 +172,22 @@ NaN/Inf 音频，验证 loader 在上传前拒绝权重且运行入口不返回�
 旧 CLI 默认单声道路径不变。Web 清理显式使用此路径；模型推理前才混合成单声道。
 该路径源于 CyberTom《需要人陪》真实试听：去和声明显缓解尾段异常音高，但不保证
 清除所有错音，也不自动替代人工局部音高校正。
+
+### 2026-10-29 长任务进度迁移（实施中）
+
+依据[ADR-0010](../../docs/adr/0010-durable-web-task-lifecycle.md)，Roformer分离入口增加可选
+同步领域ProgressObserver，按实际完成的overlap-add块计数，短输入为一块。空观察器不改变
+分块、边界窗与归一化；异常遵守原入口异常契约。vc_preprocess显式`--progress`输出任务阶段/
+文件及块计数。单纯进度不等于恢复。
+
+Roformer两个分离入口另增可选、借用的`io::BlockCheckpoint*`；调用者绑定输入、模型/配置、
+实现身份。完成窗口保留完整模型输出；继续时按原顺序重放窗口、首尾边界权重及overlap-add，
+重建累加器而不重算已完成的GPU窗口。完整块保存后才能抛出`io::OperationPaused`；普通错误
+和损坏块沿runtime_error契约，不返回半段音频。短输入也是一块。默认空指针不写checkpoint。
+
+`vc_preprocess --checkpoint-dir <dir> [--resume] [--pause-file <path>]`将输入文件序列、
+各启用清理模型的权重/json/i64、VAD权重（如启用）、数值配方及二进制摘要绑定到同一CLI会话；
+每个输入/清理阶段独立保存Roformer窗口。模型加载前校验身份，退出0完成、2安全暂停、1错误。
+恢复重建清理波形、切片/输出文件，不能把低成本重建说成已保存了整个阶段输出；VAD/切片本身
+没有细粒度checkpoint。最多4096个输入文件；每个块store的32MiB/4096块/2GiB限制及失败语义
+同Spec001。Web整任务磁盘预算与阶段产物完成标记另行验收，不能以子store界限替代。

@@ -20,6 +20,10 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <array>
+#include <charconv>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 namespace resonantia::web {
 
@@ -162,6 +166,7 @@ ReadResult read_request(int fd, Request& request, const std::string& auth_token,
     bool have_content_length = false;
     bool have_content_type = false;
     bool have_authorization = false;
+    bool have_range = false;
     while (std::getline(headers, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line.front() == ' ' || line.front() == '\t') {
@@ -197,6 +202,9 @@ ReadResult read_request(int fd, Request& request, const std::string& auth_token,
             if (have_authorization) return ReadResult::kBadRequest;
             request.authorization = value;
             have_authorization = true;
+        } else if (key == "range") {
+            if(have_range)return ReadResult::kBadRequest;
+            request.range=value;have_range=true;
         } else if (key == "transfer-encoding") {
             return ReadResult::kBadRequest;
         }
@@ -607,6 +615,61 @@ void send_response(int fd, int status, const char* text, const std::string& cont
     const std::string headers = response.str();
     if (!send_all(fd, headers.data(), headers.size())) return;
     if (!body.empty()) send_all(fd, body.data(), body.size());
+}
+
+void send_audio_file(int socket,const std::filesystem::path& path,const std::string& range) {
+    struct Owner{int fd;~Owner(){if(fd>=0)::close(fd);}} file{
+        ::open(path.c_str(),O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOFOLLOW)};
+    struct stat st{};
+    if(file.fd<0||::fstat(file.fd,&st)||!S_ISREG(st.st_mode)||st.st_size<=0) {
+        send_response(socket,410,"Gone","application/json","{\"error\":\"retained audio result is unavailable\"}");return;
+    }
+    // Separate from the upload/body ceiling: never allocate the artifact size.
+    if(st.st_size>(1LL<<30)) {
+        send_response(socket,413,"Payload Too Large","application/json","{\"error\":\"audio artifact exceeds 1 GiB\"}");return;
+    }
+    const auto size=static_cast<std::uint64_t>(st.st_size);
+    std::uint64_t first=0,last=size-1;
+    bool valid=true;
+    const auto number=[](std::string_view text,std::uint64_t& out) {
+        if(text.empty()||text.size()>20||text.find_first_not_of("0123456789")!=text.npos)return false;
+        const auto parsed=std::from_chars(text.data(),text.data()+text.size(),out);
+        return parsed.ec==std::errc{}&&parsed.ptr==text.data()+text.size();
+    };
+    if(!range.empty()) {
+        if(range.size()>96||!range.starts_with("bytes="))valid=false;
+        else {
+            const std::string_view bytes(range.data()+6,range.size()-6);
+            const auto dash=bytes.find('-');
+            if(dash==bytes.npos)valid=false;
+            else if(dash==0) {
+                std::uint64_t count=0;valid=number(bytes.substr(1),count)&&count>0;
+                if(valid)first=size-std::min(size,count);
+            } else {
+                valid=number(bytes.substr(0,dash),first);
+                if(dash+1<bytes.size())valid=number(bytes.substr(dash+1),last)&&valid;
+                valid=valid&&first<size&&last>=first;last=std::min(last,size-1);
+            }
+        }
+    }
+    if(!valid) {
+        send_response(socket,416,"Range Not Satisfiable","application/json","{\"error\":\"invalid audio byte range\"}",
+                      "Content-Range: bytes */"+std::to_string(size)+"\r\n");return;
+    }
+    std::string header=range.empty()?"HTTP/1.1 200 OK\r\n":"HTTP/1.1 206 Partial Content\r\n";
+    header+="Content-Type: audio/wav\r\nContent-Length: "+std::to_string(last-first+1)+
+        "\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n";
+    if(!range.empty())header+="Content-Range: bytes "+std::to_string(first)+"-"+std::to_string(last)+"/"+std::to_string(size)+"\r\n";
+    header+="Connection: close\r\n\r\n";
+    if(!send_all(socket,header.data(),header.size()))return;
+    std::array<char,65536> buffer{};
+    for(auto offset=first;offset<=last;) {
+        const auto count=static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(),last-offset+1));
+        const auto n=::pread(file.fd,buffer.data(),count,static_cast<off_t>(offset));
+        if(n<0&&errno==EINTR)continue;
+        if(n<=0) {std::fprintf(stderr,"retained audio read failed after response started\n");return;}
+        if(!send_all(socket,buffer.data(),n))return;offset+=static_cast<std::uint64_t>(n);
+    }
 }
 
 void send_json(int fd, const std::string& json) {

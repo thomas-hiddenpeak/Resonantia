@@ -208,6 +208,32 @@ void expect_batch_collision_rejected(const std::string& executable, const fs::pa
     }
 }
 
+void expect_initial_resume_contract(const std::string& executable,const fs::path& root) {
+    expect_success_contains("training help describes initial resume",executable,{"--help"},{"--resume-initial"});
+    auto legacy=train_required();append(legacy,{"--resume-initial"});
+    expect_rejected("initial resume requires full profile",executable,legacy,"require joint-full");
+    expect_rejected("initial resume cannot repeat",executable,{"--resume-initial","--resume-initial"},"cannot be repeated");
+    auto both=train_required();append(both,{"--gan","--gan-profile","joint-full","--cache-dir","cache","--checkpoint-dir","state","--resume-initial","--resume","saved"});
+    expect_rejected("initial and checkpoint resume cannot combine",executable,both,"mutually exclusive");
+    const auto input=root/"initial-input.wav",state=root/"initial-state";fs::create_directory(state);
+    {
+        constexpr unsigned frames=12800,rate=40000;std::ofstream wav(input,std::ios::binary);
+        const auto u16=[&](unsigned v){wav.put(char(v));wav.put(char(v>>8));};
+        const auto u32=[&](unsigned v){for(int i=0;i<4;++i)wav.put(char(v>>(8*i)));};
+        wav<<"RIFF";u32(36+2*frames);wav<<"WAVEfmt ";u32(16);u16(1);u16(1);
+        u32(rate);u32(rate*2);u16(2);u16(16);wav<<"data";u32(2*frames);
+        const std::string silence(frames*2,'\0');wav.write(silence.data(),silence.size());
+    }
+    const auto saved=state/"state_step_0000000000.safetensors";std::ofstream(saved)<<"published state";
+    const std::vector<std::string> args{"--hubert","missing-hubert","--rmvpe","missing-rmvpe","--pretrained","missing-model",
+        "--target",input.string(),"--out",(root/"initial-out").string(),"--gan","--gan-profile","joint-full",
+        "--cache-dir",(root/"initial-cache").string(),"--checkpoint-dir",state.string(),"--resume-initial"};
+    expect_rejected("initial resume cannot discard a published checkpoint before CUDA",executable,args,
+                    "initial resume requires no published checkpoint");
+    std::ifstream file(saved);const std::string bytes((std::istreambuf_iterator<char>(file)),{});
+    if(bytes!="published state"){++failures;std::cerr<<"FAIL initial resume changed a published checkpoint\n";}
+}
+
 struct DependencyCase {
     std::string label;
     std::vector<std::string> arguments;
@@ -297,7 +323,7 @@ int main(int argc, char** argv) {
 
     expect_success_contains(
         "vc_convert help lists the supported model contract", convert, {"--help"},
-        {"--synthesis-mode", "--synthesis-seed", "--filter-radius", "--version", "--speakers", "--sr", "40 kHz",
+        {"--checkpoint-dir", "--resume", "--pause-file", "--synthesis-mode", "--synthesis-seed", "--filter-radius", "--version", "--speakers", "--sr", "40 kHz",
          "--rmvpe", "--fcpe", "required when f0-method=rmvpe",
          "required when f0-method=fcpe", "required when index-rate > 0",
          "required when content-encoder=hubert",
@@ -525,6 +551,7 @@ int main(int argc, char** argv) {
     }
     expect_batch_collision_rejected(batch, temp.path());
     expect_joint_preflight(train,temp.path());
+    expect_initial_resume_contract(train,temp.path());
     {
         auto args = preprocess_required(temp.path());
         append(args, {"--sr", "forty-k"});
