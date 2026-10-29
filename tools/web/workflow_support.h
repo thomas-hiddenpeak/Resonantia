@@ -118,6 +118,8 @@ struct UploadResult {
 
 [[nodiscard]] std::string lower(std::string value);
 [[nodiscard]] bool safe_name(const std::string& value);
+// Preserve valid UTF-8; filter ASCII punctuation as before. Reject path separators,
+// NUL, invalid UTF-8 and names over 255 bytes. Empty means an invalid basename.
 [[nodiscard]] std::string safe_filename(const std::string& value);
 [[nodiscard]] std::string json_escape(const std::string& value);
 [[nodiscard]] bool parse_int_field(const std::string& value, int minimum, int maximum,

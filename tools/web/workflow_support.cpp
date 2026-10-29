@@ -395,10 +395,35 @@ std::string safe_filename(const std::string& value) {
     const std::string base = fs::path(value).filename().string();
     if (base.empty() || base == "." || base == ".." || base.size() > 255) return "";
     std::string output;
-    for (unsigned char c : base) {
-        if (std::isalnum(c) || c == '_' || c == '-' || c == '.') {
-            output += static_cast<char>(c);
+    output.reserve(base.size());
+    for (std::size_t i = 0; i < base.size();) {
+        const auto c = static_cast<unsigned char>(base[i]);
+        if (c < 0x80) {
+            if (std::isalnum(c) || c == '_' || c == '-' || c == '.') {
+                output += static_cast<char>(c);
+            }
+            ++i;
+            continue;
         }
+        // Preserve complete UTF-8 characters: stripping them turns Chinese song
+        // names into ".mp3" (no extension) and collapses distinct batch entries.
+        const std::size_t width = c >= 0xc2 && c <= 0xdf ? 2 :
+                                  c >= 0xe0 && c <= 0xef ? 3 :
+                                  c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+        if (width == 0 || width > base.size() - i) return "";
+        unsigned codepoint = c & (0x7f >> width);
+        for (std::size_t j = 1; j < width; ++j) {
+            const auto next = static_cast<unsigned char>(base[i + j]);
+            if ((next & 0xc0) != 0x80) return "";
+            codepoint = (codepoint << 6) | (next & 0x3f);
+        }
+        if ((width == 3 && codepoint < 0x800) ||
+            (width == 4 && codepoint < 0x10000) ||
+            (codepoint >= 0xd800 && codepoint <= 0xdfff) || codepoint > 0x10ffff) {
+            return "";
+        }
+        output.append(base, i, width);
+        i += width;
     }
     if (output.empty() || output == "." || output == ".." || output.size() > 255) return "";
     return output;

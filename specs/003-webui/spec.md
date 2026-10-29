@@ -270,6 +270,11 @@ OGG（Vorbis/Opus）、Opus、WMA、AIFF/AIF。WAV 字节保持不变；其他�
 中由 CPU FFmpeg 解码成 PCM16、44.1 kHz、mono WAV；模型输出继续遵守 40 kHz WAV 契约。
 原输入可能有损；下混/重采样/量化不承诺保存原始多声道或高位深。
 
+文件名保留合法UTF-8字符（含中文、日文、带重音字母和emoji），不能删空非ASCII
+basename而误判扩展名或制造批内重名。ASCII空格/标点仍沿用现有过滤规则；拒绝
+路径分隔符、NUL、非法UTF-8及超过255字节的原始basename。扩展名不区分大小写，
+替换为`.wav`后的真正重名仍使整批失败并保留旧素材。
+
 仅允许对应 demuxer 和本地 file 协议，禁用 MOV 外部引用，选取首个音轨，丢弃视频、字幕、
 数据和 metadata。以 argv 启动 `/usr/bin/timeout`、`/usr/bin/prlimit`、配置的 FFmpeg；
 不使用 shell。每实例最多一个解码批次，解码线程2、filter线程1、地址空间2 GiB、单次
@@ -286,7 +291,7 @@ UI 两个选择/拖拽入口使用相同白名单；训练支持多文件。上�
 迁移：保留现有WAV路径与数据，部署完整音频codec的FFmpeg及coreutils/util-linux；
 独立构建和短音频验证后备份vc_serve及UI，在无活动任务时一起切换并重启。回滚恢复
 二进制与UI，新增素材已是标准WAV，无需迁移模型或原文件。部署验证仅GET，由用户试听。
-`test_web_audio_upload`覆盖四入口、失败事务、大小/并发/超时；`test_web_audio_ui`覆盖界面；
+`test_web_audio_upload`覆盖四入口、UTF-8文件名/边界/归一化重名、失败事务、大小/并发/超时；`test_web_audio_ui`覆盖界面；
 `RESONANTIA_ENABLE_AUDIO_CODEC_TESTS=ON`注册真实短人声的`test_web_audio_codecs`。
 
 ## 6. Security Boundary and Non-goals

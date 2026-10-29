@@ -144,6 +144,28 @@ void run() {
     check(reply.status == 200, "MP3 material must normalize successfully; got " + std::to_string(reply.status));
     check(read_file(paths.runs + "/voice/raw/song.wav") == pcm(), "normalized WAV missing");
     check(runner->decodes == 1 && runner->models == 0, "upload must decode once without models");
+    const std::string unicode_name = "单依纯 – 我管不住我自己.mp3";
+    reply = request(service, "/api/material", {{unicode_name, "encoded"}});
+    check(reply.status == 200, "Chinese/Unicode filename rejected before decoding: " + reply.body);
+    check(read_file(paths.runs + "/voice/raw/单依纯–我管不住我自己.wav") == pcm(),
+          "Unicode name must survive sanitization and WAV normalization");
+    reply = request(service, "/api/material", {{"张三.wav", pcm()}, {"李四.wav", pcm()},
+                                               {"うた🎤.MP3", "encoded"}, {"café.FLAC", "encoded"}});
+    check(reply.status == 200, "distinct Unicode filenames must not collapse into one name");
+    check(read_file(paths.runs + "/voice/work/张三.wav") == pcm() &&
+          read_file(paths.runs + "/voice/work/李四.wav") == pcm() &&
+          read_file(paths.runs + "/voice/work/うた🎤.wav") == pcm() &&
+          read_file(paths.runs + "/voice/work/café.wav") == pcm(), "Unicode batch outputs missing");
+    for (const auto& bad : std::vector<std::string>{"../录音.mp3", "目录/录音.mp3", "目录\\录音.mp3",
+              std::string("bad\0.mp3",8), std::string("\xc0\xaf.mp3"), std::string("\xed\xa0\x80.mp3"),
+              std::string("\xf4\x90\x80\x80.mp3"), std::string("\xe4\xb8.mp3"),
+              std::string("\x80.mp3"), std::string("\xe0\x80\xaf.mp3"),
+              std::string("\xf0\x80\x80\xaf.mp3"), std::string("\xe4\xb8X.mp3")})
+        check(safe_filename(bad).empty(), "unsafe or invalid UTF-8 filename accepted");
+    std::string long_name;
+    for (int i=0; i<83; ++i) long_name += "音";
+    check(safe_filename(long_name+".mp3")==long_name+".mp3", "valid filename below 255 bytes rejected");
+    check(safe_filename(long_name+"音.mp3").empty(), "overlong filename accepted");
     for (const auto& extension : {"wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "wma", "aiff", "aif"}) {
         const auto file = std::string("audio.") + extension;
         reply = request(service, "/api/material", {{file, std::string(extension) == "wav" ? pcm() : "encoded"}});
@@ -163,7 +185,8 @@ void run() {
             check(!entry.path().filename().string().starts_with('.'), "staging not cleaned");
     };
     for (const auto& files : std::vector<std::vector<std::pair<std::string, std::string>>>{
-             {{"a.mp3", "x"}, {"a.FLAC", "x"}}, {{"a.mp4", "x"}}, {{"a.mp3", ""}}, {{"a.wav", "bad"}}}) {
+             {{"a.mp3", "x"}, {"a.FLAC", "x"}}, {{"录音.mp3", "x"}, {"录音.FLAC", "x"}},
+             {{"a.mp4", "x"}}, {{"a.mp3", ""}}, {{"a.wav", "bad"}}}) {
         const auto before = runner->decodes.load();
         check(request(service, "/api/material", files).status == 400, "bad upload accepted");
         check(runner->decodes == before, "invalid batch launched decoder"); preserved();
@@ -226,13 +249,13 @@ void run() {
     check(request(missing, "/api/material", {{"a.mp3", "x"}}).status == 503, "missing dependency not reported"); preserved();
     check(request(missing, "/api/material", {{"old.WAV", old}}).status == 200, "WAV requires FFmpeg");
     runner->decode = {};
-    check(request(service, "/api/preprocess", {{"a.aac", "x"}}).body == pcm(), "preprocess did not normalize audio");
-    check(request(service, "/api/convert", {{"a.flac", "x"}}).status == 200, "convert did not normalize audio");
-    check(request(service, "/api/train", {{"a.wma", "x"}}).status == 200, "training did not accept normalized material");
+    check(request(service, "/api/preprocess", {{"录音.aac", "x"}}).body == pcm(), "preprocess did not normalize Unicode audio");
+    check(request(service, "/api/convert", {{"录音.flac", "x"}}).status == 200, "convert did not normalize Unicode audio");
+    check(request(service, "/api/train", {{"录音.wma", "x"}}).status == 200, "training did not accept Unicode material");
     const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (service.use_count() != 1 && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     check(service.use_count() == 1, "mock training worker did not retire");
-    check(read_file(paths.runs + "/voice/raw/a.wav") == pcm(), "training raw not normalized");
+    check(read_file(paths.runs + "/voice/raw/录音.wav") == pcm(), "training raw not normalized");
 
     // Exercise the same deadline wrapper and production process runner with a
     // short sleeping fixture. No test waits for the production 120 s deadline.
@@ -321,6 +344,13 @@ void codecs(const std::string& ffmpeg, const std::string& speech) {
         check(n > 74970 && n < 101430, "decoded duration outside 1 +/- .15 seconds");
         check(decoded.find_first_not_of('\0', data + 8) != std::string::npos, "real speech became silence");
         std::cout << ext << '/' << encoder << ": " << n / 88200.0 << " s\n";
+        if (ext == "MP3") {
+            const auto unicode = request(service, "/api/material",
+                {{"单依纯 – 我管不住我自己.mp3", read_file(file)}});
+            check(unicode.status == 200, "real MP3 with reported Unicode filename failed: " + unicode.body);
+            check(read_file(paths.runs+"/voice/work/单依纯–我管不住我自己.wav")==decoded,
+                  "filename must not affect decoded audio");
+        }
     }
     for (const auto& ext : {"mp3", "m4a", "aac", "flac", "ogg", "opus", "wma", "aiff"})
         check(request(service, "/api/material", {{std::string("bad.") + ext, "#EXTM3U\nhttp://127.0.0.1/secret\n"}}).status == 400,

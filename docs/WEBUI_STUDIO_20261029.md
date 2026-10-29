@@ -101,3 +101,63 @@ node tests/run_web_studio_browser.cjs
 `runs/WebUI_Studio_20261029/baseline/webui/`；回退只改服务webroot，不涉及任何素材或模型。
 完整删除清单与正式声线改名见[前一轮发布记录](WEBUI_RELEASE_20261029.md)。
 GitHub推送与CI以最终交付中的提交链接及该提交的运行结果为准；本文件记录本地验收证据。
+
+### 中文文件名上传修复（2026-10-29）
+
+用户反馈`单依纯 – 我管不住我自己.mp3`上传报格式不支持。旧`safe_filename`删掉
+中文和特殊横线，使结果只剩`.mp3`，随后被文件系统扩展名检查拒绝，尚未调用FFmpeg。
+已保留合法UTF-8字符，拒绝非法编码、路径分隔符、NUL及超过255字节的名称；ASCII
+过滤规则保持。不同中文文件不会再折叠成相同名称；归一化为WAV后的真正重名仍整批
+拒绝，并保留原材料。四个上传入口共用修复。
+
+新增回归覆盖中文、日文、重音字母、emoji、非法/截断/过长UTF-8、路径/字节上限、
+不同中文名称和跨格式真正重名；真实MP3以ASCII及用户报告的文件名上传后，断言解码
+WAV逐字节一致。模型进程在契约测试中使用替身，codec测试仅调用FFmpeg。
+
+```bash
+cmake --build /tmp/resonantia-web-release-host --target test_web_audio_upload -j 2
+ctest --test-dir /tmp/resonantia-web-release-host -R '^test_web_audio_upload$' --output-on-failure
+cmake --build /tmp/resonantia-performance-20261024.uemhTG -j 2
+ctest --test-dir /tmp/resonantia-performance-20261024.uemhTG -L web --output-on-failure
+NODE_PATH=/tmp/resonantia-web-release-browser/node_modules \
+  /tmp/resonantia-web-release-browser/node_modules/node/bin/node \
+  runs/Unicode_Upload_Fix_20261029/upload-browser.cjs
+bash scripts/check_sdd.sh
+git diff --check
+```
+
+修复前focused测试因中文名返回400失败，生产HTTP一秒MP3同名复现400；修复后focused
+1/1通过。完整已有目标构建成功，最终Web **18/18通过，0失败/skip，16.03秒**，含
+12组真实codec及同名MP3解码比较。未重新运行全部66项模型测试。
+
+确认没有活动任务/子进程后，原子替换`build/vc_serve`并重启服务，PID2034441；实际
+运行二进制SHA与测试构建一致。内网Chromium以报告的文件名上传一秒真实人声MP3，
+HTTP200，页面显示原名及“上传完成”，WAV预览时长1秒、生成按钮可用、无JS错误。
+浏览器探针阻止所有除material之外的非GET API，未请求转换、清理、训练或发布。
+此验证复现的是文件名问题，没有取得用户整首MP3，不能宣称其完整内容已验证。
+正式声线API仍只返回Tom Cybersinger。
+
+证据、浏览器脚本和回退二进制分别位于本地
+`runs/Unicode_Upload_Fix_20261029/evidence/`、`upload-browser.cjs`及`backup/vc_serve`；
+恢复备份二进制并重启即可回退，不涉及模型或上传素材；以上为当次部署的历史记录。
+
+### 中文文件名修复的独立提交验证
+
+在任务管理提交 `9b709be` 基础上单独纳入本修复的实现、测试和文档，共8个文件；
+42个诊断工具和8份CyberTom原始录音仍留在本地。2026-10-29重新验证命令：
+
+```sh
+cmake --build /tmp/resonantia-web-release-host --target test_web_audio_upload --parallel 2
+ctest --test-dir /tmp/resonantia-web-release-host -R '^test_web_audio_upload$' --output-on-failure
+/tmp/resonantia-web-release-host/test_web_audio_upload /usr/bin/ffmpeg /home/rm01/Resonantia/tests/fixtures/speech_00.wav
+cmake --build /tmp/resonantia-web-release-host --parallel 2
+ctest --test-dir /tmp/resonantia-web-release-host --output-on-failure --parallel 1 --no-tests=error
+bash scripts/check_sdd.sh
+git diff --cached --check
+```
+
+增量host构建成功；focused **1/1，0.52秒**，完整host契约 **19/19，4.57秒**，均0失败/skip。
+真实短人声12组codec和同一MP3的ASCII/中文文件名解码一致性通过；fixture摘要与
+[来源记录](../tests/fixtures/README.md#real-human-speech)一致。SDD32项通过。
+证据位于 `runs/Git_Unicode_Upload_20261029/evidence/`，这次未重跑GPU模型或生产浏览器测试，
+也未重新部署服务。远端CI结果以该独立提交对应的GitHub Actions记录为准。
