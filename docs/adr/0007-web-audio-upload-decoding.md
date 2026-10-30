@@ -42,6 +42,17 @@
 - 缺 FFmpeg 时 WAV 仍可使用，新格式返回可诊断错误；部署时安装/定位可执行文件并核验
   所需 decoder。不能让现有 Python 虚拟环境变成生产服务的隐式依赖。
 
+## 2026-10-31 双声道解码边界修正
+
+后续翻唱工作流增加了`preserve_stereo=1`，但仍沿用初始mono的64MiB解码上限，
+导致约6分20秒以上的44.1k双声道PCM16被拒绝，即使压缩原文件小于64MiB。
+沿用已批准的FFmpeg与事务路径，将该模式解码上限对齐现有清理的128MiB/600秒范围；
+默认mono仍为64MiB，批次新解码累计128MiB，原文件和HTTP上限不变。
+同步修正FFmpeg哨兵、OS文件限额及错误提示，不放行截断产物。
+大PCM16双声道预览复用现有不可变文件分块发送器，发送前在material锁内复制独立快照；
+不增加依赖、不迁移素材/模型。完整契约和测试见Spec003及
+[本轮证据](../../specs/003-webui/decoded-upload-limits-20261031.md)。
+
 ## Alternatives considered
 
 - 浏览器 Web Audio 解码再上传 WAV：当前已有 decodeAudioData 用于时长估计，能复用，

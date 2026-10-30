@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <cstdint>
 #include <functional>
 #include <string_view>
 #include <mutex>
@@ -108,6 +109,14 @@ struct UploadResult {
     int status = 200;
     std::string error;
 };
+
+inline constexpr std::uintmax_t kMaxStereoUploadBytes = 128u << 20;
+inline constexpr std::uint64_t kMaxStereoUploadFrames = 600u * 44100;
+
+// Header-only validation of complete PCM16/44.1 kHz WAV, with exactly one
+// nonempty data chunk and the requested channel count. No payload allocation.
+[[nodiscard]] std::optional<std::uint64_t> decoded_wav_frames(
+    const std::filesystem::path& path, std::uintmax_t size, bool stereo);
 
 // Only writes to request-owned staging. Borrowed Parts must outlive this call.
 // Compressed uploads share one nonblocking decoder slot per WebService instance.

@@ -396,7 +396,8 @@ int run_vc_preprocess(const VcPreprocessOptions& options) try {
         if (options.preserve_stereo) {
             auto loaded = io::read_stereo_audio(file);
             if (!loaded || loaded->frames() == 0) {
-                std::cerr << "error: stereo input invalid or exceeds 600 seconds / 128 MiB\n";
+                std::cerr << "error: stereo input invalid or exceeds 600 seconds / 128 MiB "
+                             "(256 MiB for 44.1kHz stereo float32 cleanup intermediates)\n";
                 return 1;
             }
             const int count = static_cast<int>(loaded->frames());

@@ -115,7 +115,7 @@ bool read_wav(const std::string& path, std::vector<float>& samples,
     const std::streamoff stream_size = file.tellg();
     if (stream_size < 12) return false;
     const auto file_size = static_cast<std::uint64_t>(stream_size);
-    if (stereo && file_size > (128u << 20)) return false;
+    if (stereo && file_size > (256u << 20)) return false;
     if (!seek_to(file, 0)) return false;
 
     std::array<std::uint8_t, 12> riff {};
@@ -182,6 +182,11 @@ bool read_wav(const std::string& path, std::vector<float>& samples,
     }
 
     const std::size_t frame_count = data_size / format.block_align;
+    // Cleanup writes 44.1k stereo float32 between stages: ten minutes occupy
+    // ~202 MiB. Other input formats retain the original 128 MiB boundary.
+    const bool cleanup_float = format.audio_format == kIeeeFloat &&
+        format.channels == 2 && format.sample_rate == 44100 && format.bits_per_sample == 32;
+    if (stereo && !cleanup_float && file_size > (128u << 20)) return false;
     if (stereo && (format.channels > 2 ||
         frame_count > static_cast<std::uint64_t>(format.sample_rate) * 600)) return false;
     if (frame_count > samples.max_size() || data_size > std::vector<std::uint8_t>().max_size()) {

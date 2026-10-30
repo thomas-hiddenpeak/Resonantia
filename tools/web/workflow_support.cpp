@@ -549,9 +549,11 @@ bool valid_audio_upload(const std::string& filename, const std::string& data) {
            data.compare(8, 4, "WAVE") == 0;
 }
 
+}  // namespace
+
 // Inspect bounded chunk headers, without loading the decoded payload into RAM.
-// FFmpeg must finish a complete, nonempty PCM16/mono/44.1 kHz RIFF file.
-bool valid_decoded_wav(const fs::path& path, std::uintmax_t size, bool stereo) {
+// FFmpeg must finish a complete, nonempty PCM16/44.1 kHz RIFF file.
+std::optional<std::uint64_t> decoded_wav_frames(const fs::path& path, std::uintmax_t size, bool stereo) {
     std::ifstream in(path, std::ios::binary);
     auto u32 = [](const unsigned char* p) {
         return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) |
@@ -560,30 +562,35 @@ bool valid_decoded_wav(const fs::path& path, std::uintmax_t size, bool stereo) {
     unsigned char header[16];
     if (size < 44 || !in.read(reinterpret_cast<char*>(header), 12) ||
         std::memcmp(header, "RIFF", 4) || std::memcmp(header + 8, "WAVE", 4) ||
-        u32(header + 4) != size - 8) return false;
+        u32(header + 4) != size - 8) return std::nullopt;
     bool format = false, data = false;
+    std::uint64_t frames = 0;
     std::uintmax_t offset = 12;
     while (offset + 8 <= size) {
         in.seekg(static_cast<std::streamoff>(offset));
-        if (!in.read(reinterpret_cast<char*>(header), 8)) return false;
+        if (!in.read(reinterpret_cast<char*>(header), 8)) return std::nullopt;
         const auto count = u32(header + 4);
         const auto padded = std::uintmax_t(count) + (count & 1u);
-        if (padded > size - offset - 8) return false;
+        if (padded > size - offset - 8) return std::nullopt;
         if (!std::memcmp(header, "fmt ", 4)) {
-            if (format || count < 16 || !in.read(reinterpret_cast<char*>(header), 16)) return false;
+            if (format || count < 16 || !in.read(reinterpret_cast<char*>(header), 16)) return std::nullopt;
             const unsigned channels = stereo ? 2 : 1;
             format = header[0] == 1 && header[1] == 0 && header[2] == channels && header[3] == 0 &&
                      u32(header + 4) == 44100 && u32(header + 8) == 88200 * channels &&
                      header[12] == 2 * channels && header[13] == 0 && header[14] == 16 && header[15] == 0;
-            if (!format) return false;
+            if (!format) return std::nullopt;
         } else if (!std::memcmp(header, "data", 4)) {
-            if (data || !count || count % (stereo ? 4 : 2)) return false;
+            if (data || !count || count % (stereo ? 4 : 2)) return std::nullopt;
             data = true;
+            frames = count / (stereo ? 4 : 2);
         }
         offset += 8 + padded;
     }
-    return format && data && offset == size;
+    if (!format || !data || offset != size) return std::nullopt;
+    return frames;
 }
+
+namespace {
 
 std::string mime_for(const std::string& path) {
     if (path.size() >= 5 && path.substr(path.size() - 5) == ".html") {
@@ -666,7 +673,7 @@ bool write_uploads(const std::vector<Upload>& uploads, const fs::path& raw,
 UploadResult normalize_uploads(const std::vector<Upload>& uploads, const fs::path& raw,
                                const std::optional<fs::path>& work, const Paths& paths,
                                const ProcessRunner& runner, std::mutex& decode_mutex, bool stereo) {
-    constexpr std::uintmax_t file_limit = 64u << 20;
+    const std::uintmax_t file_limit = stereo ? kMaxStereoUploadBytes : 64u << 20;
     constexpr std::uintmax_t batch_limit = 128u << 20;
     const auto compressed = [](const Upload& upload) {
         return lower(fs::path(safe_filename(upload.part->filename)).extension().string()) != ".wav";
@@ -709,7 +716,7 @@ UploadResult normalize_uploads(const std::vector<Upload>& uploads, const fs::pat
         // timeout owns the process group; prlimit is exec'd in that group. No
         // shell, network protocols, playlist probing or GPU decoding is used.
         spec.argv = {"/usr/bin/timeout", "--signal=TERM", "--kill-after=2s", "120s",
-                     "/usr/bin/prlimit", "--as=2147483648", "--fsize=67239936", "--",
+                     "/usr/bin/prlimit", "--as=2147483648", "--fsize=" + std::to_string(file_limit + (128u << 10)), "--",
                      paths.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-xerror",
                      "-max_alloc", "67108864", "-threads", "2", "-filter_threads", "1",
                      "-protocol_whitelist", "file", "-format_whitelist", demuxer, "-f", demuxer};
@@ -717,14 +724,17 @@ UploadResult normalize_uploads(const std::vector<Upload>& uploads, const fs::pat
             spec.argv.insert(spec.argv.end(), {"-enable_drefs", "0", "-use_absolute_path", "0"});
         spec.argv.insert(spec.argv.end(), {"-i", input.string(), "-map", "0:a:0", "-vn", "-sn", "-dn",
                          "-map_metadata", "-1", "-threads", "2", "-ac", stereo ? "2" : "1", "-ar", "44100",
-                         "-c:a", "pcm_s16le", "-f", "wav", "-fs", "67108865", "-y", output.string()});
+                         "-c:a", "pcm_s16le", "-f", "wav", "-fs", std::to_string(file_limit + 1), "-y", output.string()});
         spec.log_path = fs::path(temp.path()) / "decode.log";
         const auto result = runner.run(spec);
         const auto size = fs::file_size(output, ec);
         // FFmpeg's -fs may stop successfully and overshoot by one packet. The
         // sentinel lies ABOVE the accepted cap, so truncation can never pass.
-        if (!ec && (size > file_limit || size > batch_limit - decoded_bytes))
-            return {413, "decoded audio exceeds 64 MiB per file or 128 MiB per upload"};
+        if (!ec && size > file_limit)
+            return {413, stereo ? "解码后的音频超过 128 MiB（并非原文件大小）；翻唱音频请控制在 10 分钟以内"
+                                : "解码后的音频超过 64 MiB（并非原文件大小）；请将录音分段上传"};
+        if (!ec && size > batch_limit - decoded_bytes)
+            return {413, "本批音频解码后合计超过 128 MiB（并非原文件大小）；请减少本次上传的文件"};
         if (!result.success()) {
             if (result.termination == ProcessTermination::kLaunchFailed ||
                 result.termination == ProcessTermination::kExecFailed ||
@@ -734,7 +744,10 @@ UploadResult normalize_uploads(const std::vector<Upload>& uploads, const fs::pat
                 return {400, "audio decoding timed out (120 seconds); split the recording"};
             return {400, "audio decoding failed; file is damaged, has no audio, or its codec is unavailable"};
         }
-        if (ec || !valid_decoded_wav(output, size, stereo)) return {400, "audio decoder produced incomplete or empty WAV"};
+        const auto frames = ec ? std::nullopt : decoded_wav_frames(output, size, stereo);
+        if (!frames) return {400, "audio decoder produced incomplete or empty WAV"};
+        if (stereo && *frames > kMaxStereoUploadFrames)
+            return {413, "翻唱音频时长超过 10 分钟；请裁剪后上传，原文件大小不代表解码后的长度"};
         decoded_bytes += size;
         if (work) {
             fs::copy_file(output, *work / upload.filename, fs::copy_options::overwrite_existing, ec);

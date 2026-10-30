@@ -19,7 +19,8 @@ std::optional<AudioBuffer> read_audio_excerpt(const std::string& path,double sta
 bool write_audio_excerpt(const std::string& input,const std::string& output,double start,double end);
 
 /// Owned interleaved L/R PCM. Mono input is duplicated; >2 channels rejected.
-/// Limited to 600 seconds and 128 MiB encoded WAV for the cleanup workflow.
+/// Limited to 600 seconds and 128 MiB encoded WAV; the cleanup workflow's
+/// 44.1kHz stereo float32 intermediates may occupy up to 256 MiB.
 struct StereoAudioBuffer {
     std::vector<float> data;
     int sample_rate = 44'100;

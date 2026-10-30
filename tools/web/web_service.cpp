@@ -1693,11 +1693,36 @@ void WebService::handle_preview(int fd, const Request& req) {
     TempDir preview_temp("/tmp", "resonantia-preview-");
     std::string preview_path = first->string();
     if (exceeds_buffered_response_limit(*first)) {
+        std::error_code error;
+        const auto size = fs::file_size(*first, error);
+        const auto frames = !error && size <= kMaxStereoUploadBytes
+            ? decoded_wav_frames(*first, size, true) : std::nullopt;
+        if (frames && *frames <= kMaxStereoUploadFrames) {
+            // Snapshot under the material lock; send in bounded blocks after
+            // unlocking so replacement and slow clients cannot mix generations.
+            const auto snapshot = fs::path(preview_temp.path()) / "preview.wav";
+            fs::copy_file(*first, snapshot, fs::copy_options::none, error);
+            material_lock.unlock();
+            if (error) {
+                send_response(fd, 500, "Internal Server Error", "text/plain", "preview snapshot failed");
+                return;
+            }
+            send_audio_file(fd, snapshot, req.range);
+            return;
+        }
         auto stereo = voxmutatio::io::read_stereo_audio(preview_path);
-        if (stereo && 44 + stereo->frames() * 4 <= kMaxFileBytes) {
+        if (stereo && 44 + stereo->frames() * 4 <= kMaxStereoUploadBytes) {
             const auto compact = preview_temp.path() + "/preview.wav";
             if (voxmutatio::io::write_stereo_audio(compact, stereo->data.data(),
-                    static_cast<int>(stereo->frames()), 44100)) preview_path = compact;
+                    static_cast<int>(stereo->frames()), 44100)) {
+                if (exceeds_buffered_response_limit(compact)) {
+                    stereo.reset();
+                    material_lock.unlock();
+                    send_audio_file(fd, compact, req.range);
+                    return;
+                }
+                preview_path = compact;
+            }
         }
     }
     if (exceeds_buffered_response_limit(preview_path)) {

@@ -688,3 +688,43 @@ TEST_CASE("Stereo cleanup IO preserves channels and rejects invalid writes", "[a
     REQUIRE(stereo);
     REQUIRE(stereo->data[1] == Catch::Approx(-0.75).margin(0.00004));
 }
+
+TEST_CASE("Long stereo cleanup intermediates retain the ten-minute time axis", "[audio_io]") {
+    using voxmutatio::io::read_stereo_audio;
+    TempFile file("_long_stereo.wav");
+    const auto fixture = [&](unsigned frames, unsigned rate = 44100, bool floating = true) {
+        const unsigned align = floating ? 8 : 4;
+        auto bytes = make_wav(floating ? 3 : 1, 2, rate, rate * align, align,
+                              floating ? 32 : 16, {});
+        set_u32(bytes, 4, 36 + frames * align);
+        set_u32(bytes, 40, frames * align);
+        REQUIRE(write_binary(file.path, bytes));
+        std::filesystem::resize_file(file.path, 44 + std::uint64_t(frames) * align);
+    };
+    // The separator emits float32 (twice PCM16's bytes). The next cleanup stage
+    // and final mixing must be able to read it without truncating a seven-minute song.
+    fixture(420u * 44100);
+    {
+        auto audio = read_stereo_audio(file.path);
+        REQUIRE(audio);
+        REQUIRE(audio->frames() == 420u * 44100);
+        REQUIRE(audio->sample_rate == 44100);
+        REQUIRE(std::all_of(audio->data.begin(), audio->data.end(), [](float v) { return v == 0; }));
+    }
+    fixture(600u * 44100);
+    {
+        auto audio = read_stereo_audio(file.path);
+        REQUIRE(audio);
+        REQUIRE(audio->frames() == 600u * 44100);
+    }
+    fixture(600u * 44100 + 1);
+    REQUIRE_FALSE(read_stereo_audio(file.path));
+    fixture(420u * 44100);
+    std::filesystem::resize_file(file.path, (256u << 20) + 1);
+    REQUIRE_FALSE(read_stereo_audio(file.path));
+    // The larger allowance is only for the workflow's 44.1k stereo float32.
+    fixture(400u * 96000, 96000, false);
+    REQUIRE_FALSE(read_stereo_audio(file.path));
+    fixture(400u * 48000, 48000);
+    REQUIRE_FALSE(read_stereo_audio(file.path));
+}

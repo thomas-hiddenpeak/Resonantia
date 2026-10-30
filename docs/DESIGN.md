@@ -302,9 +302,12 @@ Web上传新增格式边界见 [ADR-0007](adr/0007-web-audio-upload-decoding.md)
 [Spec 003 FR-012](../specs/003-webui/spec.md#multi-format-upload-web-fr-012)。
 `normalize_uploads`在request staging中串行解码MP3/M4A/AAC/FLAC/OGG/Opus/WMA/AIFF，
 WAV继续原样写入；四个HTTP入口共享校验，归一化重名整批拒绝。FFmpeg只选首个音轨，
-固定PCM16/44.1kHz/mono，限制demuxer/file协议并关闭MOV外部引用。argv直接启动，
+固定PCM16/44.1kHz，默认mono，material `preserve_stereo=1`为双声道；限制demuxer/file协议并关闭MOV外部引用。argv直接启动，
 `timeout`/`prlimit`提供120秒（TERM后2秒KILL）、2GiB地址空间和文件大小上限；
-超限截断不得成功，每文件64MiB、每批解码总量128MiB。实例内独立decoder mutex提供409，
+超限截断不得成功，单声道每文件64MiB、双声道128MiB且≤600秒，每批解码总量128MiB。
+FFmpeg `-fs`哨兵为对应文件上限+1，OS文件限额额外留128KiB包尾空间；完成后按WAV
+头校验体积和精确帧数，超限不提交。原文件64MiB及HTTP body上限不变。
+实例内独立decoder mutex提供409，
 不改变GPU/训练取消生命周期。失败不会移动已发布raw/work/marker或启动模型。
 `safe_filename`保留合法UTF-8字符，避免中文名称只剩`.mp3`导致扩展名丢失或不同名称
 碰撞；ASCII过滤行为保持，拒绝路径分隔符、NUL、非法编码及超过255字节的名称。
@@ -335,7 +338,11 @@ step/训练产物）；先将保留字节复制到独立恢复目录、确认属
 维护者安排恢复。不得盲目覆盖 live 或删除唯一备份。默认 `test_web_transaction_failure`
 隔离进程在失败 rename 后注入一次
 分配失败，验证三种事务的旧产物在 live 或 backup 中完整保留。一个实例内的 material mutex 同步
-material/train/step 发布与 preview 的文件选择、校验及最多 64 MiB 的完整读取。写路径先取得
+material/train/step 发布与 preview 的文件选择、校验及最多 64 MiB 的完整读取。
+64MiB以上的完整PCM16/44.1k双声道预览须≤128MiB且≤600秒：仅检查chunk头，
+锁内复制到RAII临时目录的独立快照，解锁后复用`send_audio_file`以64KiB块发送，支持单段Range。
+不按音频长度分配宿主缓冲；快照发送结束或断线后清理，素材更换不会混入旧响应。
+float32清理预览转≤128MiB PCM16副本，超过64MiB同样复用分块发送。写路径先取得
 GPU mutex 再取得 material mutex，preview 只取后者；不在 CLI 执行或 socket 发送期间持有
 material mutex，异常由 RAII 解锁。锁内包含文件读取和提交/回滚及 backup 清理，因此没有
 硬性时间上限；它不保证外部进程修改或进程崩溃时多次 rename 的原子性。
@@ -610,7 +617,11 @@ hostname/device-tree检查是调度后的辅助保护。自动与手动并发组
 沿用现有单GPU串行编排；模型仍由原生CLI加载执行。`workflow=song`创建请求临时目录，
 依次调用分离与去和声CLI；各阶段保留44.1k立体声，之后形成mono40k主唱快照再转换。
 Web混音只做声道加减与单一防削波增益，无新模型算法或新运行时依赖。三份宿主音频
-受600秒/128MiB输入上限约束；HTTP响应仍限64MiB。失败在返回音频前传播，临时文件由RAII清理。
+受600秒/128MiB一般输入上限约束；仅内部44.1k双声道float32中间产物允许256MiB，
+格式及精确帧数在payload分配前验证，600秒最多211,680,000字节PCM。
+此读取路径同时供下一清理阶段和混音使用，不改变样本算法；原始上传仍受64MiB限制。
+同步转换HTTP缓冲响应仍限64MiB，双声道material预览例外见上文，
+持久任务结果使用已有分块响应。失败在返回音频前传播，临时文件由RAII清理。
 
 `io::StereoAudioBuffer`拥有交错L/R float；单声道复制，>2声道拒绝。新增读写沿用WAV
 块校验/原子文件提交；`read_audio`及旧预处理默认mono语义不变。立体声清理禁止trim/VAD，

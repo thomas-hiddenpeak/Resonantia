@@ -60,11 +60,15 @@ struct Runner : ProcessRunner {
             (cleanup_success && spec.argv.front().ends_with("vc_preprocess")) ? 0 : 1};
     }
 };
-struct Reply { int status; std::string body; };
+struct Reply { int status; std::string body; std::string headers; };
 Reply request(const std::shared_ptr<WebService>& service, const std::string& route,
               const std::vector<std::pair<std::string, std::string>>& files,
-              const std::string& extra = "", const std::string& method = "POST") {
-    Request req; req.method = method; req.path = route;
+              const std::string& extra = "", const std::string& method = "POST",
+              const std::string& range = "") {
+    Request req; req.method = method; req.range = range;
+    const auto query = route.find('?');
+    req.path = route.substr(0, query);
+    if (query != std::string::npos) req.query = route.substr(query + 1);
     req.content_type = "multipart/form-data; boundary=audio-test";
     req.body = "--audio-test\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nvoice\r\n";
     req.body += extra;
@@ -83,7 +87,92 @@ Reply request(const std::shared_ptr<WebService>& service, const std::string& rou
     close(sockets[1]); worker.join();
     if (failure) std::rethrow_exception(failure);
     check(wire.starts_with("HTTP/1.1 "), "missing HTTP response");
-    return {std::stoi(wire.substr(9, 3)), wire.substr(wire.find("\r\n\r\n") + 4)};
+    const auto end = wire.find("\r\n\r\n");
+    return {std::stoi(wire.substr(9, 3)), wire.substr(end + 4), wire.substr(0, end)};
+}
+
+// Sparse PCM fixtures exercise size/duration boundaries, never model quality.
+void sparse_stereo(const fs::path& path, unsigned frames, bool floating = false) {
+    auto wav = pcm(0);
+    auto set = [&](unsigned offset, unsigned value, unsigned bytes) {
+        for (unsigned i = 0; i < bytes; ++i) wav[offset + i] = char(value >> (8 * i));
+    };
+    const unsigned align = floating ? 8 : 4;
+    set(4, 36 + frames * align, 4); set(20, floating ? 3 : 1, 2);
+    set(22, 2, 2); set(28, 44100 * align, 4); set(34, floating ? 32 : 16, 2);
+    set(32, align, 2); set(40, frames * align, 4);
+    write(path, wav); fs::resize_file(path, 44 + std::uintmax_t(frames) * align);
+    std::fstream out(path, std::ios::binary | std::ios::in | std::ios::out);
+    out.seekp(-4, std::ios::end); out.write(floating ? "\0\0\0\0" : "TAIL", 4);
+    check(bool(out), "sparse PCM fixture write");
+}
+
+void stereo_upload_boundaries() {
+    TempDir temp("/tmp", "resonantia-stereo-upload-");
+    Paths paths; paths.runs = temp.path() + "/runs"; paths.ffmpeg = "/bin/true";
+    auto runner = std::make_shared<Runner>();
+    auto service = std::make_shared<WebService>(paths, runner);
+    const std::string stereo = "--audio-test\r\nContent-Disposition: form-data; name=\"preserve_stereo\"\r\n\r\n1\r\n";
+    unsigned frames = 420 * 44100;
+    runner->decode = [&](const ProcessSpec& spec) {
+        sparse_stereo(spec.argv.back(), frames);
+        return ProcessResult{ProcessTermination::kExited, 0};
+    };
+    auto reply = request(service, "/api/material", {{"山丘.flac", "encoded"}}, stereo);
+    check(reply.status == 200, "7-minute stereo FLAC rejected: " + reply.body);
+    const auto work = fs::path(paths.runs) / "voice/work/山丘.wav";
+    const auto size = 44 + std::uintmax_t(frames) * 4;
+    check(fs::file_size(work) == size && fs::file_size(work.parent_path().parent_path()/"raw/山丘.wav") == size,
+          "stereo material was truncated");
+    reply = request(service, "/api/preview?name=voice", {}, "", "GET");
+    check(reply.status == 200 && reply.body.size() == size && reply.body.ends_with("TAIL"),
+          "uploaded stereo material cannot be previewed completely");
+    reply = request(service, "/api/preview?name=voice", {}, "", "GET", "bytes=-4");
+    check(reply.status == 206 && reply.body == "TAIL" &&
+          reply.headers.find("Content-Range: bytes " + std::to_string(size - 4) + "-" +
+              std::to_string(size - 1) + "/" + std::to_string(size)) != std::string::npos,
+          "large preview range did not preserve original bytes");
+    check(request(service, "/api/preview?name=voice", {}, "", "GET", "bytes=999999999-").status == 416,
+          "invalid large preview range accepted");
+    sparse_stereo(work, frames, true);
+    reply = request(service, "/api/preview?name=voice", {}, "", "GET");
+    check(reply.status == 200 && reply.body.size() == size && reply.body[20] == 1 && reply.body[34] == 16,
+          "large float32 cleanup preview must be compacted without truncation");
+    check(fs::file_size(work) == 44 + std::uintmax_t(frames) * 8,
+          "preview replaced the original float32 cleanup material");
+
+    frames = 600 * 44100;
+    check(request(service, "/api/material", {{"limit.flac", "encoded"}}, stereo).status == 200,
+          "10-minute stereo limit rejected");
+    write(fs::path(paths.runs)/"voice/steps.txt", "old-generation\n");
+    const auto preserved = [&] {
+        check(fs::file_size(fs::path(paths.runs)/"voice/work/limit.wav") == 44 + std::uintmax_t(600 * 44100) * 4 &&
+              fs::file_size(fs::path(paths.runs)/"voice/raw/limit.wav") == 44 + std::uintmax_t(600 * 44100) * 4 &&
+              read_file(paths.runs + "/voice/steps.txt") == "old-generation\n", "failed upload changed previous material");
+        for (const auto& entry : fs::recursive_directory_iterator(paths.runs))
+            check(!entry.path().filename().string().starts_with('.'), "failed upload left staging files");
+        check(runner->models == 0, "upload/preview started a model process");
+    };
+    ++frames;
+    reply = request(service, "/api/material", {{"long.flac", "encoded"}}, stereo);
+    check(reply.status == 413 && reply.body.find("10") != std::string::npos,
+          "stereo duration over 10 minutes accepted or not explained"); preserved();
+    frames = 400 * 44100;
+    reply = request(service, "/api/material", {{"a.flac", "encoded"}, {"b.flac", "encoded"}}, stereo);
+    check(reply.status == 413 && reply.body.find("128 MiB") != std::string::npos,
+          "decoded stereo batch over 128 MiB accepted"); preserved();
+    runner->decode = [&](const ProcessSpec& spec) {
+        const auto cap = std::find(spec.argv.begin(), spec.argv.end(), "-fs");
+        check(cap != spec.argv.end() && *(cap + 1) == std::to_string((128u << 20) + 1),
+              "stereo decoder still truncates at mono cap");
+        check(std::find(spec.argv.begin(), spec.argv.end(), "--fsize=" + std::to_string((128u << 20) + (128u << 10))) != spec.argv.end(),
+              "stereo process file limit not updated");
+        write(spec.argv.back(), pcm()); fs::resize_file(spec.argv.back(), (128u << 20) + 1);
+        return ProcessResult{ProcessTermination::kExited, 0};
+    };
+    reply = request(service, "/api/material", {{"huge.flac", "encoded"}}, stereo);
+    check(reply.status == 413 && reply.body.find("128 MiB") != std::string::npos,
+          "truncated oversized stereo output accepted"); preserved();
 }
 void run() {
     TempDir temp("/tmp", "resonantia-audio-contract-");
@@ -352,6 +441,30 @@ void codecs(const std::string& ffmpeg, const std::string& speech) {
                   "filename must not affect decoded audio");
         }
     }
+    // Repeat the real speech fixture to cross the former stereo 64 MiB cap.
+    // This verifies actual FFmpeg argv/limits and preview bytes, not voice quality.
+    ProcessSpec long_flac;
+    const auto file = fs::path(temp.path()) / "山丘.flac";
+    long_flac.argv = {ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                     "-stream_loop", "-1", "-i", speech, "-t", "420", "-ac", "2",
+                     "-ar", "44100", "-c:a", "flac", file.string()};
+    long_flac.log_path = fs::path(temp.path()) / "long-encode.log";
+    check(runner->run(long_flac).success(), "long FLAC encoding failed: " + log_tail(long_flac.log_path));
+    const auto encoded = read_file(file);
+    check(!encoded.empty(), "long FLAC fixture exceeds source upload limit");
+    const std::string stereo = "--audio-test\r\nContent-Disposition: form-data; name=\"preserve_stereo\"\r\n\r\n1\r\n";
+    const auto uploaded = request(service, "/api/material", {{"山丘.flac", encoded}}, stereo);
+    check(uploaded.status == 200, "real long stereo FLAC rejected: " + uploaded.body);
+    const auto work = fs::path(paths.runs) / "voice/work/山丘.wav";
+    const auto size = fs::file_size(work);
+    check(size > (64u << 20) && decoded_wav_frames(work, size, true) == 420u * 44100,
+          "long FLAC must retain all 420 seconds as stereo PCM16");
+    const auto preview = request(service, "/api/preview?name=voice", {}, "", "GET");
+    check(preview.status == 200 && preview.body == read_file(work, 128u << 20),
+          "real FLAC preview differs from normalized material");
+    std::cout << "long stereo FLAC: " << encoded.size() << " encoded bytes, " << size
+              << " decoded bytes, 420 s, complete preview\n";
+
     for (const auto& ext : {"mp3", "m4a", "aac", "flac", "ogg", "opus", "wma", "aiff"})
         check(request(service, "/api/material", {{std::string("bad.") + ext, "#EXTM3U\nhttp://127.0.0.1/secret\n"}}).status == 400,
               "playlist/invalid audio accepted");
@@ -372,7 +485,7 @@ int main(int argc, char** argv) {
             std::cout << getpid() << std::endl;
             for (;;) pause();
         }
-        if (argc == 3) codecs(argv[1], argv[2]); else { run(); cover_lengths(); }
+        if (argc == 3) codecs(argv[1], argv[2]); else { run(); stereo_upload_boundaries(); cover_lengths(); }
         std::cout << "Web audio upload checks passed\n"; return 0;
     }
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

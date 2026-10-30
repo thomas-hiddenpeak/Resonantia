@@ -225,7 +225,7 @@ ProcessRunner替身，FD无增长、staging/backup清理。首次测试编译误
 | request body | 128 MiB |
 | aggregate in-flight body reservation | 256 MiB |
 | one uploaded file | 64 MiB |
-| one buffered audio response | 64 MiB；preview/preprocess/convert 超过时返回 413 |
+| one buffered audio response | 64 MiB；preprocess/convert 超过时返回 413；preview 的已校验双声道 PCM16 可用独立快照分块发送，≤128 MiB 且≤600秒 |
 | one non-file multipart field | 16 KiB |
 | multipart parts | 128 |
 | listen backlog / connection cap basis | 32 |
@@ -267,7 +267,8 @@ multipart part header 必须逐行解析：每个 part 有唯一的 `Content-Dis
 [ADR-0007](../../docs/adr/0007-web-audio-upload-decoding.md)。material、带文件 training、
 preprocess、convert 共享同一归一化入口，支持 WAV、MP3、M4A（AAC/ALAC）、AAC、FLAC、
 OGG（Vorbis/Opus）、Opus、WMA、AIFF/AIF。WAV 字节保持不变；其他格式在 request staging
-中由 CPU FFmpeg 解码成 PCM16、44.1 kHz、mono WAV；模型输出继续遵守 40 kHz WAV 契约。
+中由 CPU FFmpeg 解码成 PCM16、44.1 kHz、mono WAV；material 的 `preserve_stereo=1`
+改为双声道，供翻唱工作流使用。模型输出继续遵守 40 kHz WAV 契约。
 原输入可能有损；下混/重采样/量化不承诺保存原始多声道或高位深。
 
 文件名保留合法UTF-8字符（含中文、日文、带重音字母和emoji），不能删空非ASCII
@@ -279,8 +280,10 @@ basename而误判扩展名或制造批内重名。ASCII空格/标点仍沿用现
 数据和 metadata。以 argv 启动 `/usr/bin/timeout`、`/usr/bin/prlimit`、配置的 FFmpeg；
 不使用 shell。每实例最多一个解码批次，解码线程2、filter线程1、地址空间2 GiB、单次
 分配64 MiB、每文件120秒 deadline，TERM后2秒未退出则KILL。此限制不适用于模型进程。
-新解码产物每文件最多64 MiB、每批累计128 MiB（约12.7/25.4分钟 PCM16单声道），超限
-整批413；FFmpeg截断停止的输出不得被接纳。原HTTP body128 MiB/inflight256 MiB仍生效。
+新解码产物默认单声道每文件最多64 MiB；`preserve_stereo=1` 每文件最多128 MiB且
+最多600秒，时长由完整WAV的样本帧数校验。每批新解码产物累计最多128 MiB；超限整批413，
+提示区分原始文件、解码体积、批次及10分钟时长。FFmpeg截断停止的输出不得被接纳，
+文件大小哨兵随声道模式选择。原文件64 MiB、HTTP body128 MiB/inflight256 MiB仍生效。
 错误为400（格式/损坏/无音轨/超时）、409（decoder busy）、413（解码超限）、503（依赖
 不可启动），磁盘staging错误500。失败不得提交素材或调用模型；已存在素材及marker保留。
 
@@ -291,8 +294,10 @@ UI 两个选择/拖拽入口使用相同白名单；训练支持多文件。上�
 迁移：保留现有WAV路径与数据，部署完整音频codec的FFmpeg及coreutils/util-linux；
 独立构建和短音频验证后备份vc_serve及UI，在无活动任务时一起切换并重启。回滚恢复
 二进制与UI，新增素材已是标准WAV，无需迁移模型或原文件。部署验证仅GET，由用户试听。
-`test_web_audio_upload`覆盖四入口、UTF-8文件名/边界/归一化重名、失败事务、大小/并发/超时；`test_web_audio_ui`覆盖界面；
-`RESONANTIA_ENABLE_AUDIO_CODEC_TESTS=ON`注册真实短人声的`test_web_audio_codecs`。
+`test_web_audio_upload`覆盖四入口、UTF-8文件名/边界/归一化重名、失败事务、大小/并发/超时，
+以及7分钟双声道上传/完整与Range预览、600秒及超限拒绝；`test_web_audio_ui`覆盖界面；
+`RESONANTIA_ENABLE_AUDIO_CODEC_TESTS=ON`注册真实短人声及循环到7分钟的FLAC编解码验证，
+不将其作为模型音质或整曲转换验收。见[解码上限修复记录](decoded-upload-limits-20261031.md)。
 
 ## 6. Security Boundary and Non-goals
 
@@ -483,8 +488,13 @@ song先独立生成全人声，随后去和声；干声可选去混响。RoForme
 清理结束后转mono40k PCM16再进入模型，与已听审交付路径相同。需要时对主唱作一次固定
 降增益防止PCM16削波。混音为 `原立体声 − 全人声 + 转换主唱`，使用全曲单一增益使峰值≤0.95，
 不使用压缩/限制器，也不加入原伴唱。库仍只读WAV，压缩格式解码依赖已批准的FFmpeg方案。
-清理输入上限600秒/128MiB，上传、解码与HTTP响应原上限不扩大；超大float32清理预览可
-生成PCM16试听副本，原处理结果不变，副本仍须≤64MiB。
+清理输入上限600秒/128MiB。2026-10-31修正双声道解码仍受旧mono上限约束的问题：
+原始上传仍≤64MiB，双声道解码≤128MiB且≤600秒。64MiB以上、≤128MiB且≤600秒的
+完整PCM16双声道预览在material锁内制作独立文件快照，解锁后复用64KiB分块发送与Range。
+超大float32清理预览可生成≤128MiB的PCM16试听副本，超过64MiB同样分块发送，原处理结果不变。
+清理自身写出的44.1k双声道float32中间文件读取上限为256MiB，时长仍≤600秒；
+防止7分钟左右的歌曲在第二次清理或混音时因位深翻倍再次被拒绝。其他格式仍限128MiB。
+同步preprocess/convert的64MiB缓冲响应限制不变；任务结果已有独立分块发送路径。
 
 界面默认完整歌曲与混音输出，默认Tom Cybersinger及听审参数；若未安装正式声线，不显示
 已发布说明。训练只推荐完整联合200轮与最多50步短试验，旧配方保留高级入口。
