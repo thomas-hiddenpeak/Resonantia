@@ -264,7 +264,7 @@ WavChunkReader::~WavChunkReader() = default;
 WavChunkReader::WavChunkReader(WavChunkReader&&) noexcept = default;
 WavChunkReader& WavChunkReader::operator=(WavChunkReader&&) noexcept = default;
 
-bool WavChunkReader::open(const std::filesystem::path& path) noexcept try {
+bool WavChunkReader::open(const std::filesystem::path& path, bool no_follow) noexcept try {
     close();
     const std::string path_text = path.string();
     if (path_text.empty() || path_text.find('\0') != std::string::npos) return false;
@@ -274,7 +274,7 @@ bool WavChunkReader::open(const std::filesystem::path& path) noexcept try {
         // Reject FIFOs/devices at the subsequent fstat boundary without ever
         // waiting for a writer. O_NONBLOCK does not change regular-file pread.
         staged->fd = ::open(
-            path_text.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+            path_text.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | (no_follow ? O_NOFOLLOW : 0));
     } while (staged->fd < 0 && errno == EINTR);
     if (staged->fd < 0 || !capture_identity(staged->fd, staged->identity) ||
         staged->identity.size < 12) {
@@ -720,10 +720,16 @@ bool AtomicWavStreamWriter::open(const std::filesystem::path& target,
 }
 
 bool AtomicWavStreamWriter::append(std::span<const float> samples) noexcept {
+    return append_impl(samples,false);
+}
+bool AtomicWavStreamWriter::append_decoded_pcm16(std::span<const float> samples) noexcept {
+    return append_impl(samples,true);
+}
+bool AtomicWavStreamWriter::append_impl(std::span<const float> samples,bool exact_pcm16) noexcept {
     if (!state_ || state_->fd < 0 || state_->failed) return false;
     if (samples.empty()) return true;
     for (const float value : samples) {
-        if (!std::isfinite(value)) {
+        if (!std::isfinite(value)||(exact_pcm16&&(value < -1.0f || value > 32767.0f/32768 || std::trunc(value*32768)!=value*32768))) {
             state_->failed = true;
             return false;
         }
@@ -759,7 +765,7 @@ bool AtomicWavStreamWriter::append(std::span<const float> samples) noexcept {
     for (const float input : samples) {
         const float sample = std::clamp(input, -1.0f, 1.0f);
         const auto pcm = static_cast<std::uint16_t>(
-            static_cast<std::int16_t>(sample * 32767.0f));
+            static_cast<std::int16_t>(exact_pcm16 ? input * 32768.0f : sample * 32767.0f));
         encoded[encoded_size++] = static_cast<std::uint8_t>(pcm);
         encoded[encoded_size++] = static_cast<std::uint8_t>(pcm >> 8);
         if (encoded_size == encoded.size() && !flush()) {

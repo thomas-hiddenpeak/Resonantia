@@ -5,6 +5,7 @@
 
 #include "pipeline/bounded_pipeline_detail.h"
 #include "voxmutatio/io/audio_io.h"
+#include "voxmutatio/f0/pitch_review.h"
 
 #include <algorithm>
 #include <array>
@@ -494,4 +495,18 @@ TEST_CASE("Manual pitch corrections preserve endpoints, UV and unrelated frames"
     for (const auto text : {"smooth:nan:1", "shift:0:1:25", "smooth:1:0", "smooth:0:3",
                             "smooth:0:1;smooth:0.5:1.5", "shift:0:1:12;", "smooth:0:1:2"})
         CHECK_FALSE(voxmutatio::parse_pitch_edits(text, config.pitch_edits));
+}
+
+TEST_CASE("pitch review curve matches the actual bounded postprocessor exactly", "[bounded][pitch]") {
+    TempDirectory directory;std::vector<float> f0(1401,200);
+    for(std::size_t i=0;i<f0.size();++i)f0[i]=(i%71<5)?0.f:static_cast<float>(150+30*std::sin(i*.17));
+    bounded_io::RawFloatSpool raw;REQUIRE(raw.create(directory.path()));REQUIRE(raw.append(f0));
+    for(int filter:{0,3,5,31})for(int pitch:{-12,0,7}) {
+        voxmutatio::VCConfig c;c.filter_radius=filter;c.f0_up_key=pitch;
+        c.pitch_edits={{voxmutatio::PitchEditMode::kShift,3,3.18,12}};
+        bounded_io::RawFloatSpool result;std::string error;
+        REQUIRE(bounded_pipeline::process_f0(raw,directory.path(),c,result,error,2,10));
+        std::vector<float> values;REQUIRE(result.read(0,result.sample_count(),values));
+        CHECK(values==voxmutatio::f0::prepare_pitch_curve(f0,filter,pitch,c.pitch_edits,2,10));
+    }
 }

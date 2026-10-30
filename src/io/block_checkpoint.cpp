@@ -58,6 +58,7 @@ struct BlockCheckpoint::Impl {
     std::uint64_t bytes=0,hits=0;
     std::uint32_t blocks=0;
     bool healthy=true;
+    bool read_only=false;
 
     Impl(const std::filesystem::path& path,std::string id,Mode mode,std::function<bool()> stop,Limits bounds)
         :identity(std::move(id)),pause(std::move(stop)),limits(bounds) {
@@ -66,19 +67,20 @@ struct BlockCheckpoint::Impl {
         if(!core::valid_digest(identity)||limits.block_bytes<4||limits.block_bytes>32ULL*1024*1024||
            limits.total_bytes<header_size+4||limits.total_bytes>2ULL*1024*1024*1024||!limits.blocks||limits.blocks>4096)
             throw std::invalid_argument("invalid checkpoint identity or limits");
-        if(mode!=Mode::Create&&mode!=Mode::Resume)throw std::invalid_argument("invalid checkpoint mode");
+        if(mode!=Mode::Create&&mode!=Mode::Resume&&mode!=Mode::ReadOnly)throw std::invalid_argument("invalid checkpoint mode");
+        read_only=mode==Mode::ReadOnly;
         if(mode==Mode::Create)std::filesystem::create_directories(path);
         directory.value=::open(path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
         if(directory.value<0)bad("cannot open checkpoint directory");
-        lock.value=::openat(directory.value,".lock",O_RDWR|O_CREAT|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC,0600);
+        lock.value=::openat(directory.value,".lock",(read_only?O_RDONLY:O_RDWR|O_CREAT)|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC,0600);
         struct stat st{};
-        if(lock.value<0||::fstat(lock.value,&st)||!S_ISREG(st.st_mode)||st.st_nlink!=1||::flock(lock.value,LOCK_EX|LOCK_NB))
+        if(lock.value<0||::fstat(lock.value,&st)||!S_ISREG(st.st_mode)||st.st_nlink!=1||::flock(lock.value,(read_only?LOCK_SH:LOCK_EX)|LOCK_NB))
             bad("checkpoint directory is already owned or lock is invalid");
         const auto manifest="RESONANTIA_BLOCKS 1\n"+identity+"\n";
         bool initialize=mode==Mode::Create;
-        if(mode==Mode::Resume) {
+        if(mode==Mode::Resume||read_only) {
             Fd f(::openat(directory.value,"identity",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC));
-            if(f.value<0&&errno==ENOENT)initialize=true;
+            if(f.value<0&&errno==ENOENT&&!read_only)initialize=true;
             else {
                 if(f.value<0||::fstat(f.value,&st)||!S_ISREG(st.st_mode)||st.st_nlink!=1||st.st_size!=static_cast<off_t>(manifest.size()))
                     bad("checkpoint identity missing or malformed");
@@ -105,7 +107,7 @@ struct BlockCheckpoint::Impl {
                 bad("checkpoint identity missing with existing block data");
             }
             if(name.ends_with(".block.pending")&&valid_key(name.substr(0,name.size()-14))) {
-                if(::unlinkat(directory.value,name.c_str(),0))bad("cannot remove incomplete checkpoint block");
+                if(!read_only&&::unlinkat(directory.value,name.c_str(),0))bad("cannot remove incomplete checkpoint block");
                 continue;
             }
             if(!name.ends_with(".block")||!valid_key(name.substr(0,name.size()-6))||
@@ -121,7 +123,7 @@ struct BlockCheckpoint::Impl {
             publish("identity",std::span<const unsigned char>(
                 reinterpret_cast<const unsigned char*>(manifest.data()),manifest.size()),{});
         }
-        if(::fsync(directory.value))bad("checkpoint directory sync failed");
+        if(!read_only&&::fsync(directory.value))bad("checkpoint directory sync failed");
     }
 
     void publish(const std::string& name,std::span<const unsigned char> head,std::span<const float> data) try {
@@ -175,6 +177,7 @@ std::optional<std::vector<float>> BlockCheckpoint::load(const std::string& key,s
     auto value=impl_->read(key,offset,count);if(value)++impl_->hits;return value;
 }
 void BlockCheckpoint::save(const std::string& key,std::uint64_t offset,std::span<const float> data) {
+    if(impl_->read_only)bad("read-only checkpoint cannot save");
     check_key(key);
     if(data.empty()||data.size()>impl_->limits.block_bytes/sizeof(float))
         throw std::invalid_argument("checkpoint count out of bounds");
@@ -195,4 +198,35 @@ void BlockCheckpoint::boundary()const {
     if(impl_->pause&&impl_->pause())throw OperationPaused();
 }
 std::uint64_t BlockCheckpoint::restored_blocks()const noexcept{return impl_->hits;}
+std::string BlockCheckpoint::stored_identity(const std::filesystem::path& path) {
+    Fd directory(::open(path.c_str(),O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
+    if(directory.value<0)bad("cannot inspect checkpoint directory");
+    Fd file(::openat(directory.value,"identity",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC));
+    struct stat st{};constexpr std::string_view prefix="RESONANTIA_BLOCKS 1\n";
+    if(file.value<0||::fstat(file.value,&st)||!S_ISREG(st.st_mode)||st.st_nlink!=1||st.st_size!=static_cast<off_t>(prefix.size()+65))bad("checkpoint identity missing or malformed");
+    std::string data(prefix.size()+65,'\0');transfer(file.value,data.data(),data.size(),false);
+    auto id=data.substr(prefix.size(),64);
+    if(!data.starts_with(prefix)||data.back()!='\n'||!core::valid_digest(id))bad("checkpoint identity malformed");
+    return id;
+}
+std::vector<BlockCheckpoint::Entry> BlockCheckpoint::entries() const {
+    // openat creates a separate directory cursor; dup would share readdir offset.
+    Dir dir{::fdopendir(::openat(impl_->directory.value,".",O_RDONLY|O_DIRECTORY|O_CLOEXEC))};
+    if(!dir.value)bad("cannot inspect checkpoint entries");
+    std::vector<Entry> result;std::uint32_t scanned=0;
+    for(;;) {
+        errno=0;auto* item=::readdir(dir.value);if(!item){if(errno)bad("checkpoint scan failed");break;}
+        const std::string name=item->d_name;if(++scanned>8196)bad("checkpoint entry limit exceeded");
+        if(!name.ends_with(".block"))continue;
+        const auto key=name.substr(0,name.size()-6);check_key(key);
+        Fd file(::openat(impl_->directory.value,name.c_str(),O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC));
+        struct stat st{};Header header{};
+        if(file.value<0||::fstat(file.value,&st)||!S_ISREG(st.st_mode)||st.st_nlink!=1||st.st_size<static_cast<off_t>(header_size+4))bad("invalid checkpoint entry");
+        transfer(file.value,header.data(),header.size(),false);
+        const auto count=get64(header,80);
+        if(std::memcmp(header.data(),"RSBLK001",8)||std::memcmp(header.data()+8,impl_->identity.data(),64)||get64(header,152)!=0||!count||count>impl_->limits.block_bytes/4||static_cast<std::uint64_t>(st.st_size)!=header_size+4*count)bad("invalid checkpoint entry metadata");
+        result.push_back({key,get64(header,72),count});if(result.size()>impl_->limits.blocks)bad("checkpoint entry limit exceeded");
+    }
+    return result;
+}
 } // namespace voxmutatio::io

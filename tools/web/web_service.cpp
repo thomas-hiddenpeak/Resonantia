@@ -1,5 +1,8 @@
 #include "tools/web/web_service.h"
 #include "tools/web/workflow_identity.h"
+#include "tools/web/pitch_review.h"
+#include <iomanip>
+#include <sstream>
 #include "tools/app_support/progress_protocol.h"
 #include "tools/app_support/operation_checkpoint.h"
 
@@ -70,6 +73,10 @@ bool valid_display_name(const std::string& name) {
     return true;
 }
 
+bool pitch_preview_task(const TaskRecord& r) {
+    return r.parameters.contains("recovery")&&r.parameters.at("recovery")=="audio-pitch-preview-v1";
+}
+
 bool mixed_result(const TaskRecord& r) {
     const auto kind=r.parameters.find("output_kind");return r.kind=="convert"&&kind!=r.parameters.end()&&kind->second=="mix";
 }
@@ -90,7 +97,8 @@ std::string task_json(const TaskRecord& r,const fs::path& directory={}) {
         if(r.state=="succeeded"&&!r.result.empty()) {
             const std::string kind=mixed_result(r)?"mix":r.kind=="convert"?"vocal":"result";
             const auto entry=[&](const std::string& k,const std::string& label){return "{\"kind\":\""+k+"\",\"label\":\""+label+"\",\"url\":\"/api/task/result?id="+r.id+"&variant="+k+"\"}";};
-            out+=entry(kind,kind=="mix"?"完整翻唱":kind=="vocal"?"干净人声":"处理后音频");
+            out+=entry(kind,pitch_preview_task(r)?"修正后（局部试听）":kind=="mix"?"完整翻唱":kind=="vocal"?"干净人声":"处理后音频");
+            if(pitch_preview_task(r))out+=","+entry("baseline","修正前（同一片段）");
             if(kind=="mix") {
                 bool available=false;
                 try {available=TaskArtifacts::retained_output(directory/"work","conversion",false).has_value();}catch(const std::exception&){}
@@ -107,14 +115,14 @@ std::string task_json(const TaskRecord& r,const fs::path& directory={}) {
         out+="\""+json_escape(key)+"\":\""+json_escape(value)+"\"";
     }
     const bool full=r.kind=="training"&&r.parameters.contains("recovery")&&r.parameters.at("recovery")=="training-full-v1";
-    const bool recoverable=full||((r.kind=="convert"||r.kind=="preprocess")&&r.parameters.contains("recovery")&&r.parameters.at("recovery")=="audio-v1");
+    const bool recoverable=full||((r.kind=="convert"||r.kind=="preprocess")&&r.parameters.contains("recovery")&&(r.parameters.at("recovery")=="audio-v1"||pitch_preview_task(r)));
     const bool pause=recoverable&&(r.state=="queued"||r.state=="running"||r.state=="pause_requested")&&r.stage!="saving"&&r.stage!="publishing";
     const bool resume=recoverable&&(r.state=="paused"||r.state=="interrupted"||r.state=="failed"||(full&&r.state=="cancelled"));
     const bool cleanable=r.state=="succeeded"&&!r.parameters.contains("retention")&&
         ((r.kind!="convert"&&r.kind!="preprocess")||r.parameters.contains("result_sha256"));
     return out+"},\"actions\":{\"pause\":"+(pause?"true":"false")+",\"resume\":"+(resume?"true":"false")+
         ",\"cleanup\":"+(cleanable?"true":"false")+",\"revise\":"+
-        ((r.kind=="convert"||r.kind=="preprocess")&&r.state=="succeeded"&&recoverable?"true":"false")+"}}";
+        ((r.kind=="convert"||r.kind=="preprocess")&&r.state=="succeeded"&&recoverable&&!pitch_preview_task(r)?"true":"false")+"}}";
 }
 
 void sync_artifact(const fs::path& path,bool directory=false) {
@@ -488,11 +496,19 @@ void WebService::handle_tasks(int fd,const Request& req) {
             }
             auto path=tasks_->task_directory(id)/r->result;
             const auto variant=query_get(req.query,"variant");
-            if(!variant.empty()&&variant!="mix"&&variant!="vocal"&&variant!="result") {
+            if(!variant.empty()&&variant!="mix"&&variant!="vocal"&&variant!="result"&&variant!="baseline") {
                 send_response(fd,400,"Bad Request","application/json","{\"error\":\"未知音频类型\"}");return;
             }
             if((variant=="mix"&&!mixed_result(*r))||(variant=="vocal"&&r->kind!="convert")) {
                 send_response(fd,404,"Not Found","application/json","{\"error\":\"此任务没有这份音频\"}");return;
+            }
+            if(variant=="baseline") {
+                try {
+                    if(!pitch_preview_task(*r))throw std::runtime_error("此任务不是局部试听");
+                    const auto baseline=TaskArtifacts::retained_output(tasks_->task_directory(id)/"work","baseline");
+                    if(!baseline)throw std::runtime_error("修正前片段未保留");
+                    path=*baseline;
+                } catch(const std::exception& e) {send_response(fd,409,"Conflict","application/json","{\"error\":\""+json_escape(e.what())+"\"}");return;}
             }
             if(variant=="vocal"&&mixed_result(*r)) {
                 try {
@@ -576,7 +592,8 @@ bool WebService::run_audio_process(ProcessSpec& process,std::uint64_t generation
 }
 
 WebWorkflowIdentity WebService::audio_identity(const ConversionPlan& p)const {
-    WebWorkflowIdentity identity("web-audio-v1");
+    WebWorkflowIdentity identity(p.pitch_preview?"web-pitch-preview-v1":"web-audio-v1");
+    if(p.pitch_preview)for(const auto& value:{p.analysis_id,std::to_string(p.preview_start),std::to_string(p.preview_end)})identity.field("preview",value);
     for(const auto& item:std::vector<std::string>{p.workflow,p.output_kind,p.voice,p.pitch_edits,
         std::to_string(p.pitch),std::to_string(p.filter_radius),std::to_string(p.index_rate),std::to_string(p.rms),
         std::to_string(p.protect),std::to_string(p.separate),std::to_string(p.deharmony),std::to_string(p.dereverb),
@@ -600,11 +617,18 @@ WebWorkflowIdentity WebService::audio_identity(const ConversionPlan& p)const {
     return identity;
 }
 WebService::ConversionPlan WebService::restore_audio_plan(const TaskRecord& r)const {
-    if((r.kind!="convert"&&r.kind!="preprocess")||!r.parameters.contains("recovery")||r.parameters.at("recovery")!="audio-v1")
+    if((r.kind!="convert"&&r.kind!="preprocess")||!r.parameters.contains("recovery")||(r.parameters.at("recovery")!="audio-v1"&&!pitch_preview_task(r)))
         throw WorkflowError(409,"此任务没有可验证的恢复记录");
     ConversionPlan p;p.directory=(tasks_->task_directory(r.id)/"work").string();p.name=r.name;
     p.input=p.directory+"/source.wav";p.model=p.directory+"/model.safetensors";p.index=p.directory+"/model.index";
     p.preprocess_only=r.kind=="preprocess";
+    p.pitch_preview=pitch_preview_task(r);
+    if(p.pitch_preview) {
+        p.analysis_id=r.parameters.at("analysis_id");
+        if(!parse_double_field(r.parameters.at("preview_start"),0,600,p.preview_start)||
+           !parse_double_field(r.parameters.at("preview_end"),0,600,p.preview_end)||p.preview_end<=p.preview_start||p.preview_end-p.preview_start>15||
+           !voxmutatio::core::valid_digest(p.analysis_id))throw WorkflowError(409,"保存的试听范围无效");
+    }
     if(r.parameters.contains("source_task"))p.source_task=r.parameters.at("source_task");
     const auto& v=r.parameters;
     p.voice=v.at("voice");p.workflow=v.at("workflow");p.output_kind=v.at("output_kind");p.pitch_edits=v.at("pitch_edits");
@@ -628,6 +652,83 @@ void WebService::resolve_saved_audio_model(ConversionPlan& p)const {
     // usable only after the complete parent's workflow identity is verified.
     if(!nonempty_regular_file(p.model))p.model=base?paths_.gmodel:paths_.runs+"/"+p.voice+"/model.safetensors";
     if(p.index_rate>0&&!nonempty_regular_file(p.index))p.index=paths_.runs+"/"+p.voice+"/model.index";
+}
+
+voxmutatio::VCConfig WebService::conversion_config(const ConversionPlan& p)const {
+    voxmutatio::VCConfig c;
+    c.hubert_model_path=paths_.hubert;c.rmvpe_model_path=paths_.rmvpe;
+    c.synthesizer_model_path=p.model;c.index_path=p.index;c.version=voxmutatio::ModelVersion::kV2;c.num_speakers=109;
+    c.f0_up_key=p.pitch;c.filter_radius=p.filter_radius;c.index_rate=p.index_rate;c.rms_mix_rate=p.rms;c.protect=p.protect;
+    if(!voxmutatio::parse_pitch_edits(p.pitch_edits,c.pitch_edits))throw WorkflowError(409,"保存的局部修音无效");
+    return c;
+}
+
+void WebService::handle_pitch_report(int fd,const Request& req) {
+    try {
+        if(!tasks_||task_storage_failed_)throw WorkflowError(503,"任务存储不可用");
+        const auto id=query_get(req.query,"id");
+        if(!TaskStore::valid_id(id))throw WorkflowError(400,"invalid task ID");
+        auto record=tasks_->get(id);if(!record)throw WorkflowError(404,"任务不存在");
+        const bool fallback=record->state=="failed"&&record->parameters.contains("source_task");
+        if(fallback)record=tasks_->get(record->parameters.at("source_task"));
+        if(!record||record->kind!="convert"||record->state!="succeeded"||pitch_preview_task(*record))
+            throw WorkflowError(409,"请选择已完成的整段转换；局部试听或未完成任务不能作为基线");
+        const auto plan=restore_audio_plan(*record);const auto config=conversion_config(plan);
+        const auto evidence=pitch_review::read_evidence(plan.directory);
+        const auto curve=voxmutatio::f0::prepare_pitch_curve(evidence.raw,plan.filter_radius,plan.pitch,config.pitch_edits,evidence.pad,evidence.duration);
+        const auto issues=voxmutatio::f0::find_pitch_issues(evidence.raw,curve,plan.filter_radius,evidence.pad,evidence.duration);
+        const auto analysis=voxmutatio::core::sha256(evidence.identity+voxmutatio::app_support::conversion_recipe(config,0));
+        std::ostringstream out;out.imbue(std::locale::classic());out<<std::setprecision(8);
+        out<<"{\"task_id\":\""<<id<<"\",\"baseline_id\":\""<<record->id<<"\",\"analysis_id\":\""<<analysis
+           <<"\",\"duration\":"<<evidence.duration<<",\"start_time\":"<<-evidence.pad<<",\"step\":0.01,\"notice\":\""
+           <<(fallback?"失败的修音没有应用；以下分析与试听使用上一个成功版本。":"疑点来自音高轨迹，只是复核线索；正常换音也可能被标记，未标记处也可能有问题。")<<"\",\"raw\":[";
+        for(std::size_t i=0;i<evidence.raw.size();++i){if(i)out<<',';out<<evidence.raw[i];}
+        out<<"],\"processed\":[";for(std::size_t i=0;i<curve.size();++i){if(i)out<<',';out<<curve[i];}
+        out<<"],\"issues\":[";
+        for(std::size_t i=0;i<issues.size();++i) {
+            if(i)out<<',';const auto& issue=issues[i];out<<"{\"start\":"<<issue.start<<",\"end\":"<<issue.end<<",\"reason\":\""<<json_escape(issue.reason)<<"\",\"suggestion\":";
+            if(issue.suggestion) {const auto& e=*issue.suggestion;out<<"{\"start\":"<<e.start<<",\"end\":"<<e.end<<",\"semitones\":"<<e.semitones<<"}";}else out<<"null";
+            out<<'}';
+        }
+        out<<"],\"baseline_edits\":\""<<json_escape(plan.pitch_edits)<<"\"}";send_json(fd,out.str());
+    } catch(const WorkflowError& e) {send_response(fd,e.status,"Conflict","application/json","{\"error\":\""+json_escape(e.what())+"\"}");}
+      catch(const std::exception& e) {send_response(fd,409,"Conflict","application/json","{\"error\":\"音高分析不可用："+json_escape(e.what())+"\"}");}
+}
+
+void WebService::handle_pitch_preview(int fd,const Request& req) {
+    std::vector<Part> parts;if(!request_parts(fd,req,parts))return;
+    try {
+        if(!tasks_||task_storage_failed_)throw WorkflowError(503,"任务存储不可用");
+        const auto id=field(parts,"task_id",""),parent_id=field(parts,"source_task","");
+        if(!TaskStore::valid_id(id)||!TaskStore::valid_id(parent_id))throw WorkflowError(400,"invalid task ID");
+        for(const auto& part:parts)if(!part.filename.empty()||(part.name!="task_id"&&part.name!="source_task"&&part.name!="pitch_edits"&&part.name!="preview_start"&&part.name!="preview_end"&&part.name!="analysis_id"))
+            throw WorkflowError(400,"局部试听只接受修音范围；其他设置沿用成功版本");
+        for(const auto& part:parts)if(std::count_if(parts.begin(),parts.end(),[&](const Part& other){return other.name==part.name;})!=1)
+            throw WorkflowError(400,"试听字段不可重复");
+        if(tasks_->get(id))throw WorkflowError(409,"task already exists; query its state");
+        auto parent=tasks_->get(parent_id);
+        if(!parent||parent->kind!="convert"||parent->state!="succeeded"||pitch_preview_task(*parent))throw WorkflowError(409,"试听基线不是已完成的整段转换");
+        auto plan=restore_audio_plan(*parent);resolve_saved_audio_model(plan);
+        const auto evidence=pitch_review::read_evidence(plan.directory);
+        const auto config=conversion_config(plan);
+        const auto analysis=voxmutatio::core::sha256(evidence.identity+voxmutatio::app_support::conversion_recipe(config,0));
+        if(field(parts,"analysis_id","")!=analysis)throw WorkflowError(409,"分析已变化，请重新读取音高");
+        if(!parse_double_field(field(parts,"preview_start",""),0,evidence.duration,plan.preview_start)||
+           !parse_double_field(field(parts,"preview_end",""),0,evidence.duration,plan.preview_end)||plan.preview_end<=plan.preview_start||plan.preview_end-plan.preview_start>15)
+            throw WorkflowError(400,"试听范围须在音频内，且不超过15秒");
+        plan.pitch_edits=field(parts,"pitch_edits","");
+        const auto corrected=conversion_config(plan);
+        // Validate before creating a durable task. No model work at this boundary.
+        const auto next_curve=voxmutatio::f0::prepare_pitch_curve(evidence.raw,plan.filter_radius,plan.pitch,corrected.pitch_edits,evidence.pad,evidence.duration);
+        const auto old_curve=voxmutatio::f0::prepare_pitch_curve(evidence.raw,plan.filter_radius,plan.pitch,config.pitch_edits,evidence.pad,evidence.duration);
+        if(old_curve==next_curve)throw WorkflowError(400,"没有需要试听的音高变化");
+        for(std::size_t i=0;i<old_curve.size();++i)if(old_curve[i]!=next_curve[i]&&(i/100.-evidence.pad<plan.preview_start-.011||i/100.-evidence.pad>plan.preview_end+.011))
+            throw WorkflowError(400,"请只预览当前片段内的修音变化");
+        plan.pitch_preview=true;plan.source_task=parent_id;plan.analysis_id=analysis;plan.output_kind="vocal";
+        plan.name="修音试听 · "+parent->name;
+        start_audio_task(fd,std::move(plan),id);
+    } catch(const WorkflowError& e) {send_response(fd,e.status,"Conflict","application/json","{\"error\":\""+json_escape(e.what())+"\"}");}
+      catch(const std::exception& e) {send_response(fd,409,"Conflict","application/json","{\"error\":\"不能创建试听："+json_escape(e.what())+"\"}");}
 }
 void WebService::inherit_audio_stages(const JobTicket& ticket,const ConversionPlan& p,TaskArtifacts& artifacts) {
     if(p.source_task.empty())return;
@@ -2150,6 +2251,30 @@ std::string WebService::convert_audio(const ConversionPlan& p,std::uint64_t gene
     }
     stage("converting");
     std::string output=p.directory+"/output.wav";
+    if(p.pitch_preview&&artifacts&&!artifacts->completed("conversion")) {
+        stage("preview-checking");
+        const auto parent=tasks_->get(p.source_task);
+        if(!parent||parent->state!="succeeded"||pitch_preview_task(*parent))throw WorkflowError(409,"试听基线不可用");
+        auto previous=restore_audio_plan(*parent);resolve_saved_audio_model(previous);
+        std::optional<fs::path> baseline;
+        if(previous.output_kind=="vocal"&&parent->parameters.contains("retention")&&parent->parameters.contains("result_sha256")) {
+            const auto file=tasks_->task_directory(parent->id)/parent->result;
+            if(voxmutatio::io::sha256_file(file)==parent->parameters.at("result_sha256"))baseline=file;
+        }else baseline=TaskArtifacts::retained_output(previous.directory,"conversion");
+        if(!baseline)throw WorkflowError(409,"基线干净人声未保留，不能制作对照试听");
+        if(!artifacts->completed("baseline")) {
+            const auto excerpt=p.directory+"/baseline.wav";
+            pitch_review::write_excerpt(*baseline,excerpt,p.preview_start,p.preview_end);artifacts->commit("baseline",excerpt);
+        }
+        std::string pause_file;{std::lock_guard lock(job_.mu);pause_file=job_.control_path;}
+        const auto cores=pitch_review::seed_preview(previous.directory,fs::path(p.directory)/"conversion_blocks",input,
+            fs::path(paths_.build)/"vc_convert",conversion_config(previous),conversion_config(p),p.preview_start,p.preview_end,pause_file,
+            [&]{audio_boundary(generation);});
+        std::ofstream preview_log(fs::path(p.directory)/"stages.log",std::ios::app);
+        preview_log<<"[serve] pitch preview "<<p.preview_start<<".."<<p.preview_end<<" seconds; recompute "<<cores<<" synthesis cores; reuse all F0 and unaffected cores\n";
+        if(!preview_log)throw std::runtime_error("cannot retain preview log");
+        stage("converting");
+    }
     if(auto saved=cached("conversion"))output=saved->string();
     else {
     ProcessSpec process;
@@ -2203,7 +2328,7 @@ void WebService::start_audio_task(int fd,ConversionPlan plan,const std::string& 
         {
             std::lock_guard lock(job_.mu);auto r=tasks_->get(task_id);
             // Keep display edits accepted while copying the task's inputs.
-            r->parameters.insert({{"recovery","audio-v1"},{"voice",plan.voice},{"workflow",plan.workflow},{"output_kind",plan.output_kind},
+            r->parameters.insert({{"recovery",plan.pitch_preview?"audio-pitch-preview-v1":"audio-v1"},{"voice",plan.voice},{"workflow",plan.workflow},{"output_kind",plan.output_kind},
                 {"f0_up_key",std::to_string(plan.pitch)},{"filter_radius",std::to_string(plan.filter_radius)},
                 {"index_rate",std::to_string(plan.index_rate)},{"rms_mix_rate",std::to_string(plan.rms)},
                 {"protect",std::to_string(plan.protect)},{"pitch_edits",plan.pitch_edits},
@@ -2211,6 +2336,7 @@ void WebService::start_audio_task(int fd,ConversionPlan plan,const std::string& 
                 {"pp_dereverb",plan.dereverb?"1":"0"},{"pp_deecho",plan.deecho?"1":"0"},
                 {"pp_denoise",plan.denoise?"1":"0"}});
             if(!plan.source_task.empty())r->parameters["source_task"]=plan.source_task;
+            if(plan.pitch_preview) {r->parameters["analysis_id"]=plan.analysis_id;r->parameters["preview_start"]=std::to_string(plan.preview_start);r->parameters["preview_end"]=std::to_string(plan.preview_end);}
             if(!tasks_->save(*r,r->revision))throw std::runtime_error("cannot retain conversion parameters");
         }
         auto self=shared_from_this();
@@ -2243,7 +2369,12 @@ void WebService::run_audio_task(JobTicket ticket,ConversionPlan plan) noexcept {
             TaskArtifacts artifacts(plan.directory,identity.finish(),identity.legacy());
             inherit_audio_stages(ticket,plan,artifacts);
             audio_boundary(ticket.generation);
-            const auto output=convert_audio(plan,ticket.generation,&artifacts);
+            auto output=convert_audio(plan,ticket.generation,&artifacts);
+            if(plan.pitch_preview) {
+                audio_boundary(ticket.generation,"preview");
+                if(const auto cached=artifacts.completed("preview"))output=cached->string();
+                else {const auto excerpt=plan.directory+"/preview.wav";pitch_review::write_excerpt(output,excerpt,plan.preview_start,plan.preview_end);artifacts.commit("preview",excerpt);output=excerpt;}
+            }
             audio_boundary(ticket.generation,"saving");
             artifacts.publish_result(output);
         }
@@ -2277,6 +2408,8 @@ void WebService::finish_audio_task(const JobTicket& ticket,std::string_view resu
 }
 
 const char* WebService::allowed_api_method(const std::string& path) {
+    if (path == "/api/task/pitch") return "GET";
+    if (path == "/api/tasks/pitch-preview") return "POST";
     if (path == "/api/task/rename") return "POST";
     if (path == "/api/tasks" || path == "/api/task" || path == "/api/task/log" || path == "/api/task/result" || path == "/api/task/source") return "GET";
     if (path == "/api/train/runs" || path == "/api/storage") return "GET";
@@ -2294,7 +2427,11 @@ const char* WebService::allowed_api_method(const std::string& path) {
 }
 
 void WebService::handle_request(int fd, const Request& request) {
-    if (request.method == "POST" && request.path == "/api/task/rename") {
+    if (request.method == "GET" && request.path == "/api/task/pitch") {
+        handle_pitch_report(fd,request);
+    } else if (request.method == "POST" && request.path == "/api/tasks/pitch-preview") {
+        handle_pitch_preview(fd,request);
+    } else if (request.method == "POST" && request.path == "/api/task/rename") {
         handle_task_rename(fd,request);
     } else if (request.method == "GET" && (request.path == "/api/tasks" || request.path == "/api/task" || request.path == "/api/task/log" || request.path == "/api/task/result" || request.path == "/api/task/source")) {
         handle_tasks(fd,request);

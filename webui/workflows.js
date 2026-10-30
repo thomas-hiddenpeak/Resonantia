@@ -66,18 +66,23 @@
         lock,
         hasCandidate: () => !!candidatePreview,
         validate: pitchText,
-        resetPitchEdits: () => q('pitchEdits').replaceChildren(),
+        resetPitchEdits: () => {globalThis.resonantiaPitchReview?.reset();q('pitchEdits').replaceChildren();q('pitchError').hidden=true;},
         refreshRuns,
         restore(p) {
             candidatePreview=null;q('candidateNotice').hidden=true;q('exitCandidate').hidden=true;
             q('inputKind').value=p.workflow;workflowChanged();q('outputKind').value=p.output_kind;
             q('conversionDereverb').checked=p.pp_dereverb==='1';
+            this.setPitchEdits(p.pitch_edits||'');
+            q('pitchAdvanced').open=!!p.pitch_edits;
+        },
+        setPitchEdits(value) {
             q('pitchEdits').replaceChildren();
-            for(const text of (p.pitch_edits||'').split(';').filter(Boolean)) {
+            for(const text of (value||'').split(';').filter(Boolean)) {
                 q('addPitchEdit').onclick();const row=q('pitchEdits').lastElementChild,parts=text.split(':');
                 for(const [i,role] of ['mode','start','end','shift'].entries())if(parts[i]!==undefined)row.querySelector('[data-role="'+role+'"]').value=parts[i];
                 row.querySelector('select').dispatchEvent(new Event('change'));
             }
+            globalThis.resonantiaStudio?.render();
         },
         append(fd) {
             fd.append('workflow',q('inputKind').value); fd.append('output_kind',q('outputKind').value);

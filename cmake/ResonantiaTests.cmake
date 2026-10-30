@@ -86,6 +86,13 @@ endforeach()
 resonantia_register_test(test_block_checkpoint test_block_checkpoint
     LABELS "contract;host;checkpoint" TIMEOUT 30 NO_GPU_LOCK)
 
+resonantia_add_test_executable(test_pitch_review "${PROJECT_SOURCE_DIR}/tests/test_pitch_review.cpp")
+resonantia_register_test(test_pitch_review test_pitch_review LABELS "contract;host;f0" TIMEOUT 30 NO_GPU_LOCK)
+resonantia_add_test_executable(test_pitch_review_io "${PROJECT_SOURCE_DIR}/tests/test_pitch_review_io.cpp")
+target_link_libraries(test_pitch_review_io PRIVATE resonantia_web_support resonantia_training_control)
+target_include_directories(test_pitch_review_io PRIVATE "${PROJECT_SOURCE_DIR}")
+resonantia_register_test(test_pitch_review_io test_pitch_review_io LABELS "contract;host;f0" TIMEOUT 30 NO_GPU_LOCK)
+
 resonantia_add_test_executable(test_checkpoint_initialization "${PROJECT_SOURCE_DIR}/tests/test_checkpoint_initialization.cpp")
 target_sources(test_checkpoint_initialization PRIVATE "${PROJECT_SOURCE_DIR}/tools/app_support/joint_initialization.cpp")
 target_include_directories(test_checkpoint_initialization PRIVATE "${PROJECT_SOURCE_DIR}")

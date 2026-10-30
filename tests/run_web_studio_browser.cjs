@@ -36,6 +36,7 @@ const types = {
   "workflows.js": "text/javascript",
   "studio.js": "text/javascript",
   "tasks.js": "text/javascript",
+  "pitch-review.js": "text/javascript",
   "presets.json": "application/json",
 };
 const server = http.createServer((req, res) => {

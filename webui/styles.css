@@ -1020,6 +1020,11 @@ details[open] > summary::after {
   padding: 12px 0;
   border-bottom: 1px solid var(--border);
 }
+.pitch-section { margin-top: 24px; }
+#pitchPanel { scroll-margin-top: 24px; }
+#pitchTitle { font-size: 18px; font-weight: 600; }
+#pitchTitle:focus { outline: 2px solid var(--accent); outline-offset: 5px; }
+#pitchEdits input, #pitchEdits select { min-width: 0; width: 100%; }
 .pitch-edit label {
   font-size: 11px;
   color: var(--muted);
@@ -1628,3 +1633,20 @@ dialog p {
 .task-storage-policy { margin:12px 0 24px; }.task-storage-policy p { line-height:1.8; } #taskActiveName { overflow-wrap:anywhere;min-width:0;max-width:100%; }
 
 .task-revision-notice { padding: 1rem; margin: 1rem 0; border: 1px solid var(--border); border-radius: 12px; overflow-wrap: anywhere; }
+
+/* Guided pitch review uses the existing studio palette and native controls. */
+.pitch-guide { margin-block: 1rem; padding: 1rem; border: 1px solid var(--border, #d4d9e2); border-radius: 12px; }
+.pitch-issues { display:flex; flex-wrap:wrap; gap:.5rem; max-height:15rem; overflow:auto; margin-block:1rem; }
+.pitch-issues button { text-align:left; white-space:normal; max-width:100%; }
+.pitch-issues button[aria-pressed="true"] { outline:2px solid #2758bc; outline-offset:1px; }
+#pitchCurve { display:block; width:100%; height:auto; background:#f7f9fc; border-radius:8px; }
+#pitchReviewAudio { width:100%; margin-top:.75rem; }
+.pitch-loop { display:flex; align-items:center; gap:.5rem; margin-block:.5rem; }
+#pitchAdvanced { margin-block:1rem; }
+#pitchReviewStatus, #pitchDraftStatus { overflow-wrap:anywhere; }
+
+.pitch-review-summary { font-weight: 600; margin-block: .75rem; }
+.pitch-preview-status { margin-block: .75rem; padding: .75rem; background: var(--bg-input, #f3f5f0); border-radius: 8px; }
+.pitch-preview-status p { margin-block: 0 .5rem; overflow-wrap: anywhere; }
+.pitch-issues button[data-state="accepted"] { border-color: #286853; }
+.pitch-issues button[data-state="ignored"] { opacity: .75; }

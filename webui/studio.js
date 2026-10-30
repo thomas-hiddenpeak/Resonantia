@@ -85,6 +85,16 @@
     q("btnConvert").disabled =
       !!storageReason || backgroundBusy || convRunning || !!activeTrain || convCascade.state.busy || !ready || !name;
     q("regeneratePitch").disabled = q("btnConvert").disabled;
+    const pitchLocked = backgroundBusy || convRunning || !!activeTrain || convCascade.state.busy || !ready;
+    q("pitchEdits").querySelectorAll("input,select,button").forEach(el => {
+      el.disabled = pitchLocked || (el.dataset.role === 'shift' && el.closest('.pitch-edit').querySelector('[data-role="mode"]').value !== 'shift');
+    });
+    q("addPitchEdit").disabled = pitchLocked || q("pitchEdits").children.length >= 16;
+    const editCount = q("pitchEdits").children.length;
+    setText("regeneratePitch", editCount ? `生成完整新版（${editCount} 处修正）` : "生成完整新版");
+    setText("pitchContext", ready
+      ? `${convSource?.display_name || convFile.name} · ${editCount ? '已添加 ' + editCount + ' 个修音区间，生成新版后生效。' : '尚未添加修音区间。'}`
+      : "先上传音频，或在任务中心选择已有翻唱，点击“局部修音”。");
     q('btnPreprocess').disabled=backgroundBusy || !!storageReason || convRunning || convCascade.state.busy || !ready || q('inputKind').value==='manual' || (q('inputKind').value==='dry'&&!q('conversionDereverb').checked);
     q("resultStale").hidden =
       !resultSettings || resultSettings === settingsKey();
@@ -372,6 +382,11 @@
     q("pitchError").scrollIntoView({ behavior: "smooth", block: "center" });
     q("pitchEdits").querySelector("input")?.focus({ preventScroll: true });
   }
+  function openPitch() {
+    q("pitchPanel").open = true;
+    q("pitchTitle").focus({preventScroll:true});
+    q("pitchPanel").scrollIntoView({behavior:"smooth",block:"start"});
+  }
   globalThis.resonantiaStudio = {
     render,
     navigate,
@@ -381,6 +396,7 @@
     confirmTraining,
     trainingStatus,
     validationError,
+    openPitch,
   };
   q("convRetryUpload").onclick = () => ensureConvMaterial();
   q("retryConnection").onclick = () => {
@@ -391,6 +407,7 @@
   q("regeneratePitch").onclick = () => {
     if (!q("btnConvert").disabled) q("btnConvert").click();
   };
+  q("resultPitch").onclick = openPitch;
   q("pitchEdits").addEventListener("input", () => {
     q("pitchError").hidden = true;
   });

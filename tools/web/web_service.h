@@ -15,6 +15,7 @@
 #include "tools/app_support/training_cancel.h"
 #include "tools/web/workflow_support.h"
 
+namespace voxmutatio { struct VCConfig; }
 namespace resonantia::web {
 
 class WebWorkflowIdentity;
@@ -84,6 +85,8 @@ private:
     void persist_job_locked(const std::string& state, bool terminal = false);
     void persist_terminal_locked(const std::string& state) noexcept;
     void handle_tasks(int fd, const Request& request);
+    void handle_pitch_report(int fd, const Request& request);
+    void handle_pitch_preview(int fd, const Request& request);
     void handle_task_rename(int fd, const Request& request);
     void handle_storage(int fd);
     TaskStorageUsage storage_usage(bool force = false);
@@ -140,12 +143,16 @@ private:
         bool separate=false, deharmony=false, dereverb=false, deecho=false, denoise=false;
         bool preprocess_only=false;
         std::string source_task;
+        bool pitch_preview=false;
+        double preview_start=0, preview_end=0;
+        std::string analysis_id;
     };
     // Owns only values and task-owned paths, never request or socket references.
     std::string convert_audio(const ConversionPlan& plan, std::uint64_t generation=0,
                               TaskArtifacts* artifacts=nullptr);
     WebWorkflowIdentity audio_identity(const ConversionPlan& plan) const;
     ConversionPlan restore_audio_plan(const TaskRecord& record) const;
+    voxmutatio::VCConfig conversion_config(const ConversionPlan& plan) const;
     void resolve_saved_audio_model(ConversionPlan& plan) const;
     void inherit_audio_stages(const JobTicket& ticket, const ConversionPlan& plan, TaskArtifacts& artifacts);
     void start_audio_task(int fd, ConversionPlan plan, const std::string& task_id);

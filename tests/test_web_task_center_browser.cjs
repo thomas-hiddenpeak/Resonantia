@@ -163,6 +163,8 @@ const server = http.createServer(async (req,res) => {
   assert.equal(await page.locator('#pitchShift').inputValue(),'-3');assert.equal(await page.locator('#indexRate').inputValue(),'23');
   assert.equal(await page.locator('#inputKind').inputValue(),'song');assert.equal(await page.locator('#outputKind').inputValue(),'mix');
   assert.equal(await page.locator('.pitch-edit').count(),1);assert.equal(await page.locator('#inputKind').isDisabled(),true);
+  assert(await page.locator('#addPitchEdit').isVisible(),'historical task must expose local pitch editing without generating another result');
+  assert(!(await page.locator('#resultSection').isVisible()),'editing must not pretend the historical result was regenerated');
   assert.equal(await page.locator('#convFileInfo img').count(),0);
   await page.locator('#btnConvRemove').click();assert.equal(await page.locator('#inputKind').isDisabled(),false,'removing inherited source unlocks workflow');
   parent.parameters.f0_up_key='-30';parent.parameters.filter_radius='31';parent.parameters.index_rate='0.234567';
@@ -178,6 +180,61 @@ const server = http.createServer(async (req,res) => {
   const revisionBody=submittedBodies.at(-1);assert(revisionBody.includes('name="source_task"\r\n\r\nbrowser-fixture-1'));
   assert(!revisionBody.includes('name="session"'));assert(revisionBody.includes('name="f0_up_key"\r\n\r\n-4'));
   assert.notEqual(submittedIds.at(-1),parent.id);assert.equal(parent.state,'succeeded');
+  // Pitch editing remains reachable after reopening history, including a failed
+  // revision. Opening an editor must be read-only; submitting makes a new task.
+  for(const r of records.values())if(r.state==='running'){r.state='succeeded';r.actions={};}
+  await page.evaluate(id=>resonantiaTasks.open(id),parent.id);
+  await page.locator('#taskPitch').waitFor({state:'visible',timeout:5000});
+  const beforePitch=submissions;
+  await page.locator('#taskPitch').click();
+  await page.waitForFunction(()=>document.activeElement?.id==='pitchTitle');
+  assert(await page.locator('#addPitchEdit').isVisible());assert.equal(submissions,beforePitch);
+  const failed=record('failed-pitch-fixture','convert','failed');
+  failed.error='RESONANTIA_PROGRESS 1 f0 26314 26314 frames100hz\nConversion failed: smooth pitch edit crosses unvoiced audio; narrow the interval';
+  failed.parameters={...parent.parameters,source_task:parent.id,f0_up_key:'-5',filter_radius:'3',pitch_edits:'smooth:42:44;smooth:45:46'};
+  failed.actions={resume:true};records.set(failed.id,failed);
+  await page.evaluate(id=>resonantiaTasks.open(id),failed.id);
+  await page.locator('#taskName').waitFor({state:'visible'});
+  await page.reload();await page.locator('#nav-tasks').click();
+  await page.locator('#taskPitch').filter({hasText:'修改局部修音'}).waitFor({timeout:5000});
+  assert(!(await page.locator('#taskError').textContent()).includes('RESONANTIA_PROGRESS'));
+  assert((await page.locator('#taskPitchHint').textContent()).includes('相同设置'));
+  assert(await page.locator('#taskResume').isDisabled(),'unchanged invalid smoothing must not encourage another doomed retry');
+  // Missing ancestor is explicit and cannot silently fall back to an unrelated input.
+  records.delete(parent.id);await page.locator('#taskPitch').click();
+  await page.locator('#taskActionMessage').filter({hasText:'无法读取原成功版本'}).waitFor({timeout:5000});
+  assert.equal(submissions,beforePitch);records.set(parent.id,parent);
+  await page.locator('#taskPitch').click();
+  await page.waitForFunction(()=>document.activeElement?.id==='pitchTitle');
+  assert((await page.locator('#revisionDescription').textContent()).includes('失败版本'));
+  assert.equal(await page.locator('#pitchShift').inputValue(),'-5','must preserve failed revision settings, not overwrite with ancestor settings');
+  assert.equal(await page.locator('#filterRadius').inputValue(),'3');
+  assert.equal(await page.locator('.pitch-edit').count(),2);
+  assert.equal(await page.locator('.pitch-edit').first().locator('[data-role="start"]').inputValue(),'42');
+  assert.equal(submissions,beforePitch);assert.equal(failed.state,'failed');
+  for(const [i,start,end] of [[0,'43.36','43.54'],[1,'45.68','45.73']]) {
+    const row=page.locator('.pitch-edit').nth(i);
+    await row.locator('[data-role="mode"]').selectOption('shift');
+    await row.locator('[data-role="start"]').fill(start);await row.locator('[data-role="end"]').fill(end);
+    await row.locator('[data-role="shift"]').fill('12');
+  }
+  for(const width of [320,390,768,1440]) {
+    await page.setViewportSize({width,height:960});
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'pitch editor overflow at '+width);
+    await page.locator('#pitchPanel').scrollIntoViewIfNeeded();
+    await page.screenshot({path:path.join(output,'pitch-'+width+'.png'),fullPage:true});
+    await page.locator('#pitchPanel').screenshot({path:path.join(output,'pitch-editor-'+width+'.png')});
+  }
+  await page.addScriptTag({path:require.resolve(path.join(dependencies,'axe-core/axe.min.js'))});
+  const pitchAccessibility=await page.evaluate(async()=>await axe.run(document.getElementById('panel-convert'),{runOnly:{type:'tag',values:['wcag2a','wcag2aa','wcag21aa']}}));
+  assert.deepEqual(pitchAccessibility.violations.map(x=>({id:x.id,nodes:x.nodes.map(n=>n.target)})),[]);
+  await page.locator('#regeneratePitch').click();
+  await page.locator('#taskStateLabel').filter({hasText:'运行中'}).waitFor();
+  const pitchBody=submittedBodies.at(-1);
+  assert(pitchBody.includes('name="source_task"\r\n\r\n'+parent.id));
+  assert(pitchBody.includes('name="pitch_edits"\r\n\r\nshift:43.36:43.54:12;shift:45.68:45.73:12'));
+  assert(pitchBody.includes('name="f0_up_key"\r\n\r\n-5'));assert(!pitchBody.includes('name="session"'));
+  assert.notEqual(submittedIds.at(-1),failed.id);assert.equal(failed.state,'failed');assert.equal(parent.state,'succeeded');
   assert.deepEqual(errors,[]);
-  console.log(JSON.stringify({passed:true,submissions,controls,closedPageCompletion:true,offlineRecovery:true}));
+  console.log(JSON.stringify({passed:true,submissions,controls,closedPageCompletion:true,offlineRecovery:true,pitchHistoryAndFailedRevision:true}));
 })().catch(e=>{console.error(e);process.exitCode=1;}).finally(async()=>{await browser?.close();server.closeAllConnections();server.close();});

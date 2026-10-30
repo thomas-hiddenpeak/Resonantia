@@ -12,6 +12,25 @@ struct Directory {
     ~Directory(){std::error_code e;fs::remove_all(path,e);}
 };
 const std::string identity(64,'a');
+TEST_CASE("inspection is read only, shares readers and excludes writers") {
+    Directory d;const auto root=d.path/"store";const std::vector<float> data{0,120,121};
+    {BlockCheckpoint writer(root,identity,Mode::Create);writer.save("f0_0",0,data);
+     REQUIRE_THROWS(BlockCheckpoint(root,identity,Mode::ReadOnly));}
+    {std::ofstream f(root/"crash.block.pending");f<<"partial";}
+    REQUIRE(BlockCheckpoint::stored_identity(root)==identity);
+    {
+        BlockCheckpoint a(root,identity,Mode::ReadOnly),b(root,identity,Mode::ReadOnly);
+        REQUIRE(a.load("f0_0",0,3)==data);REQUIRE(a.entries().size()==1);
+        CHECK(a.entries()[0].key=="f0_0");CHECK(a.entries()[0].offset==0);CHECK(a.entries()[0].count==3);
+        REQUIRE_THROWS(a.save("f0_0",0,data));REQUIRE_THROWS(a.save("f0_3",3,data));
+        REQUIRE_THROWS(BlockCheckpoint(root,identity,Mode::Resume));
+        CHECK(fs::exists(root/"crash.block.pending"));
+    }
+    fs::remove(root/".lock");
+    REQUIRE_THROWS(BlockCheckpoint(root,identity,Mode::ReadOnly));CHECK_FALSE(fs::exists(root/".lock"));
+    fs::remove(root/"identity");REQUIRE_THROWS(BlockCheckpoint::stored_identity(root));
+    REQUIRE_THROWS(BlockCheckpoint(root,identity,Mode::ReadOnly));CHECK_FALSE(fs::exists(root/"identity"));
+}
 TEST_CASE("durable blocks survive owner release and pause, bind shape and identity") {
     Directory d;const auto root=d.path/"store";bool stop=false;
     const std::vector<float> data{0,1,-2,3.5f};

@@ -15,6 +15,10 @@ get_filename_component(RESONANTIA_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUT
 include("${RESONANTIA_ROOT}/cmake/ResonantiaCatch2.cmake")
 
 add_library(host_transport STATIC
+    "${RESONANTIA_ROOT}/src/io/audio_excerpt.cpp"
+    "${RESONANTIA_ROOT}/src/f0/pitch_review.cpp"
+    "${RESONANTIA_ROOT}/src/io/block_checkpoint.cpp"
+    "${RESONANTIA_ROOT}/src/io/bounded_audio_io.cpp"
     "${RESONANTIA_ROOT}/src/io/audio_io.cpp"
     "${RESONANTIA_ROOT}/tools/web/http_transport.cpp"
     "${RESONANTIA_ROOT}/src/separation/sep_registry.cpp"
@@ -23,6 +27,7 @@ target_include_directories(host_transport PUBLIC
     "${RESONANTIA_ROOT}" "${RESONANTIA_ROOT}/include")
 target_link_libraries(host_transport PUBLIC Threads::Threads)
 add_library(host_task_store STATIC "${RESONANTIA_ROOT}/tools/web/task_store.cpp" "${RESONANTIA_ROOT}/tools/web/task_artifacts.cpp" "${RESONANTIA_ROOT}/tools/web/task_storage.cpp")
+target_sources(host_task_store PRIVATE "${RESONANTIA_ROOT}/tools/web/pitch_review.cpp")
 target_link_libraries(host_task_store PUBLIC host_transport)
 add_library(host_workflow STATIC "${RESONANTIA_ROOT}/tools/web/workflow_support.cpp")
 target_link_libraries(host_workflow PUBLIC host_transport host_task_store)
@@ -120,3 +125,11 @@ register_host_contract(test_task_artifacts 30)
 add_executable(test_task_storage "${RESONANTIA_ROOT}/tests/test_task_storage.cpp")
 target_link_libraries(test_task_storage PRIVATE host_workflow)
 register_host_contract(test_task_storage 30)
+
+add_executable(test_pitch_review "${RESONANTIA_ROOT}/tests/test_pitch_review.cpp")
+target_include_directories(test_pitch_review PRIVATE "${RESONANTIA_ROOT}/include")
+target_link_libraries(test_pitch_review PRIVATE Catch2::Catch2WithMain host_transport)
+register_host_contract(test_pitch_review 30)
+add_executable(test_pitch_review_io "${RESONANTIA_ROOT}/tests/test_pitch_review_io.cpp")
+target_link_libraries(test_pitch_review_io PRIVATE Catch2::Catch2WithMain host_web)
+register_host_contract(test_pitch_review_io 30)

@@ -593,20 +593,35 @@ globalThis.resonantiaTasks?.observe(observeLocalConversion);
 
 function showRevision() {
     $('revisionNotice').hidden=!convSource;
-    if(convSource)$('revisionDescription').textContent='正在调整：'+convSource.name+'。原任务和结果保留，新版会单独保存。';
+    if(convSource)$('revisionDescription').textContent='正在调整：'+(convSource.display_name||convSource.name)+'。原任务和结果保留，新版会单独保存。';
     $('revisionParent').onclick=()=>{if(convSource)globalThis.resonantiaTasks.open(convSource.id);};
 }
-globalThis.resonantiaReviseAudio = async function(record) {
+globalThis.resonantiaReviseAudio = async function(record, {focusPitch=false, stillSelected=()=>true}={}) {
     if(convRunning||convCascade.state.busy||globalThis.resonantiaTasks.isBusy())throw new Error('请等待当前处理完成');
-    if(!record.actions?.revise||!['convert','preprocess'].includes(record.kind)||record.state!=='succeeded')throw new Error('此任务不能调整参数');
     const response=await apiFetch(API+'/task?id='+encodeURIComponent(record.id));
     if(!response.ok)throw new Error(await errText(response));
-    const source=await response.json();if(source.id!==record.id||!source.actions?.revise)throw new Error('原任务状态已变化，请刷新');
+    const selected=await response.json();if(selected.id!==record.id)throw new Error('原任务状态已变化，请刷新');
+    let source=selected;
+    const retryPitch=focusPitch && selected.kind==='convert' && selected.state==='failed' &&
+        (selected.error||'').includes('smooth pitch edit crosses unvoiced audio') && /^[A-Za-z0-9_-]{8,96}$/.test(selected.parameters?.source_task||'');
+    const reviewPreview=focusPitch && selected.kind==='convert' && selected.parameters?.recovery==='audio-pitch-preview-v1' &&
+        /^[A-Za-z0-9_-]{8,96}$/.test(selected.parameters?.source_task||'');
+    if(retryPitch || reviewPreview) {
+        const parent=await apiFetch(API+'/task?id='+encodeURIComponent(selected.parameters.source_task));
+        if(!parent.ok)throw new Error('无法读取原成功版本；失败记录与设置仍保留。'+await errText(parent));
+        source=await parent.json();
+        if(source.id!==selected.parameters.source_task||source.kind!=='convert'||source.parameters?.workflow!==selected.parameters.workflow)
+            throw new Error('原版本与失败版本不匹配，请先查看原版');
+    }
+    if(!source.actions?.revise||!['convert','preprocess'].includes(source.kind)||source.state!=='succeeded')throw new Error('此任务不能调整参数，请查看原成功版本');
+    if(!stillSelected())return;
+    if(convRunning||convCascade.state.busy||globalThis.resonantiaTasks.isBusy())throw new Error('请等待当前处理完成');
+    const p=retryPitch?selected.parameters:source.parameters;
     const generation=++convUploadGeneration;convSource=source;convFile={name:source.name};localConversion=null;
     $('convFileInput').value='';$('convFileInfo').querySelector('.file-name').textContent=source.name;
     $('convFileInfo').style.display='flex';convArea.style.display='none';$('resultSection').style.display='none';$('convProgress').style.display='none';
     $('nav-convert').click();await loadVoices();if(generation!==convUploadGeneration)return;
-    const p=source.parameters;$('voiceSelect').value=p.voice;lastVoicePreset=p.voice;
+    $('voiceSelect').value=p.voice;lastVoicePreset=p.voice;
     for(const [key,id,scale] of [['f0_up_key','pitchShift',1],['index_rate','indexRate',100],['rms_mix_rate','rmsMixRate',100],['protect','protect',100],['filter_radius','filterRadius',1]]) {
         const el=$(id),value=Number(p[key])*scale;
         if(id==='filterRadius'&&![...el.options].some(o=>o.value===String(value))){const option=document.createElement('option');option.value=String(value);option.textContent=value+'（原任务）';el.appendChild(option);}
@@ -616,6 +631,8 @@ globalThis.resonantiaReviseAudio = async function(record) {
     }
     globalThis.resonantiaWorkflow.restore(p);convCascade.state.applied=[];convCascade.state.ready=true;convCascade.setBusy(false);
     showRevision();globalThis.resonantiaWorkflow.lock(false);
+    $('pitchPanel').open=true;$('pitchError').hidden=true;
+    if(retryPitch)$('revisionDescription').textContent='正在修改失败版本：'+(selected.display_name||selected.name)+'。已恢复失败版本的设置；生成时以原成功版本为来源创建新版，两份旧任务均保留。';
     $('convUploadStatus').textContent='已载入原任务素材与设置，无需重新上传。';
     const audio=$('convOrigAudio');audio.pause();if(audio._url)URL.revokeObjectURL(audio._url);audio._url='';audio.removeAttribute('src');
     const url=API+'/task/source?id='+encodeURIComponent(source.id);
@@ -635,6 +652,9 @@ globalThis.resonantiaReviseAudio = async function(record) {
     if(generation!==convUploadGeneration)return;
     $('convOrigAudition').style.display=available?'flex':'none';audio.style.display='block';
     globalThis.resonantiaStudio?.conversion('ready');
+    await globalThis.resonantiaPitchReview?.load(source,reviewPreview?source:selected,{preview:reviewPreview?selected:null});
+    if(generation!==convUploadGeneration||!stillSelected())return;
+    if(focusPitch)globalThis.resonantiaStudio?.openPitch();
 };
 
 $('btnConvert').addEventListener('click', async () => {

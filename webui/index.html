@@ -452,6 +452,42 @@
               </section>
             </aside>
           </div>
+          <section class="card pitch-section" aria-labelledby="pitchTitle">
+            <details id="pitchPanel" open>
+              <summary id="pitchTitle" tabindex="-1">音高检查与局部修音</summary>
+              <p id="pitchContext" class="hint" role="status">先上传音频，或从任务中心选择已有翻唱。</p>
+              <div id="pitchGuide" class="pitch-guide">
+                <p id="pitchReviewStatus" role="status">从任务中心打开已完成的翻唱，即可检查可疑音高。</p>
+                <button id="pitchReload" class="btn-small" type="button" disabled>重新读取音高</button>
+                <div id="pitchReviewBody" hidden>
+                  <p id="pitchBaselineWarning" class="field-error" role="status" hidden>当前表单参数或手动区间与试听基线不同。请恢复成功版设置后使用自动建议；当前音频不受影响。</p><button id="pitchRestore" class="btn-small" type="button" hidden>恢复成功版设置</button>
+                  <p class="hint">先检查疑点，再听修正效果，满意后采用并生成完整新版。疑点不等于唱错，未标记也不代表没有问题。</p>
+                  <p id="pitchReviewSummary" class="pitch-review-summary" role="status"></p>
+                  <div id="pitchIssues" class="pitch-issues" aria-label="待听审位置"></div>
+                  <h3 id="pitchSelection">选择一个位置</h3>
+                  <svg id="pitchCurve" viewBox="0 0 760 210" role="img" aria-labelledby="pitchCurveTitle pitchCurveDesc"><title id="pitchCurveTitle">所选片段的音高轨迹</title><desc id="pitchCurveDesc">灰线为检测音高，蓝线为当前转换使用的音高。断线表示没有可靠音高。</desc></svg>
+                  <p class="hint">横轴：原曲时间；纵轴：音高（相邻水平线相差一个八度）。灰线：检测值；蓝线：已应用值；橙色：建议值。建议曲线不是已经生成的声音。</p>
+                  <div class="task-actions"><button id="pitchListenSource" class="btn-small" type="button">听原始输入</button><button id="pitchListenBefore" class="btn-small" type="button">听修正前</button><button id="pitchListenAfter" class="btn-small" type="button" disabled>听修正后</button></div>
+                  <audio id="pitchReviewAudio" controls preload="metadata" aria-label="局部修音同位置试听"></audio>
+                  <label class="pitch-loop"><input id="pitchLoop" type="checkbox" checked>循环当前整句</label>
+                  <p id="pitchReviewPlayback" class="hint" role="status"></p>
+                  <div class="task-actions"><button id="pitchTry" class="btn-secondary" type="button" disabled>先试听建议</button><button id="pitchAdopt" class="btn-secondary" type="button" disabled>采用这处修正</button><button id="pitchIgnore" class="btn-small" type="button">保留原音，忽略此处</button><button id="pitchUndo" class="btn-small" type="button" disabled>撤销上次采用</button></div>
+                  <div class="pitch-preview-status"><p id="pitchPreviewStatus" role="status"></p><button id="pitchOpenPreview" class="btn-small" type="button" hidden>查看试听任务</button></div>
+                  <p id="pitchDraftStatus" role="status"></p>
+                  <button id="pitchNext" class="btn-small" type="button" disabled>下一处待听审</button>
+                  <p class="hint">短试听沿用成功版本的声线与其他参数，只预览这一处变化，单独保存到任务中心。采用后仍需点击“生成完整新版”才会处理整首歌。</p>
+                </div>
+              </div>
+              <details id="pitchAdvanced"><summary>高级手动修音</summary>
+                <p class="hint">时间按原上传音频计算；每段 0.02–2 秒，最多 16 段，按时间排序、不重叠。</p>
+                <p class="hint">平滑跳音需整段有可靠音高。半音偏移用于已确认的音高误判；不要把整句选作平滑区间。</p>
+                <p id="pitchError" class="field-error" role="alert" hidden></p>
+                <div id="pitchEdits"></div>
+                <button class="btn-secondary" id="addPitchEdit" type="button" disabled>添加修音区间</button>
+              </details>
+              <div class="task-actions"><button id="regeneratePitch" class="btn-secondary" type="button" disabled>生成完整新版</button></div>
+            </details>
+          </section>
           <section
             class="card result-section"
             id="resultSection"
@@ -526,23 +562,7 @@
                 先听清晰度，再听音色和动态。特别留意长音、尾音和高音处是否自然。
               </p>
             </div>
-            <details class="advanced">
-              <summary>听到局部跳音？添加修正并重新生成</summary>
-              <p class="hint">
-                以这次上传音频的秒数为准。平滑用于短促跳变，半音偏移用于局部高/低八度（±12）。每段
-                0.02–2 秒，最多 16
-                段，按时间排序、不重叠；平滑不能跨无声区。输入最长 10
-                分钟。修改后重新转换并试听，避免抹掉正常滑音。
-              </p>
-              <p id="pitchError" class="field-error" role="alert" hidden></p>
-              <div id="pitchEdits"></div>
-              <button class="btn-secondary" id="addPitchEdit">
-                添加修音区间
-              </button>
-              <button id="regeneratePitch" class="btn-secondary">
-                应用修正，重新生成
-              </button>
-            </details>
+            <button id="resultPitch" class="btn-secondary" type="button">局部修音</button>
           </section>
         </div>
         <div
@@ -923,8 +943,8 @@
               <form id="taskRenameForm" class="task-rename" hidden><label for="taskRenameInput">任务名称</label><input id="taskRenameInput" type="text" maxlength="255" required aria-describedby="taskRenameHint" /><p id="taskRenameHint" class="hint">只修改显示名称，不影响素材、声线或任务进度。最多 255 字节，约 85 个汉字。</p><div class="task-actions"><button id="taskRenameSave" class="btn-secondary" type="submit">保存名称</button><button id="taskRenameCancel" class="text-button" type="button">取消</button></div><p id="taskRenameMessage" role="status"></p></form>
               <h3 id="taskStage"></h3><p id="taskCounter"></p><progress id="taskProgress" aria-label="当前阶段进度" max="1" value="0"></progress>
               <p id="taskTimes" class="hint"></p><p id="taskFreshness" class="hint"></p><p id="taskError" class="task-error" hidden></p><p id="taskRecovery"></p>
-              <div class="task-actions"><button id="taskPause" class="btn-secondary" type="button" hidden>安全暂停</button><button id="taskResume" class="btn-convert" type="button" hidden>继续此任务</button><button id="taskLegacyCancel" class="btn-secondary" type="button" hidden>停止训练（不支持完整续训）</button><button id="taskRevise" class="btn-secondary" type="button" hidden>调整参数再生成</button><button id="taskParent" class="btn-secondary" type="button" hidden>查看原版</button><button id="taskLibrary" class="btn-secondary" type="button" hidden>前往声线库</button><button id="taskCleanup" class="btn-secondary" type="button" hidden>清理冗余副本</button><button id="taskListen" class="btn-convert" type="button" hidden>载入试听与下载</button></div>
-              <p id="taskRetention" class="hint"></p><p id="taskActionMessage" role="status"></p>
+              <div class="task-actions"><button id="taskPause" class="btn-secondary" type="button" hidden>安全暂停</button><button id="taskResume" class="btn-convert" type="button" hidden>继续此任务</button><button id="taskLegacyCancel" class="btn-secondary" type="button" hidden>停止训练（不支持完整续训）</button><button id="taskRevise" class="btn-secondary" type="button" hidden>调整参数再生成</button><button id="taskPitch" class="btn-secondary" type="button" hidden>局部修音</button><button id="taskParent" class="btn-secondary" type="button" hidden>查看原版</button><button id="taskLibrary" class="btn-secondary" type="button" hidden>前往声线库</button><button id="taskCleanup" class="btn-secondary" type="button" hidden>清理冗余副本</button><button id="taskListen" class="btn-convert" type="button" hidden>载入试听与下载</button></div>
+              <p id="taskPitchHint" class="hint" hidden></p><p id="taskRetention" class="hint"></p><p id="taskActionMessage" role="status"></p>
               <section id="taskResults" aria-label="已保存的音频" hidden><p id="taskOutputsNotice" class="hint" role="status" hidden></p><div class="task-audio-results">
                 <section id="taskPrimaryCard" class="task-audio-card" aria-labelledby="taskPrimaryTitle"><h3 id="taskPrimaryTitle">处理后音频</h3><p id="taskPrimaryHint" class="hint"></p><audio id="taskAudio" controls preload="metadata" aria-label="已保存的任务音频"></audio><button id="taskLoadPrimary" class="btn-secondary" type="button" hidden>载入音频</button><a id="taskDownload" class="text-button" download hidden>下载 WAV</a><p id="taskPrimaryMessage" class="hint" role="status"></p></section>
                 <section id="taskVocalCard" class="task-audio-card" aria-labelledby="taskVocalTitle" hidden><h3 id="taskVocalTitle">干净人声</h3><p class="hint">转换后的目标声线，不含伴奏。</p><audio id="taskVocalAudio" controls preload="metadata" aria-label="干净人声"></audio><button id="taskLoadVocal" class="btn-secondary" type="button" hidden>载入人声</button><a id="taskVocalDownload" class="text-button" download hidden>下载人声 WAV</a><p id="taskVocalMessage" class="hint" role="status"></p></section>
@@ -958,5 +978,6 @@
     <script src="app.js"></script>
     <script src="workflows.js"></script>
     <script src="studio.js"></script>
+    <script src="pitch-review.js"></script>
   </body>
 </html>

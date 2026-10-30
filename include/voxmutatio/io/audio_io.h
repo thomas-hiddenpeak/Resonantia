@@ -8,6 +8,16 @@
 
 namespace voxmutatio::io {
 
+struct AudioFileInfo { std::uint64_t frames=0; int sample_rate=0, channels=0; };
+/// Header-only, seekable WAV inspection; malformed files/final symlinks rejected.
+std::optional<AudioFileInfo> inspect_audio(const std::string& path);
+/// Native-rate mono excerpt, 0 < end-start <=15s, no resampling or normalization.
+/// Reads only the selected samples; rejects out-of-file intervals/nonfinite data.
+std::optional<AudioBuffer> read_audio_excerpt(const std::string& path,double start,double end);
+/// Atomic native-rate mono PCM16 excerpt, <=15s; preserves every selected PCM
+/// sample exactly. Rejects non-PCM16/stereo input rather than silently remixing.
+bool write_audio_excerpt(const std::string& input,const std::string& output,double start,double end);
+
 /// Owned interleaved L/R PCM. Mono input is duplicated; >2 channels rejected.
 /// Limited to 600 seconds and 128 MiB encoded WAV for the cleanup workflow.
 struct StereoAudioBuffer {

@@ -26,7 +26,12 @@ public:
 // directory contains no blocks; a missing identity beside blocks always fails.
 class BlockCheckpoint {
 public:
-    enum class Mode { Create, Resume };
+    enum class Mode { Create, Resume, ReadOnly };
+    struct Entry { std::string key; std::uint64_t offset=0, count=0; };
+    // Historical inspection only: this does not prove compatibility with a new
+    // recipe. ReadOnly requires existing identity/lock, takes a shared lock,
+    // never cleans pending files and rejects every save, including idempotent ones.
+    static std::string stored_identity(const std::filesystem::path& directory);
     struct Limits {
         std::uint64_t block_bytes = 32ULL * 1024 * 1024;
         std::uint64_t total_bytes = 2ULL * 1024 * 1024 * 1024;
@@ -50,6 +55,8 @@ public:
     // callback is a no-op; true throws OperationPaused. Callback errors propagate.
     void boundary() const;
     std::uint64_t restored_blocks() const noexcept;
+    // Bounded metadata listing; load() must still verify each payload checksum.
+    std::vector<Entry> entries() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

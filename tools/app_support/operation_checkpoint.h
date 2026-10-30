@@ -13,9 +13,13 @@ namespace voxmutatio::app_support {
 // on-disk binary replacement. User input/model paths never follow final symlinks.
 class OperationIdentity {
 public:
-    explicit OperationIdentity(std::string_view domain) {
+    explicit OperationIdentity(std::string_view domain)
+        :OperationIdentity(domain,io::sha256_file("/proc/self/exe",256ULL*1024*1024,true)) {}
+    // An orchestrator may bind the exact child executable rather than itself.
+    OperationIdentity(std::string_view domain,const std::string& executable_digest) {
+        if(!core::valid_digest(executable_digest))throw std::invalid_argument("invalid executable identity");
         field("format","operation-blocks-v1");field("domain",domain);
-        field("executable",io::sha256_file("/proc/self/exe",256ULL*1024*1024,true));
+        field("executable",executable_digest);
     }
     void field(std::string_view name,std::string_view value) {
         for(auto part:{name,value}){const auto n=std::to_string(part.size())+":";hash_.update(n.data(),n.size());hash_.update(part.data(),part.size());}

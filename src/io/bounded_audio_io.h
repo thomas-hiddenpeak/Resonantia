@@ -40,7 +40,7 @@ public:
     WavChunkReader(const WavChunkReader&) = delete;
     WavChunkReader& operator=(const WavChunkReader&) = delete;
 
-    bool open(const std::filesystem::path& path) noexcept;
+    bool open(const std::filesystem::path& path, bool no_follow = false) noexcept;
     void close() noexcept;
 
     [[nodiscard]] bool is_open() const noexcept;
@@ -163,6 +163,8 @@ public:
     bool open(const std::filesystem::path& target, int sample_rate,
               std::uint64_t expected_samples) noexcept;
     bool append(std::span<const float> samples) noexcept;
+    // Decoded PCM16 values (integer / 32768), no second quantization.
+    bool append_decoded_pcm16(std::span<const float> samples) noexcept;
     bool commit() noexcept;
     void abort() noexcept;
 
@@ -172,6 +174,7 @@ public:
     [[nodiscard]] std::filesystem::path staging_path() const;
 
 private:
+    bool append_impl(std::span<const float> samples,bool exact_pcm16) noexcept;
     struct State;
     std::unique_ptr<State> state_;
 };

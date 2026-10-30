@@ -3,11 +3,13 @@
   const q = id => document.getElementById(id);
   const active = r => ['queued', 'running', 'pause_requested'].includes(r?.state);
   const states = {queued:'等待设备',running:'运行中',pause_requested:'正在安全暂停',paused:'已暂停',interrupted:'服务中断',failed:'失败',cancelled:'已停止',succeeded:'已完成'};
-  const stages = {queued:'等待设备',preparing:'准备素材',checking:'核验素材与模型',preprocessing:'清理与切分素材',separating:'分离人声',cleanup:'去和声与混响',cleaning:'清理主唱','preparing-vocal':'准备独唱人声',converting:'转换声线',mixing:'合成伴奏',saving:'保存结果',training:'训练声线',indexing:'构建音色索引',publishing:'保存训练候选',done:'完成',error:'失败'};
+  const stages = {'preview-checking':'准备局部试听缓存',preview:'保存试听片段',queued:'等待设备',preparing:'准备素材',checking:'核验素材与模型',preprocessing:'清理与切分素材',separating:'分离人声',cleanup:'去和声与混响',cleaning:'清理主唱','preparing-vocal':'准备独唱人声',converting:'转换声线',mixing:'合成伴奏',saving:'保存结果',training:'训练声线',indexing:'构建音色索引',publishing:'保存训练候选',done:'完成',error:'失败'};
   const phases = {identity:'核验素材与模型','loading-models':'载入模型',f0:'提取音高',synthesis:'合成人声',output:'保存音频',separating:'分离音频',cache:'准备训练特征',training:'更新训练参数',indexing:'构建音色索引',separation:'分离音频'};
   const units = {chunks:'块',samples16k:'采样（16 kHz）',frames100hz:'帧（每秒 100 帧）',blocks:'块',frames:'帧',samples:'采样',steps:'步',files:'份',windows:'窗'};
   const kinds = {convert:'翻唱',preprocess:'预处理',training:'训练',step:'预处理'};
   const title = r => r?.display_name || r?.name || r?.id || '';
+  const pitchPreview = r => r?.kind==='convert' && r.parameters?.recovery==='audio-pitch-preview-v1' && validId(r.parameters?.source_task);
+  const pitchFailure = r => r?.kind === 'convert' && r.state === 'failed' && (r.error || '').includes('smooth pitch edit crosses unvoiced audio');
   const validId = id => typeof id === 'string' && /^[A-Za-z0-9_-]{8,96}$/.test(id);
   function read(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
   function save(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* server remains authoritative */ } }
@@ -18,7 +20,7 @@
   pending = pending.filter(validId).slice(0,20);
   const savedRequests = read('resonantiaPendingRecipes', []);
   const requests = new Map((Array.isArray(savedRequests)?savedRequests:[]).slice(0,20).filter(r=>
-    validId(r?.id) && ['/api/train','/api/tasks/convert','/api/tasks/preprocess'].includes(r.endpoint) &&
+    validId(r?.id) && ['/api/train','/api/tasks/convert','/api/tasks/preprocess','/api/tasks/pitch-preview'].includes(r.endpoint) &&
     Array.isArray(r.fields) && r.fields.length<=64 && r.fields.every(pair=>Array.isArray(pair)&&pair.length===2&&
       typeof pair[0]==='string'&&/^[a-z][a-z0-9_]{0,63}$/.test(pair[0])&&typeof pair[1]==='string'&&pair[1].length<=4096)
   ).map(r=>[r.id,r]));
@@ -87,15 +89,21 @@
     const seconds = Math.max(0, Math.floor(((r.finished_ms || Date.now()) - r.created_ms) / 1000));
     text('taskTimes', `提交：${time(r.created_ms)} · 距提交 ${Math.floor(seconds/60)} 分 ${seconds%60} 秒（含等待与暂停）`);
     text('taskFreshness', `最近进展：${time(r.progress_at_ms)} · 状态记录：${time(r.updated_ms)}`);
-    text('taskError', r.error || ''); q('taskError').hidden = !r.error;
+    text('taskError', pitchFailure(r) ? '局部修音未应用：平滑区间跨过了没有可靠音高的部分。请缩小区间，或确认属于高 / 低八度后改用“半音偏移”。完整错误保留在运行日志中。' : r.error || ''); q('taskError').hidden = !r.error;
     text('taskRecovery', r.parameters?.reused_stages ? '本版已复用：'+r.parameters.reused_stages.split(',').map(x=>({separation:'人声分离',cleanup:'主唱清理',conversion:'声线转换'})[x]||x).join('、')+'。其余阶段按本版设置执行。' : r.state === 'pause_requested' ? '暂停请求已送达，等待当前安全保存点；此时尚未释放设备。' :
       r.state === 'interrupted' ? '服务曾中断。继续会先核验已保存内容，从有效保存点恢复；未保存的计算需要重做。' :
       r.actions?.resume ? '继续使用本任务固定的素材与设置，复用已验证的保存点。若身份核验失败，请查看日志。' :
       active(r) ? '任务在服务器运行，可以关闭页面。重新打开“任务中心”即可查看。' :
       r.kind === 'training' && r.state === 'succeeded' ? '训练候选已保存。请到声线库听审，再决定是否发布。' : '状态与日志已保留。');
     q('taskPause').hidden = !r.actions?.pause; q('taskPause').disabled = !connected || actionBusy || r.state === 'pause_requested';
-    q('taskResume').hidden = !r.actions?.resume; q('taskResume').disabled = !connected || actionBusy || busy;
+    q('taskResume').hidden = !r.actions?.resume; q('taskResume').disabled = !connected || actionBusy || busy || pitchFailure(r);
+    q('taskResume').title = pitchFailure(r) ? '请先修改局部修音；原设置会重复失败' : '';
     q('taskRevise').hidden = !r.actions?.revise; q('taskRevise').disabled = !connected || actionBusy || busy;
+    q('taskPitch').hidden = !(r.kind === 'convert' && ((r.state === 'succeeded' && r.actions?.revise) || (pitchFailure(r) && validId(r.parameters?.source_task)) || (pitchPreview(r) && ['succeeded','failed','paused','interrupted'].includes(r.state))));
+    q('taskPitch').disabled = !connected || actionBusy || busy;
+    text('taskPitch',pitchPreview(r) ? '返回修音，继续听审' : pitchFailure(r) ? '修改局部修音' : '检查音高与局部修音');
+    q('taskPitchHint').hidden = !pitchFailure(r);
+    text('taskPitchHint', '用相同设置继续仍会遇到此错误。请先修改局部修音；打开编辑器不会启动转换。');
     q('taskParent').hidden = !validId(r.parameters?.source_task);
     q('taskParent').onclick = () => choose(r.parameters.source_task,true);
     q('taskCleanup').hidden = !r.actions?.cleanup;q('taskCleanup').disabled = !connected || actionBusy || busy;
@@ -107,7 +115,7 @@
     q('taskListen').disabled = !connected;
     renderMedia(r);
     const recipe = q('taskRecipe'); recipe.replaceChildren();
-    for (const [key,label] of [['voice','声线'],['workflow','输入处理'],['output_kind','输出'],['mode','训练方式'],['epochs','训练轮数'],['f0_up_key','音高偏移'],['index_rate','音色检索率'],['rms_mix_rate','动态保留']]) {
+    for (const [key,label] of [['voice','声线'],['workflow','输入处理'],['output_kind','输出'],['mode','训练方式'],['epochs','训练轮数'],['f0_up_key','音高偏移'],['index_rate','音色检索率'],['rms_mix_rate','动态保留'],['pitch_edits','局部修音区间（秒）']]) {
       if (r.parameters?.[key] === undefined) continue;
       const dt = document.createElement('dt'), dd = document.createElement('dd'); dt.textContent=label; dd.textContent=r.parameters[key]; recipe.append(dt,dd);
     }
@@ -178,10 +186,10 @@
     } catch(e) { text('taskActionMessage','操作结果未确认：'+e.message+'。刷新状态后再决定。'); }
     finally {actionBusy=false;await refresh();renderDetail();}
   }
-  const labels={mix:'完整翻唱',vocal:'干净人声',result:'处理后音频'};
+  const labels={mix:'完整翻唱',vocal:'干净人声',result:'处理后音频',baseline:'修正前（同一片段）'};
   function downloadName(r,kind) {
     const name=title(r).replace(/\.[a-z0-9]{2,5}$/i,'').replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').replace(/[. ]+$/g,'')||r.id;
-    return `${name}_${labels[kind]}.wav`;
+    return `${name}_${r.parameters?.recovery==='audio-pitch-preview-v1'&&kind==='vocal'?'修正后':labels[kind]}.wav`;
   }
   function renderMedia(r) {
     if(r.state!=='succeeded'||!r.result_url){if(mediaId)clearMedia();return;}
@@ -191,9 +199,12 @@
     if(signature!==mediaSignature) {
       clearMedia();mediaId=r.id;mediaSignature=signature;q('taskResults').hidden=false;
       media.primary.kind=outputs[0].kind;
-      media.vocal.kind=outputs.length>1&&outputs[1].kind==='vocal'?'vocal':'';
+      media.vocal.kind=outputs.length>1&&['vocal','baseline'].includes(outputs[1].kind)?outputs[1].kind:'';
       q('taskVocalCard').hidden=!media.vocal.kind;
-      text('taskPrimaryTitle',labels[media.primary.kind]);q('taskAudio').setAttribute('aria-label',labels[media.primary.kind]);
+      text('taskPrimaryTitle',r.parameters?.recovery==='audio-pitch-preview-v1'?'修正后（局部试听）':labels[media.primary.kind]);
+      q('taskVocalCard').querySelector('h4,h3').textContent=labels[media.vocal.kind]||'干净人声';
+      q('taskVocalAudio').setAttribute('aria-label',labels[media.vocal.kind]||'干净人声');
+      text('taskLoadVocal',media.vocal.kind==='baseline'?'载入修正前':'载入人声');text('taskVocalDownload',media.vocal.kind==='baseline'?'下载修正前 WAV':'下载人声 WAV');q('taskAudio').setAttribute('aria-label',labels[media.primary.kind]);
       text('taskPrimaryHint',media.primary.kind==='mix'?'转换后的人声与原伴奏合成。':media.primary.kind==='vocal'?'转换后的目标声线，不含伴奏。':'已保存的预处理结果。');
       for(const slot of Object.values(media))if(slot.kind) {
         q(slot.load).disabled=false;
@@ -235,6 +246,15 @@
     finally {if(generation===mediaGeneration){slot.pending=false;q(slot.load).disabled=false;}}
   }
   async function listen() {const id=selected;await loadMedia('primary');if(selected===id)await loadMedia('vocal');}
+  async function revise(focusPitch) {
+    if(!current||busy||actionBusy||!connected)return;
+    const r=current;actionBusy=true;renderDetail();
+    try {
+      for(const slot of Object.values(media))q(slot.audio).pause();
+      await globalThis.resonantiaReviseAudio(r,{focusPitch,stillSelected:()=>selected===r.id});
+    }catch(e){if(selected===r.id)text('taskActionMessage','无法载入原任务：'+e.message);}
+    finally {actionBusy=false;renderDetail();}
+  }
   async function rename(event) {
     event.preventDefault();if(!renameTarget||actionBusy)return;
     const target={...renameTarget},name=q('taskRenameInput').value.trim();
@@ -299,7 +319,7 @@
     q('taskRefresh').onclick=()=>refresh(true);q('taskPause').onclick=()=>control('pause');q('taskResume').onclick=()=>control('resume');
     q('taskCleanup').onclick=()=>control('cleanup');q('taskActiveOpen').onclick=()=>choose(activeId,true);
     q('taskRetrySubmission').onclick=retrySubmission;
-    q('taskRevise').onclick=async()=>{if(!current||busy||actionBusy)return;actionBusy=true;renderDetail();try{await globalThis.resonantiaReviseAudio(current);}catch(e){text('taskActionMessage','无法载入原任务：'+e.message);}finally{actionBusy=false;renderDetail();}};
+    q('taskRevise').onclick=()=>revise(false);q('taskPitch').onclick=()=>revise(true);
     q('taskLegacyCancel').onclick=()=>control('cancel');q('taskListen').onclick=listen;q('taskLibrary').onclick=()=>q('nav-library').click();
     q('taskPrevious').onclick=()=>{offset=Math.max(0,offset-25);refresh();};q('taskNext').onclick=()=>{offset+=25;refresh();};
     q('taskLogDetails').addEventListener('toggle',()=>{if(q('taskLogDetails').open)loadLog();});
